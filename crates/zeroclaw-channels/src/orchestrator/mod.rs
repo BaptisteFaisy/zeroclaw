@@ -13614,11 +13614,11 @@ fn build_configured_discord_channel(
 }
 
 /// Resolve the enabled agent that owns `channel_key`, for binding that agent's
-/// `tts_provider`. Shares [`build_owner_by_channel_key`] with message dispatch
-/// and with [`resolve_agent_transcription_provider`], so synthesis can never
-/// select a different owner than the one the router delivers to: with two
-/// enabled agents bound to the same channel, sorted last-writer-wins picks one
-/// answer for both.
+/// `tts_provider`. Shares [`Config::active_agent_channel_bindings`] with
+/// message dispatch and with [`resolve_agent_transcription_provider`], so
+/// synthesis can never select a different owner than the one the router
+/// delivers to. Ambiguous co-ownership fails closed to `None` in every
+/// consumer rather than letting synthesis pick a winner dispatch rejects.
 ///
 /// Returns `None` when no enabled agent owns the channel, which
 /// [`crate::tts::TtsManager::from_config_for_agent`] treats as "fall back to
@@ -13626,8 +13626,9 @@ fn build_configured_discord_channel(
 /// silently drop the fallback.
 #[cfg(feature = "channel-matrix")]
 fn resolve_agent_tts_owner(config: &Config, channel_key: &str) -> Option<String> {
-    let enabled_agents = enabled_agent_aliases(config);
-    build_owner_by_channel_key(config, &enabled_agents, &[channel_key.to_string()])
+    config
+        .active_agent_channel_bindings()
+        .owner_by_channel_key()
         .get(channel_key)
         .cloned()
 }
@@ -46030,13 +46031,20 @@ This is an example JSON object for profile settings."#;
     /// `Config::agent_for_channel` takes the first match out of a `HashMap`,
     /// so with two agents bound to one Matrix alias it can name a different
     /// owner than dispatch does — silencing voice, or speaking through the
-    /// wrong agent's provider. Synthesis must go through the same sorted,
-    /// last-writer-wins decision the router uses.
+    /// wrong agent's provider. Synthesis must go through the same shared
+    /// ownership decision the router uses, which fails closed on ambiguity.
     #[cfg(feature = "channel-matrix")]
     #[test]
-    fn matrix_tts_owner_is_the_same_canonical_co_owner_as_dispatch() {
+    fn matrix_tts_owner_fails_closed_with_the_same_ambiguous_owners_as_dispatch() {
         let mut config = Config::default();
         config.agents.clear();
+        config.channels.matrix.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::MatrixConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
         config.agents.insert(
             "zeta".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
@@ -46056,16 +46064,16 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let enabled_agents = enabled_agent_aliases(&config);
-        let owners =
-            build_owner_by_channel_key(&config, &enabled_agents, &["matrix.default".to_string()]);
+        let owners = config
+            .active_agent_channel_bindings()
+            .owner_by_channel_key();
         let dispatch_owner = owners.get("matrix.default").map(String::as_str);
 
-        assert_eq!(dispatch_owner, Some("zeta"));
+        assert_eq!(dispatch_owner, None);
         assert_eq!(
             resolve_agent_tts_owner(&config, "matrix.default").as_deref(),
             dispatch_owner,
-            "synthesis must bind the same owning agent the router delivers to"
+            "synthesis must fail closed on the same ambiguous binding the router rejects"
         );
     }
 
@@ -46076,6 +46084,13 @@ This is an example JSON object for profile settings."#;
     fn matrix_tts_owner_is_the_same_legacy_fallback_owner_as_dispatch() {
         let mut config = Config::default();
         config.agents.clear();
+        config.channels.matrix.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::MatrixConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
         config.agents.insert(
             "legacy".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
@@ -46086,9 +46101,9 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let enabled_agents = enabled_agent_aliases(&config);
-        let collected_channel_keys = vec!["matrix.default".to_string()];
-        let owners = build_owner_by_channel_key(&config, &enabled_agents, &collected_channel_keys);
+        let owners = config
+            .active_agent_channel_bindings()
+            .owner_by_channel_key();
 
         assert_eq!(
             owners.get("matrix.default").map(String::as_str),
@@ -46108,6 +46123,13 @@ This is an example JSON object for profile settings."#;
     fn matrix_tts_owner_is_none_when_no_enabled_agent_owns_the_channel() {
         let mut config = Config::default();
         config.agents.clear();
+        config.channels.matrix.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::MatrixConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
         config.agents.insert(
             "off".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
