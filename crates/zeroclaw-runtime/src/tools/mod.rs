@@ -1348,11 +1348,38 @@ fn all_tools_with_runtime_on_thread(
             Ok(discord_mem) => {
                 // Legacy pre-provenance archive rows fail closed in
                 // multi-agent installs; a sole enabled agent owns them.
-                let enabled_agent_count = root_config.agents.values().filter(|a| a.enabled).count();
+                // Availability is a catalog decision made once, above; the
+                // GRANT is re-resolved on every search. A binding revoked or
+                // reassigned after this tool was built must stop answering
+                // for the old owner, which a snapshot here would not do.
+                let archive_scope = match live_config.as_ref() {
+                    Some(live) => {
+                        let live = Arc::clone(live);
+                        let alias = agent_alias.to_string();
+                        DiscordArchiveScope::live(Arc::new(move || {
+                            let cfg = live.read();
+                            let owned: std::collections::BTreeSet<String> = cfg
+                                .channel_refs_owned_by_agent(&alias)
+                                .into_iter()
+                                .filter(|r| r.starts_with("discord."))
+                                .collect();
+                            let enabled = cfg.agents.values().filter(|a| a.enabled).count();
+                            zeroclaw_tools::discord_search::DiscordArchiveGrant {
+                                owned_channel_refs: owned,
+                                include_unattributed: enabled <= 1,
+                            }
+                        }))
+                    }
+                    None => {
+                        let enabled_agent_count =
+                            root_config.agents.values().filter(|a| a.enabled).count();
+                        DiscordArchiveScope::new(owned_discord_refs, enabled_agent_count <= 1)
+                    }
+                };
                 tool_arcs.push(Arc::new(DiscordSearchTool::for_agent(
                     Arc::new(discord_mem),
                     security.clone(),
-                    DiscordArchiveScope::new(owned_discord_refs, enabled_agent_count <= 1),
+                    archive_scope,
                 )));
             }
             Err(e) => {
@@ -1926,10 +1953,27 @@ fn all_tools_with_runtime_on_thread(
         // When an ACP session read view is present it is attached on top of
         // the ownership scope so protocol sessions remain visible without
         // widening the trusted per-agent boundary.
-        let ownership_scope = SessionOwnershipScope::with_channels(
-            agent_alias,
-            root_config.channel_refs_owned_by_agent(agent_alias),
-        );
+        // The channel arm is a live fact for the same reason: reassigning a
+        // channel must stop admitting the previous owner to its sessions.
+        let ownership_scope = match live_config.as_ref() {
+            Some(live) => {
+                let live = Arc::clone(live);
+                let alias = agent_alias.to_string();
+                SessionOwnershipScope::with_live_channels(
+                    agent_alias,
+                    Arc::new(move || {
+                        live.read()
+                            .channel_refs_owned_by_agent(&alias)
+                            .into_iter()
+                            .collect()
+                    }),
+                )
+            }
+            None => SessionOwnershipScope::with_channels(
+                agent_alias,
+                root_config.channel_refs_owned_by_agent(agent_alias),
+            ),
+        };
         tool_arcs.push(Arc::new(
             SessionsCurrentTool::new(backend.clone())
                 .with_optional_acp_sessions(acp_sessions.clone()),

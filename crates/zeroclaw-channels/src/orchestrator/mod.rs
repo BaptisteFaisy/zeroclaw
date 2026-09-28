@@ -21206,10 +21206,7 @@ temperature = 0.3
 
         // Agent A owns the transcript and has real content in it.
         session_store
-            .append(
-                "webhook_a_b_b_b_alice",
-                &ChatMessage::user("A_ONLY_SECRET"),
-            )
+            .append("webhook_a_b_b_b_alice", &ChatMessage::user("A_ONLY_SECRET"))
             .unwrap();
         let claim_a = session_store
             .claim_session_agent_alias("webhook_a_b_b_b_alice", "agent-a")
@@ -21238,8 +21235,7 @@ temperature = 0.3
             ..Default::default()
         };
 
-        let proceeded =
-            stamp_session_routing_context(&ctx_b, &msg, "webhook_a_b_b_b_alice");
+        let proceeded = stamp_session_routing_context(&ctx_b, &msg, "webhook_a_b_b_b_alice");
 
         assert!(
             !proceeded,

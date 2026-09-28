@@ -24,26 +24,65 @@ static TOOL_DESCRIPTION: OnceLock<String> = OnceLock::new();
 /// agent (a sole agent owns everything; in multi-agent installs legacy
 /// rows fail closed).
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// The archive namespaces one agent may search, and whether legacy
+/// unattributed rows are included.
+pub struct DiscordArchiveGrant {
+    pub owned_channel_refs: BTreeSet<String>,
+    pub include_unattributed: bool,
+}
+
+/// How a tool learns which archive namespaces it may read.
+///
+/// `Live` exists because a binding can be revoked or reassigned while a tool
+/// object is still held by a retained agent. A grant copied at construction
+/// keeps answering for the old owner after the operator has taken it away,
+/// which turns a legitimate revocation into a no-op for whoever still holds
+/// the session. Resolving per call is what makes revocation take effect.
+enum ArchiveGrantSource {
+    Fixed(DiscordArchiveGrant),
+    Live(Arc<dyn Fn() -> DiscordArchiveGrant + Send + Sync>),
+}
+
 pub struct DiscordArchiveScope {
-    owned_channel_refs: BTreeSet<String>,
-    include_unattributed: bool,
+    source: ArchiveGrantSource,
 }
 
 impl DiscordArchiveScope {
+    /// A grant fixed at construction.
+    ///
+    /// Only correct where the scope cannot outlive the policy it was built
+    /// from: one-shot callers and tests. Anything retained across a config
+    /// publication must use [`Self::live`].
     pub fn new<I, S>(owned_channel_refs: I, include_unattributed: bool) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
         Self {
-            owned_channel_refs: owned_channel_refs.into_iter().map(Into::into).collect(),
-            include_unattributed,
+            source: ArchiveGrantSource::Fixed(DiscordArchiveGrant {
+                owned_channel_refs: owned_channel_refs.into_iter().map(Into::into).collect(),
+                include_unattributed,
+            }),
+        }
+    }
+
+    /// A grant resolved from canonical config on every call.
+    pub fn live(resolve: Arc<dyn Fn() -> DiscordArchiveGrant + Send + Sync>) -> Self {
+        Self {
+            source: ArchiveGrantSource::Live(resolve),
         }
     }
 
     fn allowed_namespaces(&self) -> Vec<String> {
-        let mut namespaces: Vec<String> = self.owned_channel_refs.iter().cloned().collect();
-        if self.include_unattributed {
+        let grant = match &self.source {
+            ArchiveGrantSource::Fixed(grant) => DiscordArchiveGrant {
+                owned_channel_refs: grant.owned_channel_refs.clone(),
+                include_unattributed: grant.include_unattributed,
+            },
+            ArchiveGrantSource::Live(resolve) => resolve(),
+        };
+        let mut namespaces: Vec<String> = grant.owned_channel_refs.into_iter().collect();
+        if grant.include_unattributed {
             namespaces.push(LEGACY_NAMESPACE.to_string());
         }
         namespaces

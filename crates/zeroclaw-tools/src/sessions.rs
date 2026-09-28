@@ -185,20 +185,55 @@ fn resolve_existing_session_key(backend: &dyn SessionBackend, session_id: &str) 
     None
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// How a scope learns which channels its agent currently owns.
+///
+/// The channel arm of the ownership predicate is a live authorization fact:
+/// an operator can reassign `discord.ops` from A to B while A stays enabled
+/// and keeps its tool names. A set copied at construction keeps admitting A
+/// to the reassigned channel's sessions, so the revocation silently fails
+/// for whoever still holds a retained agent. `Live` resolves per check.
+#[derive(Clone)]
+enum OwnedChannels {
+    Fixed(BTreeSet<String>),
+    Live(Arc<dyn Fn() -> BTreeSet<String> + Send + Sync>),
+}
+
+impl OwnedChannels {
+    fn resolve(&self) -> BTreeSet<String> {
+        match self {
+            Self::Fixed(ids) => ids.clone(),
+            Self::Live(resolve) => resolve(),
+        }
+    }
+}
+
+impl std::fmt::Debug for OwnedChannels {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fixed(ids) => f.debug_tuple("Fixed").field(ids).finish(),
+            Self::Live(_) => f.write_str("Live(<resolver>)"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct SessionOwnershipScope {
     agent_alias: String,
-    channel_ids: BTreeSet<String>,
+    channel_ids: OwnedChannels,
 }
 
 impl SessionOwnershipScope {
     pub fn for_agent(agent_alias: impl Into<String>) -> Self {
         Self {
             agent_alias: agent_alias.into(),
-            channel_ids: BTreeSet::new(),
+            channel_ids: OwnedChannels::Fixed(BTreeSet::new()),
         }
     }
 
+    /// Channel ownership fixed at construction.
+    ///
+    /// Correct only where the scope cannot outlive the policy it was built
+    /// from. Retained agents must use [`Self::with_live_channels`].
     pub fn with_channels<I, S>(agent_alias: impl Into<String>, channel_ids: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -206,7 +241,18 @@ impl SessionOwnershipScope {
     {
         Self {
             agent_alias: agent_alias.into(),
-            channel_ids: channel_ids.into_iter().map(Into::into).collect(),
+            channel_ids: OwnedChannels::Fixed(channel_ids.into_iter().map(Into::into).collect()),
+        }
+    }
+
+    /// Channel ownership resolved from canonical config on every check.
+    pub fn with_live_channels(
+        agent_alias: impl Into<String>,
+        resolve: Arc<dyn Fn() -> BTreeSet<String> + Send + Sync>,
+    ) -> Self {
+        Self {
+            agent_alias: agent_alias.into(),
+            channel_ids: OwnedChannels::Live(resolve),
         }
     }
 
@@ -226,7 +272,7 @@ impl SessionOwnershipScope {
             metadata.agent_alias.as_deref(),
             metadata.channel_id.as_deref(),
             &self.agent_alias,
-            &self.channel_ids,
+            &self.channel_ids.resolve(),
         )
         .map(|()| session_key)
         .map_err(|denial| self.denial_message(session_id, &denial))
@@ -261,7 +307,7 @@ impl SessionOwnershipScope {
             metadata.agent_alias.as_deref(),
             metadata.channel_id.as_deref(),
             &self.agent_alias,
-            &self.channel_ids,
+            &self.channel_ids.resolve(),
         )
         .is_ok()
     }
@@ -560,7 +606,7 @@ impl Tool for SessionsHistoryTool {
                 match self.backend.load_if_owned(
                     &target_session_key,
                     &scope.agent_alias,
-                    &scope.channel_ids,
+                    &scope.channel_ids.resolve(),
                 ) {
                     Ok(ScopedSessionAccess::Granted(messages)) => messages,
                     Ok(ScopedSessionAccess::Missing) => Vec::new(),
@@ -821,7 +867,7 @@ impl Tool for SessionsSendTool {
                 &target_session_key,
                 &chat_msg,
                 &scope.agent_alias,
-                &scope.channel_ids,
+                &scope.channel_ids.resolve(),
             ),
             None => self
                 .backend
@@ -3227,5 +3273,47 @@ mod tests {
         assert!(result.success);
         assert!(!result.output.contains(&foreign));
         assert!(!result.output.contains("colliding foreign chat message"));
+    }
+
+    /// A grant copied at construction keeps answering after the operator has
+    /// taken the channel away. The scope must re-read ownership per check so
+    /// a revocation actually revokes.
+    #[test]
+    fn a_retained_scope_stops_admitting_a_revoked_channel() {
+        use std::sync::RwLock as StdRwLock;
+
+        let owned: Arc<StdRwLock<BTreeSet<String>>> = Arc::new(StdRwLock::new(
+            ["discord.ops".to_string()].into_iter().collect(),
+        ));
+        let reader = Arc::clone(&owned);
+        // The scope is built ONCE, before the policy change, exactly as a
+        // retained agent's tool would be.
+        let scope = SessionOwnershipScope::with_live_channels(
+            "agent-a",
+            Arc::new(move || reader.read().unwrap().clone()),
+        );
+
+        let metadata = session_metadata("s1", None, Some("discord.ops"), 1);
+
+        assert!(
+            scope.owns_metadata(&metadata),
+            "while the binding is held, the channel session is owned"
+        );
+
+        // The operator reassigns discord.ops away from agent-a.
+        owned.write().unwrap().clear();
+
+        assert!(
+            !scope.owns_metadata(&metadata),
+            "after revocation the retained scope must stop admitting the channel"
+        );
+
+        // Non-vacuous the other way: a fixed scope built from the same
+        // starting policy still admits, which is the defect this replaces.
+        let stale = SessionOwnershipScope::with_channels("agent-a", ["discord.ops"]);
+        assert!(
+            stale.owns_metadata(&metadata),
+            "a construction-time grant is exactly what keeps answering"
+        );
     }
 }
