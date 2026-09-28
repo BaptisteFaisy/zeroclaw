@@ -27,7 +27,10 @@ importantly, what changes for existing remote connections.
    - `session/new` and `session/prompt` check the agent selector and hold
      the session's workspace to a directory that agent's policy lets it both
      read and write, whether the workspace was named by the request, stored
-     with a resumed session, or restored from a durable one. The other
+     with a resumed session, or restored from a durable one. The session is
+     bound to the resolved directory, not the requested spelling, so
+     retargeting a symlinked cwd after admission does not move it, and a
+     live session held under such an alias is refused. The other
      session methods do not check the agent yet, as described under
      [What this layer does not do (yet)](#what-this-layer-does-not-do-yet);
    - running or approving an SOP requires every agent it runs as, with the
@@ -123,6 +126,16 @@ snapshot is kept only for an operator-level principal (the shared
 operator, or a roster principal with `admin = true`) on a local connection.
 Every other principal, and every remote connection, gets the daemon's own
 environment instead.
+
+Eligibility is checked again when a session is built or restored. An existing
+session that retains a non-empty forwarded environment can be resumed or
+prompted only by a currently authorized local operator. Reconnecting over WSS,
+or losing `admin` while a prompt is queued, does not carry that environment into
+the next turn: the request is refused before execution. Create a new session to
+continue without the forwarded environment. Sessions without forwarded values
+remain eligible for normal resume, subject to the other authorization checks.
+The retained environment is immutable for the lifetime of its session; refusing
+a later request does not rewrite it underneath an already running turn.
 
 #### Recovery
 

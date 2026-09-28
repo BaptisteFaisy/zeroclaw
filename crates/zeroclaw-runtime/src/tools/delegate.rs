@@ -1,4 +1,5 @@
 use crate::agent::dispatcher::{ToolDispatcher, XmlToolDispatcher};
+use crate::agent::execution_tree_budget::ExecutionTreeBudget;
 use crate::agent::loop_::{
     LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
     TOOL_LOOP_SESSION_KEY, TOOL_LOOP_THREAD_ID, ToolLoop, apply_text_tool_prompt_policy,
@@ -179,11 +180,10 @@ pub struct DelegateTool {
     max_delegation_depth: Option<u32>,
     /// Whether this instance may manage background delegate tasks
     /// (`check_result`, `list_results`, `cancel_task`, `await_sessions`).
-    /// Background records live in a workspace-wide namespace without owner
-    /// identity, and a bounded sub-agent shares the delegating parent's
-    /// workspace, so handing it the management surface would let it read and
-    /// cancel tasks owned by other identities. Bounded sub-delegate tools
-    /// therefore carry delegate-only instances; every other construction
+    /// Bounded sub-agent loops run under a transient identity, so their
+    /// sub-delegate tools carry delegate-only instances and retrieval stays
+    /// with the ancestors, who read, await, list and cancel through the
+    /// delegation chain recorded on each task row; every other construction
     /// keeps the full surface.
     background_task_management: bool,
     /// Whether the loop calling this instance has an operator approval
@@ -236,6 +236,10 @@ pub struct DelegateTool {
     /// advertised roster so an agent is never offered itself as a
     /// delegation target. Empty when unset (legacy unit-test constructors).
     caller_alias: String,
+    /// Aliases of the callers above this tool's `caller_alias`, root first;
+    /// empty on a root tool. Combined with `caller_alias` when a background
+    /// row is stamped and when a row's visibility is checked.
+    originator_chain: Vec<String>,
     /// Optional per-tree override for background task lifecycle storage. A
     /// daemon-provided control plane wins; non-daemon surfaces share a
     /// process-local handle keyed by `root_config.data_dir`.
@@ -360,6 +364,7 @@ impl DelegateTool {
             root_config: None,
             live_config: None,
             caller_alias: String::new(),
+            originator_chain: Vec::new(),
             task_control_plane: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
@@ -412,6 +417,7 @@ impl DelegateTool {
             root_config: None,
             live_config: None,
             caller_alias: String::new(),
+            originator_chain: Vec::new(),
             task_control_plane: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
@@ -545,6 +551,29 @@ impl DelegateTool {
     pub fn with_caller_alias(mut self, alias: impl Into<String>) -> Self {
         self.caller_alias = alias.into();
         self
+    }
+
+    /// Set the delegation chain above this tool's `caller_alias`, root caller
+    /// first. Bounded sub-delegate constructions derive it from their parent
+    /// tool via `lineage`; this setter is for tests and other manual assembly.
+    pub fn with_originator_chain(
+        mut self,
+        chain: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.originator_chain = chain.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// The full caller chain of any task this tool starts, root first and
+    /// ending with this tool's own caller identity. Used both to stamp
+    /// background task rows and to build the nested sub-delegate tool's
+    /// inherited chain.
+    fn lineage(&self) -> Vec<String> {
+        let mut chain = self.originator_chain.clone();
+        if let Some(caller) = self.caller_identity() {
+            chain.push(caller.to_owned());
+        }
+        chain
     }
 
     pub(crate) fn policy_for_target(
@@ -1136,6 +1165,19 @@ impl DelegateTool {
             .unwrap_or(false)
     }
 
+    fn execution_tree_budget_for_agentic_loop(
+        mode: DelegateExecutionMode,
+        inherited: Option<ExecutionTreeBudget>,
+        target_limit: Option<usize>,
+    ) -> Option<ExecutionTreeBudget> {
+        match mode {
+            DelegateExecutionMode::Bounded => inherited
+                .map(|budget| budget.child())
+                .or_else(|| ExecutionTreeBudget::from_limit(target_limit)),
+            DelegateExecutionMode::Independent => ExecutionTreeBudget::from_limit(target_limit),
+        }
+    }
+
     fn resolve_loop_runtime(
         &self,
         agent_alias: &str,
@@ -1156,6 +1198,7 @@ impl DelegateTool {
             if profile.max_tool_iterations > 0 {
                 resolved.max_tool_iterations = profile.max_tool_iterations;
             }
+            resolved.max_execution_tree_iterations = profile.max_execution_tree_iterations;
             if profile.max_context_tokens.is_some() {
                 resolved.max_context_tokens = profile.max_context_tokens;
             }
@@ -1658,18 +1701,29 @@ impl DelegateTool {
         Ok((true, aborted))
     }
 
-    fn owns_delegate_task(&self, task: &crate::control_plane::TaskRecord) -> bool {
-        task.kind == crate::control_plane::TaskKind::Delegate
-            && self
-                .caller_identity()
-                .is_some_and(|caller| task.originator_route.as_deref() == Some(caller))
-    }
-
-    fn can_read_delegate_task(&self, task: &crate::control_plane::TaskRecord) -> bool {
-        self.owns_delegate_task(task)
-            || (task.kind == crate::control_plane::TaskKind::Delegate
-                && task.originator_route.is_none()
-                && task.status.is_terminal())
+    /// The single visibility rule for delegate rows. A caller sees a row when its
+    /// alias created it (`originator_route`) or appears anywhere in the row's
+    /// `originator_chain`. Legacy rows with neither are visible only when
+    /// `allow_legacy_terminal` is set and the row is terminal, so old results stay
+    /// readable but nothing legacy can be mutated.
+    fn delegate_task_visible(
+        &self,
+        task: &crate::control_plane::TaskRecord,
+        allow_legacy_terminal: bool,
+    ) -> bool {
+        if task.kind != crate::control_plane::TaskKind::Delegate {
+            return false;
+        }
+        if let Some(caller) = self.caller_identity()
+            && (task.originator_route.as_deref() == Some(caller)
+                || task.originator_chain.iter().any(|alias| alias == caller))
+        {
+            return true;
+        }
+        allow_legacy_terminal
+            && task.originator_route.is_none()
+            && task.originator_chain.is_empty()
+            && task.status.is_terminal()
     }
 
     fn caller_identity(&self) -> Option<&str> {
@@ -1830,10 +1884,9 @@ impl Tool for DelegateTool {
             });
         };
 
-        // Bounded sub-agents carry delegate-only instances: background
-        // records live in a workspace-wide namespace without owner identity,
-        // so the management surface must never reach a distinct identity
-        // sharing that workspace.
+        // Bounded sub-agents carry delegate-only instances: their identity is
+        // transient, so the management surface stays with the ancestors, who
+        // retrieve through the delegation chain recorded on the task row.
         if !self.background_task_management && action != DelegateAction::Delegate {
             return Ok(ToolResult {
                 success: false,
@@ -2348,9 +2401,15 @@ impl DelegateTool {
                 depth: self.depth,
                 parent_id: None,
                 originator_route: Some(caller_identity),
+                // The full chain, root delegating agent first and ending with
+                // the creating caller (`originator_route`), so every ancestor
+                // in a bounded delegation chain can retrieve this row.
+                originator_chain: self.lineage(),
                 delivered: false,
                 idem_key: None,
-                principal_id: None,
+                // Forensic record of the launching tool-loop session; the
+                // owner check above consults aliases only, never this.
+                principal_id: current_tool_loop_session_key(),
                 started_at: started_at.clone(),
                 finished_at: None,
             })
@@ -2400,12 +2459,24 @@ impl DelegateTool {
         // will construct its own nested registries.
         let live_config = self.live_config.clone();
         let caller_alias = self.caller_alias.clone();
+        // The background wrapper re-executes the SAME hop as the outer tool
+        // (depth ownership comment above), so the rebuilt inner tool carries
+        // the outer chain verbatim rather than extending it.
+        let originator_chain = self.originator_chain.clone();
         let nested_task_control_plane = Arc::clone(&self.task_control_plane);
         let terminal_store = Arc::clone(&task_control_plane.store);
         let terminal_owner_pid = std::process::id();
         let terminal_owner_boot_id = task_control_plane.boot_id.clone();
         let memory = self.memory.clone();
         let parent_session_key = current_tool_loop_session_key();
+        // Receipt continuity for detached work: capture the launching turn's
+        // generator so the background sub-loop signs with the same key. The
+        // wrapper below pairs it with a fresh collector, never the parent's
+        // per-turn one.
+        let parent_receipt_generator = crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
+            .try_with(|scope| scope.as_ref().map(|scope| scope.generator.clone()))
+            .ok()
+            .flatten();
         // Sender-bucket continuity (same rationale as the parallel spawn):
         // capture the originating sender scope so every admission inside the
         // detached task charges the caller's bucket, not the fallback
@@ -2424,7 +2495,13 @@ impl DelegateTool {
                     parent_session_key,
                     crate::sop::active_scope::with_inherited_headless_step_scope(
                         parent_step_scope,
-                        async move {
+                        // Detached receipt scope: the launching turn's generator with a
+                        // fresh per-task collector; nothing appends to the launching
+                        // turn's receipts block (consumer: check_result progress,
+                        // tracked separately).
+                        crate::agent::tool_receipts::scope_receipts(
+                            crate::agent::tool_receipts::detached_scope(parent_receipt_generator),
+                            async move {
                 let inner = DelegateTool {
                     agents,
                     security,
@@ -2448,6 +2525,7 @@ impl DelegateTool {
                     root_config,
                     live_config,
                     caller_alias,
+                    originator_chain,
                     task_control_plane: nested_task_control_plane,
                 };
 
@@ -2522,7 +2600,8 @@ impl DelegateTool {
                     terminal_owner_boot_id,
                 )
                 .await;
-                        },
+                            },
+                        ),
                     ),
                 ),
             )
@@ -2543,9 +2622,9 @@ impl DelegateTool {
                 format!(
                     "Background task started for agent '{agent_name}'.\n\
                      task_id: {task_id}\n\
-                     This tool cannot check task results, and the task record is owned by this \
-                     tool's configured caller identity; retrieval through the delegate API is not \
-                     available to it."
+                     This tool cannot check task results. Pass the task_id upward: a \
+                     management-enabled ancestor in the delegation chain (normally the root \
+                     delegating agent) can read it with action='check_result'."
                 )
             }
             .into(),
@@ -2641,6 +2720,7 @@ impl DelegateTool {
             .ok()
             .flatten();
         let parent_session_key = current_tool_loop_session_key();
+        let parent_budget = ExecutionTreeBudget::current();
         // Captured once here and restored inside every worker: each fan-out
         // target runs on its own spawned task, which does not inherit the SOP
         // step scope this call was made under. Fanning work out must not widen
@@ -2687,7 +2767,12 @@ impl DelegateTool {
             // that will construct its own nested registries.
             let live_config = self.live_config.clone();
             let caller_alias = self.caller_alias.clone();
+            // The parallel fan-out task re-executes the SAME hop as the outer
+            // tool, so the rebuilt inner tool carries the outer chain
+            // verbatim rather than extending it.
+            let originator_chain = self.originator_chain.clone();
             let session_key = parent_session_key.clone();
+            let inherited_budget = parent_budget.clone();
             let thread_scope = parent_thread_id.clone();
             let step_scope = parent_step_scope.clone();
             let memory = self.memory.clone();
@@ -2719,11 +2804,13 @@ impl DelegateTool {
                         root_config,
                         live_config,
                         caller_alias,
+                        originator_chain,
                         task_control_plane,
                     };
                     let agent_name_for_return = agent_name.clone();
-                    let result = TOOL_LOOP_THREAD_ID
-                        .scope(
+                    let result = ExecutionTreeBudget::scope_optional(
+                        inherited_budget,
+                        TOOL_LOOP_THREAD_ID.scope(
                             thread_scope,
                             crate::sop::active_scope::with_inherited_headless_step_scope(
                                 step_scope,
@@ -2740,8 +2827,9 @@ impl DelegateTool {
                                         .await
                                 }),
                             ),
-                        )
-                        .await;
+                        ),
+                    )
+                    .await;
                     (agent_name_for_return, result)
                 }
                 .instrument(::zeroclaw_log::attribution_span!(
@@ -2850,9 +2938,7 @@ impl DelegateTool {
     ) -> anyhow::Result<Option<(BackgroundResultState, serde_json::Value, Option<String>)>> {
         let control_plane = self.background_control_plane().await?;
         if let Some(snapshot) = control_plane.store.get_snapshot(task_id).await? {
-            if !(self.owns_delegate_task(&snapshot.task)
-                || allow_legacy_terminal && self.can_read_delegate_task(&snapshot.task))
-            {
+            if !self.delegate_task_visible(&snapshot.task, allow_legacy_terminal) {
                 return Ok(None);
             }
             let state = BackgroundResultState::from_task_status(snapshot.task.status);
@@ -3221,7 +3307,7 @@ impl DelegateTool {
 
         let control_plane = self.background_control_plane().await?;
         if let Some(snapshot) = control_plane.store.get_snapshot(task_id).await? {
-            if !self.owns_delegate_task(&snapshot.task) {
+            if !self.delegate_task_visible(&snapshot.task, false) {
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
@@ -3700,11 +3786,11 @@ impl DelegateTool {
                         max_delegation_depth: Some(
                             self.tightened_max_depth(&agent_config.runtime_profile),
                         ),
-                        // Delegate-only: background records live in a
-                        // workspace-wide namespace without owner identity,
-                        // and this tool shares the delegating parent's
-                        // workspace, so the management surface would expose
-                        // foreign identities' tasks.
+                        // Delegate-only: management stays refused on the
+                        // child instance because its identity is transient;
+                        // ancestors retrieve through the delegation chain the
+                        // task row records (this construction hands the child
+                        // the parent chain below).
                         background_task_management: false,
                         // The bounded child loop has no operator approval
                         // route, so this tool enforces the target profile's
@@ -3724,6 +3810,7 @@ impl DelegateTool {
                         root_config: self.root_config.clone(),
                         live_config: self.live_config.clone(),
                         caller_alias: agent_name.to_string(),
+                        originator_chain: self.lineage(),
                         task_control_plane: nested_task_control_plane,
                     }) as Box<dyn Tool>
                 });
@@ -3874,6 +3961,11 @@ impl DelegateTool {
         let turn_id = uuid::Uuid::new_v4().to_string();
         let pacing = zeroclaw_config::schema::PacingConfig::default();
         let loop_knobs = LoopKnobs::default();
+        let execution_tree_budget = Self::execution_tree_budget_for_agentic_loop(
+            target_mode,
+            ExecutionTreeBudget::current(),
+            loop_runtime.max_execution_tree_iterations,
+        );
         let execution = tokio::time::timeout(
             Duration::from_secs(agentic_timeout_secs),
             run_tool_call_loop(ToolLoop {
@@ -3940,8 +4032,7 @@ impl DelegateTool {
                 channel_reply_target: None,
                 cancellation_token: Some(self.cancellation_token.child_token()),
                 on_delta: None,
-                shared_budget: None,
-                // TODO thread from parent in future
+                shared_budget: execution_tree_budget.clone(),
                 channel: None,
                 collected_receipts,
                 event_tx: None,
@@ -3960,6 +4051,8 @@ impl DelegateTool {
                 &crate::agent::AgentAttribution(agent_name)
             )),
         );
+        let execution =
+            ExecutionTreeBudget::scope_optional(execution_tree_budget, Box::pin(execution));
         let result = match thinking_params {
             Some(params) => {
                 zeroclaw_api::NATIVE_THINKING_OVERRIDE
@@ -4123,6 +4216,7 @@ mod tests {
             depth: 0,
             parent_id: None,
             originator_route: Some("caller".into()),
+            originator_chain: Vec::new(),
             delivered: false,
             idem_key: None,
             principal_id: None,
@@ -5060,6 +5154,332 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delegate_visibility_follows_the_originator_chain() {
+        let temp = TempDir::new().unwrap();
+        let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        // A second-hop row: created by "leaf" with the chain root -> middle -> leaf.
+        let chain_row = "91919191-9191-9191-9191-919191919191";
+        let mut task = task_record(chain_row, TaskStatus::Running);
+        task.originator_route = Some("leaf".into());
+        task.originator_chain = vec!["root".into(), "middle".into(), "leaf".into()];
+        store.create(task).await.unwrap();
+        // A foreign row: created by "other", chain contains only "other".
+        let other_row = "92929292-9292-9292-9292-929292929292";
+        let mut task = task_record(other_row, TaskStatus::Running);
+        task.originator_route = Some("other".into());
+        task.originator_chain = vec!["other".into()];
+        store.create(task).await.unwrap();
+        // A legacy terminal row: no route, no chain (written before either existed).
+        let legacy_terminal = "93939393-9393-9393-9393-939393939393";
+        let mut task = task_record(legacy_terminal, TaskStatus::Completed);
+        task.originator_route = None;
+        store.create(task).await.unwrap();
+        // A legacy running row: same shape, nonterminal, so it stays hidden.
+        let legacy_running = "94949494-9494-9494-9494-949494949494";
+        let mut task = task_record(legacy_running, TaskStatus::Running);
+        task.originator_route = None;
+        store.create(task).await.unwrap();
+
+        // Artifacts so `list_results` enumerates every row through the same
+        // door as `check_result`.
+        let seeding = DelegateTool::new(HashMap::new(), None, Arc::new(SecurityPolicy::default()))
+            .with_workspace_dir(temp.path().into())
+            .with_caller_alias("root")
+            .with_task_control_plane(task_control_plane(Arc::clone(&store)));
+        tokio::fs::create_dir_all(seeding.results_dir())
+            .await
+            .unwrap();
+        for task_id in [chain_row, other_row, legacy_terminal, legacy_running] {
+            DelegateTool::write_result_atomic(
+                &seeding.results_dir().join(format!("{task_id}.json")),
+                &BackgroundDelegateOutput {
+                    task_id: task_id.into(),
+                    output: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let reader = |alias: &str| {
+            DelegateTool::new(HashMap::new(), None, Arc::new(SecurityPolicy::default()))
+                .with_workspace_dir(temp.path().into())
+                .with_caller_alias(alias)
+                .with_task_control_plane(task_control_plane(Arc::clone(&store)))
+        };
+
+        // Every alias in the chain reads, awaits and lists the row.
+        for alias in ["root", "middle", "leaf"] {
+            let tool = reader(alias);
+            let check = tool
+                .handle_check_result(&json!({"task_id": chain_row}))
+                .await
+                .unwrap();
+            assert!(
+                check.output.contains(chain_row),
+                "{alias} must read the chain row via check_result: {check:?}"
+            );
+            let awaited = tool
+                .handle_await_sessions(&json!({
+                    "task_ids": [chain_row],
+                    "timeout_ms": 100,
+                }))
+                .await
+                .unwrap();
+            let awaited_view: serde_json::Value = serde_json::from_str(&awaited.output).unwrap();
+            assert!(
+                awaited_view["results"]
+                    .as_array()
+                    .is_some_and(|results| results.iter().any(|r| r["task_id"] == chain_row)),
+                "{alias} must see the chain row in await_sessions results: {awaited:?}"
+            );
+            assert_eq!(
+                awaited_view["missing"],
+                json!([]),
+                "{alias} must not have the chain row reported missing: {awaited:?}"
+            );
+            let listed = tool.handle_list_results().await.unwrap();
+            assert!(
+                listed.output.contains(chain_row),
+                "{alias} must see the chain row in list_results: {listed:?}"
+            );
+            assert!(
+                !listed.output.contains(other_row),
+                "{alias} must not see the foreign row in list_results: {listed:?}"
+            );
+        }
+
+        // The foreign row's creator sees only its own row, not the chain row.
+        let tool = reader("other");
+        let check = tool
+            .handle_check_result(&json!({"task_id": chain_row}))
+            .await
+            .unwrap();
+        assert!(
+            check
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("No result found"),
+            "a non-ancestor must be refused the chain row: {check:?}"
+        );
+        let listed = tool.handle_list_results().await.unwrap();
+        assert!(
+            listed.output.contains(other_row),
+            "the creating caller sees its own row: {listed:?}"
+        );
+        assert!(
+            !listed.output.contains(chain_row),
+            "the foreign row's creator must not list the chain row: {listed:?}"
+        );
+
+        // An ancestor reads the legacy terminal row and not the legacy running one.
+        let tool = reader("root");
+        let check = tool
+            .handle_check_result(&json!({"task_id": legacy_terminal}))
+            .await
+            .unwrap();
+        assert!(
+            check.output.contains(legacy_terminal),
+            "the legacy terminal row stays readable: {check:?}"
+        );
+        let check = tool
+            .handle_check_result(&json!({"task_id": legacy_running}))
+            .await
+            .unwrap();
+        assert!(
+            check
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("No result found"),
+            "the legacy running row stays hidden: {check:?}"
+        );
+
+        // An unrelated alias sees nothing but the legacy terminal row.
+        let tool = reader("stranger");
+        for task_id in [chain_row, other_row, legacy_running] {
+            let check = tool
+                .handle_check_result(&json!({"task_id": task_id}))
+                .await
+                .unwrap();
+            assert!(
+                check
+                    .error
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("No result found"),
+                "a stranger must not read {task_id}: {check:?}"
+            );
+        }
+        let check = tool
+            .handle_check_result(&json!({"task_id": legacy_terminal}))
+            .await
+            .unwrap();
+        assert!(
+            check.output.contains(legacy_terminal),
+            "the legacy terminal row is the one thing a stranger still reads: {check:?}"
+        );
+        let listed = tool.handle_list_results().await.unwrap();
+        assert!(
+            !listed.output.contains(chain_row) && !listed.output.contains(other_row),
+            "a stranger's list_results stays empty of chain-owned rows: {listed:?}"
+        );
+        let awaited = tool
+            .handle_await_sessions(&json!({
+                "task_ids": [chain_row],
+                "timeout_ms": 100,
+            }))
+            .await
+            .unwrap();
+        assert!(!awaited.success, "{awaited:?}");
+        let awaited_view: serde_json::Value = serde_json::from_str(&awaited.output).unwrap();
+        assert_eq!(
+            awaited_view["missing"],
+            json!([chain_row]),
+            "a stranger's await_sessions reports the chain row missing: {awaited:?}"
+        );
+        assert_eq!(
+            awaited_view["results"],
+            json!([]),
+            "a stranger's await_sessions returns no result rows: {awaited:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unreadable_chain_keeps_creator_only_access() {
+        // A corrupt chain column drops ancestor access and nothing else: the
+        // creator route still governs, the former ancestor and a stranger are
+        // refused. The corruption is applied through a second connection to
+        // the same file so the store's own decoder is what handles it.
+        let temp = TempDir::new().unwrap();
+        let data_dir = temp.path().join("data");
+        let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new(&data_dir).unwrap());
+        let task_id = "96969696-9696-9696-9696-969696969696";
+        let mut task = task_record(task_id, TaskStatus::Completed);
+        task.originator_route = Some("leaf".into());
+        task.originator_chain = vec!["root".into(), "leaf".into()];
+        store.create(task).await.unwrap();
+        {
+            let conn = rusqlite::Connection::open(data_dir.join("control_plane.db")).unwrap();
+            conn.execute(
+                "UPDATE tasks SET originator_chain = 'not json' WHERE id = ?1",
+                rusqlite::params![task_id],
+            )
+            .unwrap();
+        }
+        let reader = |alias: &str| {
+            DelegateTool::new(HashMap::new(), None, Arc::new(SecurityPolicy::default()))
+                .with_workspace_dir(temp.path().into())
+                .with_caller_alias(alias)
+                .with_task_control_plane(task_control_plane(Arc::clone(&store)))
+        };
+        tokio::fs::create_dir_all(reader("leaf").results_dir())
+            .await
+            .unwrap();
+        DelegateTool::write_result_atomic(
+            &reader("leaf").results_dir().join(format!("{task_id}.json")),
+            &BackgroundDelegateOutput {
+                task_id: task_id.into(),
+                output: Some("done".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let check = reader("leaf")
+            .handle_check_result(&json!({"task_id": task_id}))
+            .await
+            .unwrap();
+        assert!(
+            check.output.contains(task_id),
+            "the creator keeps access when the chain is unreadable: {check:?}"
+        );
+        for alias in ["root", "stranger"] {
+            let check = reader(alias)
+                .handle_check_result(&json!({"task_id": task_id}))
+                .await
+                .unwrap();
+            assert!(
+                check
+                    .error
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("No result found"),
+                "{alias} must lose access when the chain is unreadable: {check:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ancestor_can_cancel_a_second_hop_task_and_a_stranger_cannot() {
+        let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let task_id = "95959595-9595-9595-9595-959595959595";
+        let mut task = task_record(task_id, TaskStatus::Running);
+        task.originator_route = Some("leaf".into());
+        task.originator_chain = vec!["root".into(), "leaf".into()];
+        store.create(task).await.unwrap();
+        let token = CancellationToken::new();
+        DelegateTool::background_task_cancels()
+            .lock()
+            .insert(task_id.into(), token.clone());
+
+        let stranger = DelegateTool::new(HashMap::new(), None, Arc::new(SecurityPolicy::default()))
+            .with_caller_alias("stranger")
+            .with_task_control_plane(task_control_plane(Arc::clone(&store)));
+        let result = stranger
+            .handle_cancel_task(&json!({"task_id": task_id}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("No task found"),
+            "a stranger must not cancel a chain-owned row: {result:?}"
+        );
+        assert!(!token.is_cancelled());
+        assert!(
+            DelegateTool::background_task_cancels()
+                .lock()
+                .remove(task_id)
+                .is_some(),
+            "the stranger's refusal must leave the live token registered"
+        );
+
+        // Re-register the token the inspection above removed, then cancel as
+        // an ancestor in the recorded chain.
+        DelegateTool::background_task_cancels()
+            .lock()
+            .insert(task_id.into(), token.clone());
+        let root = DelegateTool::new(HashMap::new(), None, Arc::new(SecurityPolicy::default()))
+            .with_caller_alias("root")
+            .with_task_control_plane(task_control_plane(Arc::clone(&store)));
+        let result = root
+            .handle_cancel_task(&json!({"task_id": task_id}))
+            .await
+            .unwrap();
+        assert!(
+            result.success,
+            "an ancestor cancels through the recorded chain: {result:?}"
+        );
+        assert!(token.is_cancelled());
+        assert!(
+            DelegateTool::background_task_cancels()
+                .lock()
+                .remove(task_id)
+                .is_none(),
+            "the ancestor's cancellation removes the live token"
+        );
+        assert_eq!(
+            store.get(task_id).await.unwrap().unwrap().status,
+            TaskStatus::Cancelled
+        );
+    }
+
+    #[tokio::test]
     async fn foreign_delegate_cancellation_does_not_touch_its_token() {
         let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
         let task_id = "50505050-5050-5050-5050-505050505050";
@@ -5908,6 +6328,14 @@ mod tests {
     }
 
     async fn delegate_memory_fixture(model_uri: Option<String>) -> DelegateMemoryFixture {
+        delegate_memory_fixture_with_iteration_caps(model_uri, 5, 5).await
+    }
+
+    async fn delegate_memory_fixture_with_iteration_caps(
+        model_uri: Option<String>,
+        caller_max_tool_iterations: usize,
+        target_max_tool_iterations: usize,
+    ) -> DelegateMemoryFixture {
         use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
 
         let tmp = TempDir::new().unwrap();
@@ -5948,10 +6376,24 @@ mod tests {
             "agentic_test".to_string(),
             RuntimeProfileConfig {
                 agentic: true,
-                max_tool_iterations: 5,
+                max_tool_iterations: target_max_tool_iterations,
                 ..RuntimeProfileConfig::default()
             },
         );
+        root_config.runtime_profiles.insert(
+            "caller_test".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                max_tool_iterations: caller_max_tool_iterations,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        let caller_config = AliasedAgentConfig {
+            model_provider: "custom.local".into(),
+            risk_profile: "agentic_test".into(),
+            runtime_profile: "caller_test".into(),
+            ..AliasedAgentConfig::default()
+        };
         let target_config = AliasedAgentConfig {
             model_provider: "custom.local".into(),
             risk_profile: "agentic_test".into(),
@@ -5960,7 +6402,7 @@ mod tests {
         };
         root_config
             .agents
-            .insert("caller".to_string(), target_config.clone());
+            .insert("caller".to_string(), caller_config);
         root_config
             .agents
             .insert("target".to_string(), target_config.clone());
@@ -6426,6 +6868,236 @@ mod tests {
     fn description_not_empty() {
         let tool = DelegateTool::new(sample_agents(), None, test_security());
         assert!(!tool.description().is_empty());
+    }
+
+    #[test]
+    fn agentic_tree_budget_selects_inherited_child_or_target_root() {
+        use crate::agent::execution_tree_budget::{
+            ExecutionTreeBudgetRole, ExecutionTreeReservation,
+        };
+
+        let inherited_root = ExecutionTreeBudget::root(5);
+        let foreground = DelegateTool::execution_tree_budget_for_agentic_loop(
+            DelegateExecutionMode::Bounded,
+            Some(inherited_root.clone()),
+            Some(2),
+        )
+        .expect("foreground delegate should inherit a budget");
+        assert_eq!(foreground.role(), ExecutionTreeBudgetRole::Child);
+        assert_eq!(foreground.remaining(), 5);
+        assert_eq!(
+            foreground.reserve(),
+            Ok(ExecutionTreeReservation::Iteration)
+        );
+        assert_eq!(inherited_root.remaining(), 4);
+
+        let detached = DelegateTool::execution_tree_budget_for_agentic_loop(
+            DelegateExecutionMode::Bounded,
+            None,
+            Some(2),
+        )
+        .expect("background delegate should mint its target budget");
+        assert_eq!(detached.role(), ExecutionTreeBudgetRole::Root);
+        assert_eq!(detached.reserve(), Ok(ExecutionTreeReservation::Iteration));
+        assert_eq!(
+            detached.reserve(),
+            Ok(ExecutionTreeReservation::FinalCompletion)
+        );
+        let independent = DelegateTool::execution_tree_budget_for_agentic_loop(
+            DelegateExecutionMode::Independent,
+            Some(inherited_root.clone()),
+            Some(1),
+        )
+        .unwrap();
+        assert_eq!(independent.role(), ExecutionTreeBudgetRole::Root);
+        assert_eq!(
+            independent.reserve(),
+            Ok(ExecutionTreeReservation::FinalCompletion)
+        );
+        assert_eq!(inherited_root.remaining(), 4);
+        assert!(
+            DelegateTool::execution_tree_budget_for_agentic_loop(
+                DelegateExecutionMode::Independent,
+                Some(inherited_root),
+                None,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn delegate_fallback_runtime_projects_execution_tree_budget() {
+        let mut runtime_profiles = agentic_runtime_profiles(5);
+        runtime_profiles
+            .get_mut("agentic_test")
+            .unwrap()
+            .max_execution_tree_iterations = Some(9);
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(runtime_profiles);
+
+        let resolved = tool.resolve_loop_runtime("target", &agentic_agent_config());
+        assert_eq!(resolved.max_execution_tree_iterations, Some(9));
+    }
+
+    #[tokio::test]
+    async fn independent_agentic_delegate_uses_target_tree_budget_and_masks_caller() {
+        use crate::agent::execution_tree_budget::ExecutionTreeBudgetRole;
+
+        struct BudgetProbeModelProvider(Option<usize>);
+
+        impl ::zeroclaw_api::attribution::Attributable for BudgetProbeModelProvider {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+
+            fn alias(&self) -> &str {
+                "BudgetProbeModelProvider"
+            }
+        }
+
+        #[async_trait]
+        impl ModelProvider for BudgetProbeModelProvider {
+            fn supports_native_tools(&self) -> bool {
+                true
+            }
+
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                unreachable!("the agentic loop uses chat")
+            }
+
+            async fn chat(
+                &self,
+                request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<ChatResponse> {
+                // Inspect the ambient scope at the production loop boundary,
+                // after its reservation, not just the selection helper's return.
+                assert_eq!(
+                    ExecutionTreeBudget::current()
+                        .map(|budget| (budget.role(), budget.remaining())),
+                    self.0
+                        .map(|limit| (ExecutionTreeBudgetRole::Root, limit - 1)),
+                );
+                assert_eq!(request.tools.is_none_or(<[_]>::is_empty), self.0 == Some(1));
+                Ok(ChatResponse {
+                    text: Some("independent completion".into()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+
+        for (caller_limit, target_limit) in [(1, Some(3)), (5, Some(1)), (1, None)] {
+            let mut fixture = delegate_memory_fixture(None).await;
+            let config = Arc::make_mut(fixture.tool.root_config.as_mut().unwrap());
+            config.agents.get_mut("caller").unwrap().delegates = vec![DelegateTargetConfig {
+                agent: "target".into(),
+                mode: DelegateExecutionMode::Independent,
+            }];
+            config
+                .runtime_profiles
+                .get_mut("agentic_test")
+                .unwrap()
+                .max_execution_tree_iterations = target_limit;
+            fixture.tool = fixture.tool.with_runtime(Arc::new(DelegateTestRuntime));
+            let caller = ExecutionTreeBudget::root(caller_limit);
+            let provider = BudgetProbeModelProvider(target_limit);
+            ExecutionTreeBudget::scope(caller.clone(), async {
+                let result = fixture
+                    .tool
+                    .execute_agentic(
+                        "target",
+                        &fixture.target_config,
+                        "test",
+                        "test-model",
+                        &provider,
+                        "complete independently",
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                assert!(result.success, "independent delegate failed: {result:?}");
+                assert_eq!(
+                    ExecutionTreeBudget::current().unwrap().remaining(),
+                    caller_limit
+                );
+            })
+            .await;
+            assert_eq!(caller.remaining(), caller_limit);
+            assert!(!fixture.tool.cancellation_token.is_cancelled());
+        }
+    }
+
+    #[tokio::test]
+    async fn foreground_agentic_delegates_share_tree_budget_and_preserve_root_final_slot() {
+        use crate::agent::execution_tree_budget::{ExecutionTreeBudget, ExecutionTreeReservation};
+
+        let server = start_final_chat_server(vec!["first child", "second child"]).await;
+        let fixture =
+            delegate_memory_fixture_with_iteration_caps(Some(server.uri.clone()), 1, 5).await;
+        let root_budget = ExecutionTreeBudget::root(3);
+        let first = fixture.tool.execute(json!({
+            "agent": "target",
+            "prompt": "first foreground child"
+        }));
+        let second = fixture.tool.execute(json!({
+            "agent": "target",
+            "prompt": "second foreground child"
+        }));
+
+        let (first_result, second_result) =
+            ExecutionTreeBudget::scope(root_budget.clone(), async { tokio::join!(first, second) })
+                .await;
+        let first_result = first_result.expect("first delegate should return a tool result");
+        let second_result = second_result.expect("second delegate should return a tool result");
+
+        assert!(
+            first_result.success,
+            "first delegate failed: {first_result:?}"
+        );
+        assert!(
+            second_result.success,
+            "second delegate failed: {second_result:?}"
+        );
+        assert_eq!(root_budget.remaining(), 1);
+
+        let exhausted = ExecutionTreeBudget::scope(
+            root_budget.clone(),
+            fixture.tool.execute(json!({
+                "agent": "target",
+                "prompt": "child after shared allowance is exhausted"
+            })),
+        )
+        .await
+        .expect("budget exhaustion should return a structured tool result");
+
+        assert!(!exhausted.success);
+        assert!(
+            exhausted
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("execution tree iteration budget exhausted")),
+            "delegate should preserve the specific exhaustion cause: {exhausted:?}"
+        );
+        assert!(!fixture.tool.cancellation_token.is_cancelled());
+        assert_eq!(root_budget.remaining(), 1);
+        assert_eq!(
+            root_budget.reserve(),
+            Ok(ExecutionTreeReservation::FinalCompletion)
+        );
+        assert_eq!(root_budget.remaining(), 0);
     }
 
     #[test]
@@ -8319,6 +8991,205 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_background_signs_sub_loop_tool_results_with_the_parent_generator() {
+        use crate::agent::tool_receipts::{
+            ReceiptGenerator, ReceiptScope, TOOL_LOOP_RECEIPT_CONTEXT,
+        };
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+
+        // The background target routes through the scripted chat server (the
+        // provider routing `execute_background` supports), so the signed tool
+        // result is asserted on the captured request body that carries the
+        // tool message back to the model.
+        let (server, captured) = start_scripted_chat_server(&[
+            chat_completion_tool_call(
+                "echo_tool",
+                "call_echo_bg",
+                serde_json::json!({"value": "background receipt"}),
+            ),
+            serde_json::json!({"choices": [{"message": {"content": "background done"}}]}),
+        ])
+        .await;
+        let tmp = TempDir::new().unwrap();
+        let workspace_dir = tmp.path().join("workspace");
+        let model_provider_config = ModelProviderConfig {
+            uri: Some(server.uri.clone()),
+            model: Some("receipt-test-model".to_string()),
+            api_key: Some("receipt-test-key".to_string()),
+            timeout_secs: Some(5),
+            // The scripted server answers with a native `tool_calls` block; the
+            // text-tool request mode ignores it and retries the same prompt.
+            native_tools: Some(true),
+            ..ModelProviderConfig::default()
+        };
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.providers.models.custom.insert(
+            "local".to_string(),
+            CustomModelProviderConfig {
+                base: model_provider_config.clone(),
+            },
+        );
+        config.risk_profiles.insert(
+            "caller_profile".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_tools: vec![DelegateTool::NAME.to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "target_profile".to_string(),
+            RiskProfileConfig {
+                auto_approve: vec!["echo_tool".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "target_agentic".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                max_tool_iterations: 2,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.local".into(),
+                risk_profile: "caller_profile".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "target".to_string(),
+                    mode: DelegateExecutionMode::Bounded,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.local".into(),
+                risk_profile: "target_profile".into(),
+                runtime_profile: "target_agentic".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let config = Arc::new(config);
+        let mut providers_models: HashMap<String, HashMap<String, ModelProviderConfig>> =
+            HashMap::new();
+        providers_models
+            .entry("custom".to_string())
+            .or_default()
+            .insert("local".to_string(), model_provider_config);
+        let caller_security =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let tool = DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_security))
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_workspace_dir(workspace_dir)
+            .with_providers_models(providers_models)
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone())
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+
+        let collector: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        // Retained so the child's token can be verified against the launching
+        // turn's key, not merely spotted.
+        let parent_generator = ReceiptGenerator::new();
+        let scope = ReceiptScope {
+            generator: parent_generator.clone(),
+            collector: Arc::clone(&collector),
+        };
+
+        let result = TOOL_LOOP_RECEIPT_CONTEXT
+            .scope(Some(scope), async {
+                tool.execute(json!({
+                    "agent": "target",
+                    "prompt": "run in background",
+                    "background": true
+                }))
+                .await
+            })
+            .await
+            .unwrap();
+
+        assert!(result.success, "background delegate failed: {result:?}");
+        let task_id = result
+            .output
+            .lines()
+            .find(|line| line.starts_with("task_id:"))
+            .unwrap()
+            .trim_start_matches("task_id: ")
+            .trim();
+        let bg_result = wait_for_terminal_background_result(&tool, task_id).await;
+        assert_eq!(
+            bg_result.status,
+            BackgroundTaskStatus::Completed,
+            "{bg_result:?}"
+        );
+        assert!(
+            bg_result
+                .output
+                .as_deref()
+                .unwrap_or_default()
+                .contains("background done"),
+            "{bg_result:?}"
+        );
+
+        let bodies = captured.lock().unwrap();
+        assert_eq!(
+            bodies.len(),
+            2,
+            "the background sub-loop makes exactly two provider requests: {bodies:?}"
+        );
+        // The second request carries the tool result back to the model as
+        // `echo:<value>\n\n[receipt: <token>]`. Verify the token with the
+        // launching turn's generator against the exact tool name, arguments
+        // and output the sub-loop signed, so a wrapper that minted its own
+        // key would fail here, not just a wrapper that signed nothing.
+        let signed_body = bodies
+            .iter()
+            .find(|body| body.contains("[receipt: zc-receipt-"))
+            .expect("one provider request must carry the signed tool result");
+        let token_start = signed_body
+            .find("[receipt: ")
+            .map(|at| at + "[receipt: ".len())
+            .unwrap();
+        let token_end = token_start + signed_body[token_start..].find(']').unwrap();
+        let token = &signed_body[token_start..token_end];
+        let echo_output = "echo:background receipt";
+        assert!(
+            parent_generator.verify(
+                token,
+                "echo_tool",
+                &serde_json::json!({"value": "background receipt"}),
+                echo_output,
+            ),
+            "the child's receipt must verify against the launching turn's key: {token}"
+        );
+        assert!(
+            !ReceiptGenerator::new().verify(
+                token,
+                "echo_tool",
+                &serde_json::json!({"value": "background receipt"}),
+                echo_output,
+            ),
+            "a receipt that verifies under an unrelated key proves nothing"
+        );
+        let receipts = collector.lock().unwrap();
+        assert!(
+            receipts.is_empty(),
+            "detached receipts must not append to the launching turn's collector: {receipts:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn delegate_spawn_helper_forwards_session_key() {
         let seen = TOOL_LOOP_SESSION_KEY
             .scope(Some("channel_session".to_string()), async {
@@ -8340,7 +9211,7 @@ mod tests {
     #[tokio::test]
     async fn execute_agentic_emits_no_receipts_when_scope_absent() {
         // Backward-compat for callers without a scoped receipt context (CLI,
-        // background spawn that does not forward scope, tests). The sub-loop
+        // a background spawn whose launching turn had receipts off, tests). The sub-loop
         // must run unsigned and the agent output must not carry a
         // `[receipt: ` trailer.
         let config = agentic_agent_config();
@@ -10398,6 +11269,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn background_task_records_the_session_key_as_principal() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_principal_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let tool = DelegateTool::new(sample_agents(), None, test_security())
+            .with_workspace_dir(workspace.clone())
+            .with_caller_alias("caller")
+            .with_task_control_plane(task_control_plane(Arc::clone(&store)));
+
+        let task_id = TOOL_LOOP_SESSION_KEY
+            .scope(Some("session-a".to_string()), async {
+                let result = tool
+                    .execute(json!({
+                        "agent": "researcher",
+                        "prompt": "principal test",
+                        "background": true
+                    }))
+                    .await
+                    .unwrap();
+                assert!(result.success, "got: {:?}", result.error);
+                result
+                    .output
+                    .lines()
+                    .find(|l| l.starts_with("task_id:"))
+                    .unwrap()
+                    .trim_start_matches("task_id: ")
+                    .trim()
+                    .to_string()
+            })
+            .await;
+
+        let stored = store.get(&task_id).await.unwrap().unwrap();
+        assert_eq!(
+            stored.principal_id.as_deref(),
+            Some("session-a"),
+            "the row records the launching tool-loop session key: {stored:?}"
+        );
+        assert_eq!(stored.originator_route.as_deref(), Some("caller"));
+        assert_eq!(
+            stored.originator_chain,
+            vec!["caller".to_string()],
+            "a root tool's chain ends with its own caller: {stored:?}"
+        );
+
+        // The alias gates visibility, not the session key: the same alias
+        // under a different session still reads the row.
+        let same_alias_other_session = DelegateTool::new(sample_agents(), None, test_security())
+            .with_workspace_dir(workspace.clone())
+            .with_caller_alias("caller")
+            .with_task_control_plane(task_control_plane(Arc::clone(&store)));
+        let visible = TOOL_LOOP_SESSION_KEY
+            .scope(Some("session-b".to_string()), async {
+                same_alias_other_session
+                    .read_background_view(&task_id, true)
+                    .await
+            })
+            .await
+            .unwrap();
+        assert!(
+            visible.is_some(),
+            "a same-alias different-session caller must still see the row"
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
     async fn list_results_includes_background_tasks() {
         let workspace = std::env::temp_dir().join(format!(
             "zeroclaw_delegate_list_tasks_{}",
@@ -12335,16 +13277,14 @@ mod tests {
         let tool = bounded_subdelegation_tool(&config)
             .with_workspace_dir(workspace.clone())
             .with_task_control_plane(task_handle);
-        // Under the TaskRecord ownership model, a second-hop background task
-        // is owned by the CHILD's caller identity ("middle"), not the root's:
-        // the background spawn ran on middle's delegate tool. The reader below
-        // models that owner; the root tool would be filtered out as a
-        // non-owner; the retrieval gap for bounded chains is tracked as a
-        // follow-up issue on the repository issue tracker.
+        // The reader is the ROOT tool, carrying the alias
+        // `bounded_subdelegation_tool` stamps ("caller"): the second-hop
+        // background row records route "middle" with the chain
+        // ["caller", "middle"], so the root retrieves it as an ancestor in
+        // the recorded chain.
         let reader = bounded_subdelegation_tool(&config)
             .with_workspace_dir(workspace.clone())
-            .with_task_control_plane(task_control_plane(task_store))
-            .with_caller_alias("middle");
+            .with_task_control_plane(task_control_plane(Arc::clone(&task_store)));
         let provider = DelegateCallThenFinalModelProvider::new_background("leaf");
         let middle_config = bounded_agent_config(&config, "middle");
 
@@ -12386,6 +13326,17 @@ mod tests {
                 .unwrap_or_default()
                 .contains("leaf finished"),
             "leaf's turn must run to completion in the background task: {waited:?}"
+        );
+        let stored = task_store.get(&task_id).await.unwrap().unwrap();
+        assert_eq!(
+            stored.originator_route.as_deref(),
+            Some("middle"),
+            "the second-hop row names the creating child as its route: {stored:?}"
+        );
+        assert_eq!(
+            stored.originator_chain,
+            vec!["caller".to_string(), "middle".to_string()],
+            "the second-hop row records the root caller and the creating child: {stored:?}"
         );
         let bodies = captured.lock().unwrap();
         assert_eq!(
@@ -12471,11 +13422,11 @@ mod tests {
 
     #[tokio::test]
     async fn bounded_delegate_task_management_unavailable_to_sub_agents() {
-        // The bounded child's delegate tool is delegate-only: background task
-        // records live in a workspace-wide namespace without owner identity,
-        // so the management surface must not reach a distinct identity
-        // sharing the parent's workspace. Management calls are refused before
-        // any admission, and the child never reaches leaf's provider.
+        // The bounded child's delegate tool is delegate-only: the child's
+        // identity is transient, so the management surface stays with the
+        // ancestors, who retrieve through the delegation chain recorded on
+        // the task row. Management calls are refused before any admission,
+        // and the child never reaches leaf's provider.
         let temp = TempDir::new().unwrap();
         let (server, requests) = start_final_text_chat_server("unreachable").await;
         let config = bounded_subdelegation_fixture(
