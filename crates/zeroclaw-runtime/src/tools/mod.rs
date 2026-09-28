@@ -4622,6 +4622,212 @@ permissions = ["http_client"]
         );
     }
 
+    #[tokio::test]
+    async fn retained_session_and_archive_tools_follow_live_channel_reassignment() {
+        use zeroclaw_infra::session_backend::SessionContext;
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.agents.clear();
+        config.agents.insert(
+            "owner".into(),
+            AliasedAgentConfig {
+                channels: vec!["discord.archive".into()],
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "peer".into(),
+            AliasedAgentConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+        config.channels.discord.insert(
+            "archive".into(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
+                archive: true,
+                ..Default::default()
+            },
+        );
+        let backend = zeroclaw_infra::make_session_backend(&config.data_dir, "sqlite").unwrap();
+        for (key, owner) in [
+            ("legacy-channel", None),
+            ("explicit-owner", Some("owner")),
+            ("foreign-owner", Some("peer")),
+        ] {
+            backend
+                .append(key, &zeroclaw_api::model_provider::ChatMessage::user(key))
+                .unwrap();
+            backend
+                .set_session_context(
+                    key,
+                    SessionContext {
+                        channel_id: Some("discord.archive"),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            if let Some(owner) = owner {
+                backend.set_session_agent_alias(key, owner).unwrap();
+            }
+        }
+        let archive =
+            zeroclaw_memory::SqliteMemory::new_named("sqlite", &config.data_dir, "discord")
+                .unwrap();
+        for (key, namespace) in [
+            ("scopedmarker", Some("discord.archive")),
+            ("legacymarker", None),
+        ] {
+            archive
+                .store_with_metadata(
+                    key,
+                    key,
+                    zeroclaw_memory::MemoryCategory::Custom("discord".into()),
+                    Some("123"),
+                    namespace,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let live = Arc::new(parking_lot::RwLock::new(config.clone()));
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..Default::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let tools = all_tools_with_runtime(
+            Arc::new(config.clone()),
+            &security,
+            &Default::default(),
+            "owner",
+            Arc::new(NativeRuntime::new()),
+            mem,
+            None,
+            None,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &config,
+            None,
+            false,
+            None,
+            None,
+            None,
+            Some(live.clone()),
+        )
+        .unwrap()
+        .tools;
+        let tool = |name: &str| tools.iter().find(|tool| tool.name() == name).unwrap();
+        for key in ["legacy-channel", "explicit-owner"] {
+            assert!(
+                tool("sessions_history")
+                    .execute(serde_json::json!({"session_id": key}))
+                    .await
+                    .unwrap()
+                    .success
+            );
+        }
+        assert!(
+            !tool("sessions_history")
+                .execute(serde_json::json!({"session_id": "foreign-owner"}))
+                .await
+                .unwrap()
+                .success
+        );
+        for marker in ["scopedmarker", "legacymarker"] {
+            let result = tool("discord_search")
+                .execute(serde_json::json!({"query": marker}))
+                .await
+                .unwrap();
+            assert!(
+                result.success && result.output.contains(marker),
+                "{}",
+                result.output
+            );
+        }
+
+        // Reuse the actual factory-built tools after the canonical policy changes.
+        {
+            let mut cfg = live.write();
+            cfg.agents.get_mut("owner").unwrap().channels.clear();
+            let peer = cfg.agents.get_mut("peer").unwrap();
+            peer.enabled = true;
+            peer.channels = vec!["discord.archive".into()];
+        }
+        let list = tool("sessions_list")
+            .execute(serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(list.success && list.output.contains("explicit-owner"));
+        assert!(!list.output.contains("legacy-channel") && !list.output.contains("foreign-owner"));
+        assert!(
+            !tool("sessions_history")
+                .execute(serde_json::json!({"session_id": "legacy-channel"}))
+                .await
+                .unwrap()
+                .success
+        );
+        assert!(
+            !tool("sessions_send")
+                .execute(serde_json::json!({"session_id": "legacy-channel", "message": "refused"}))
+                .await
+                .unwrap()
+                .success
+        );
+        assert_eq!(backend.load("legacy-channel").len(), 1);
+        assert!(
+            tool("sessions_history")
+                .execute(serde_json::json!({"session_id": "explicit-owner"}))
+                .await
+                .unwrap()
+                .success
+        );
+        for marker in ["scopedmarker", "legacymarker"] {
+            let result = tool("discord_search")
+                .execute(serde_json::json!({"query": marker}))
+                .await
+                .unwrap();
+            assert!(
+                result.success && !result.output.contains(marker),
+                "{}",
+                result.output
+            );
+        }
+
+        // Restoring a grant revives scoped access, while two enabled agents still
+        // exclude archive rows with no provenance.
+        {
+            let mut cfg = live.write();
+            cfg.agents.get_mut("peer").unwrap().channels.clear();
+            cfg.agents.get_mut("owner").unwrap().channels = vec!["discord.archive".into()];
+        }
+        assert!(
+            tool("sessions_history")
+                .execute(serde_json::json!({"session_id": "legacy-channel"}))
+                .await
+                .unwrap()
+                .success
+        );
+        let scoped = tool("discord_search")
+            .execute(serde_json::json!({"query": "scopedmarker"}))
+            .await
+            .unwrap();
+        assert!(scoped.success && scoped.output.contains("scopedmarker"));
+        let legacy = tool("discord_search")
+            .execute(serde_json::json!({"query": "legacymarker"}))
+            .await
+            .unwrap();
+        assert!(legacy.success && !legacy.output.contains("legacymarker"));
+    }
+
     /// End-to-end wiring check for the cross-agent session repro: session
     /// tools built for one agent must not read or write another agent's
     /// sessions, and sessions_list must not enumerate them.
