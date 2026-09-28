@@ -1662,6 +1662,54 @@ impl SessionBackend for SqliteSessionBackend {
         Ok(())
     }
 
+    fn claim_session_agent_alias(
+        &self,
+        session_key: &str,
+        agent_alias: &str,
+    ) -> std::io::Result<crate::session_backend::SessionOwnerClaim> {
+        use crate::session_backend::SessionOwnerClaim;
+
+        let conn = self.conn.lock();
+        let alias_val = if agent_alias.is_empty() {
+            None
+        } else {
+            Some(agent_alias)
+        };
+        let now = Utc::now().to_rfc3339();
+        // The claim is decided by the WHERE clause on the upsert, not by a
+        // preceding read: two inbound turns racing on one key cannot both see
+        // "unowned" and both write. An existing row owned by this same alias
+        // still matches, so re-stamping an ongoing conversation stays a no-op
+        // rather than becoming a refusal.
+        let changed = conn
+            .execute(
+                "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count, agent_alias)
+                 VALUES (?1, ?2, ?3, 0, ?4)
+                 ON CONFLICT(session_key) DO UPDATE SET agent_alias = excluded.agent_alias
+                 WHERE session_metadata.agent_alias IS NULL
+                    OR session_metadata.agent_alias = ''
+                    OR session_metadata.agent_alias IS excluded.agent_alias",
+                params![session_key, now, now, alias_val],
+            )
+            .map_err(std::io::Error::other)?;
+        if changed > 0 {
+            return Ok(SessionOwnerClaim::Claimed);
+        }
+        // Nothing was written, so some other alias holds the row. Report who,
+        // for the audit line; a row that vanished between the two statements
+        // is reported as claimable rather than inventing an owner.
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT agent_alias FROM session_metadata WHERE session_key = ?1",
+                params![session_key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(std::io::Error::other)?
+            .flatten();
+        Ok(existing.map_or(SessionOwnerClaim::Claimed, SessionOwnerClaim::Foreign))
+    }
+
     fn set_session_principal(&self, session_key: &str, principal_id: &str) -> std::io::Result<()> {
         let conn = self.conn.lock();
         let principal_val = if principal_id.is_empty() {

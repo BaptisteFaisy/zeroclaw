@@ -8651,13 +8651,21 @@ async fn reconcile_early_ack(
 /// nothing authorization-bearing reads this column; representing the full
 /// participant set needs a session-store schema change and is deliberately
 /// out of scope here.
+/// Claim the session for the routed agent and record routing metadata.
+///
+/// Returns `false` when another agent already owns `history_key`, and the
+/// caller must abandon the turn: routing a message to an agent is not
+/// permission to take over a transcript, and continuing would hydrate the
+/// other agent's history into this model and let the session tools pass
+/// their ownership checks against a stolen owner.
+#[must_use]
 fn stamp_session_routing_context(
     ctx: &ChannelRuntimeContext,
     msg: &ChannelMessage,
     history_key: &str,
-) {
+) -> bool {
     let Some(ref store) = ctx.session_store else {
-        return;
+        return true;
     };
 
     let channel_id = if msg.channel.trim().is_empty() {
@@ -8685,14 +8693,40 @@ fn stamp_session_routing_context(
         room_id,
         sender_id: Some(msg.sender.as_str()).filter(|s| !s.is_empty()),
     };
-    if let Err(e) = store.set_session_agent_alias(history_key, ctx.agent_alias.as_str()) {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"history_key": history_key, "e": e.to_string()})),
-            "Failed to stamp session agent ownership"
-        );
+    match store.claim_session_agent_alias(history_key, ctx.agent_alias.as_str()) {
+        Ok(zeroclaw_infra::session_backend::SessionOwnerClaim::Claimed) => {}
+        Ok(zeroclaw_infra::session_backend::SessionOwnerClaim::Foreign(owner)) => {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "history_key": history_key,
+                        "routed_agent": ctx.agent_alias.as_str(),
+                        "owning_agent": owner,
+                        "error_key": "session_owner_conflict",
+                    })),
+                "Inbound message routed to an agent that does not own this session; refusing the turn"
+            );
+            return false;
+        }
+        Err(e) => {
+            // Fail closed. An unreadable ownership record is exactly the
+            // state in which an overwrite would be unrecoverable, so the
+            // turn stops rather than proceeding unattributed.
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "history_key": history_key,
+                        "e": e.to_string(),
+                        "error_key": "session_owner_unreadable",
+                    })),
+                "Could not establish session ownership; refusing the turn"
+            );
+            return false;
+        }
     }
     if let Err(e) = store.set_session_context(history_key, context) {
         ::zeroclaw_log::record!(
@@ -8703,6 +8737,7 @@ fn stamp_session_routing_context(
             "Failed to stamp session routing context"
         );
     }
+    true
 }
 
 fn record_passive_context(ctx: &ChannelRuntimeContext, msg: &ChannelMessage, history_key: &str) {
@@ -8886,7 +8921,12 @@ async fn process_channel_message_body(
     }
 
     let history_key = runtime_conversation_history_key(ctx.as_ref(), &msg);
-    stamp_session_routing_context(ctx.as_ref(), &msg, &history_key);
+    // Before anything reads or appends to this transcript. A refused claim
+    // means the key belongs to another agent, so hydrating it here is what
+    // would leak the other agent's history into this model.
+    if !stamp_session_routing_context(ctx.as_ref(), &msg, &history_key) {
+        return;
+    }
     if msg.passive_context {
         record_passive_context(ctx.as_ref(), &msg, &history_key);
         return;
@@ -21154,6 +21194,100 @@ temperature = 0.3
         );
     }
 
+    /// Two conversations can normalize onto one storage key, and an operator
+    /// reassigning a channel points the next message at a transcript another
+    /// agent owns. Routing decides which agent answers; it must not decide
+    /// who owns the history.
+    #[test]
+    fn a_routed_agent_cannot_take_over_another_agents_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session_store: Arc<dyn SessionBackend> =
+            Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+
+        // Agent A owns the transcript and has real content in it.
+        session_store
+            .append(
+                "webhook_a_b_b_b_alice",
+                &ChatMessage::user("A_ONLY_SECRET"),
+            )
+            .unwrap();
+        let claim_a = session_store
+            .claim_session_agent_alias("webhook_a_b_b_b_alice", "agent-a")
+            .unwrap();
+        assert_eq!(
+            claim_a,
+            zeroclaw_infra::session_backend::SessionOwnerClaim::Claimed,
+            "the first claim on an unowned session must succeed"
+        );
+
+        // Agent B is routed onto the same computed key.
+        let ctx_b = ChannelRuntimeContext {
+            session_store: Some(Arc::clone(&session_store)),
+            agent_alias: Arc::new("agent-b".to_string()),
+            ..(*router_test_ctx()).clone()
+        };
+        let msg = ChannelMessage {
+            id: "msg-b".into(),
+            sender: "alice".into(),
+            reply_target: "b".into(),
+            content: "Summarize the prior discussion".into(),
+            channel: "webhook".into(),
+            channel_alias: Some("a_b".to_string()),
+            timestamp: 0,
+            thread_ts: Some("b".to_string()),
+            ..Default::default()
+        };
+
+        let proceeded =
+            stamp_session_routing_context(&ctx_b, &msg, "webhook_a_b_b_b_alice");
+
+        assert!(
+            !proceeded,
+            "a foreign-owned session must abandon the turn, not continue into hydration"
+        );
+        assert_eq!(
+            session_store
+                .get_session_agent_alias("webhook_a_b_b_b_alice")
+                .unwrap()
+                .as_deref(),
+            Some("agent-a"),
+            "the durable owner must still be agent-a"
+        );
+        let transcript = session_store.load("webhook_a_b_b_b_alice");
+        assert_eq!(
+            transcript.len(),
+            1,
+            "the refused turn must not have appended to another agent's transcript"
+        );
+        assert!(
+            transcript[0].content.contains("A_ONLY_SECRET"),
+            "agent-a's content must be untouched"
+        );
+
+        // Non-vacuous in the other direction: the owner itself still proceeds,
+        // so this test fails if the claim simply refuses everyone.
+        let ctx_a = ChannelRuntimeContext {
+            session_store: Some(Arc::clone(&session_store)),
+            agent_alias: Arc::new("agent-a".to_string()),
+            ..(*router_test_ctx()).clone()
+        };
+        assert!(
+            stamp_session_routing_context(&ctx_a, &msg, "webhook_a_b_b_b_alice"),
+            "the owning agent must still be able to continue its own session"
+        );
+
+        // And an unowned key is still claimable, so ordinary first contact works.
+        let ctx_c = ChannelRuntimeContext {
+            session_store: Some(Arc::clone(&session_store)),
+            agent_alias: Arc::new("agent-c".to_string()),
+            ..(*router_test_ctx()).clone()
+        };
+        assert!(
+            stamp_session_routing_context(&ctx_c, &msg, "fresh-unowned-key"),
+            "an unowned session must still be claimable"
+        );
+    }
+
     #[test]
     fn stamp_session_routing_context_persists_message_metadata() {
         struct Case {
@@ -21235,7 +21369,7 @@ temperature = 0.3
                 ..Default::default()
             };
 
-            stamp_session_routing_context(&ctx, &msg, case.history_key);
+            assert!(stamp_session_routing_context(&ctx, &msg, case.history_key));
 
             let metadata = session_store
                 .get_session_metadata(case.history_key)
@@ -21275,7 +21409,7 @@ temperature = 0.3
             channel_alias: None,
             ..Default::default()
         };
-        stamp_session_routing_context(&ctx, &msg, "webhook-session");
+        assert!(stamp_session_routing_context(&ctx, &msg, "webhook-session"));
 
         let scope = SessionOwnershipScope::for_agent("test-agent");
         let security = Arc::new(SecurityPolicy::default());

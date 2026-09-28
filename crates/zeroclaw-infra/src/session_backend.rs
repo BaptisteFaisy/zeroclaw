@@ -128,6 +128,19 @@ pub fn check_session_ownership(
     Err(SessionOwnershipDenial::Unattributed)
 }
 
+/// Outcome of an ownership claim on a session key.
+///
+/// `Foreign` carries the owner that refused the claim so the caller can
+/// audit which agent actually holds the transcript, rather than only that
+/// the claim failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionOwnerClaim {
+    /// The session was unowned, or already owned by the claiming alias.
+    Claimed,
+    /// Another agent owns it; the claim was refused and nothing was written.
+    Foreign(String),
+}
+
 /// Trait for session persistence backends.
 /// Implementations must be `Send + Sync` for sharing across async tasks.
 pub trait SessionBackend: Send + Sync {
@@ -309,6 +322,32 @@ pub trait SessionBackend: Send + Sync {
         _agent_alias: &str,
     ) -> std::io::Result<()> {
         Ok(())
+    }
+
+    /// Claim ownership of a session for `agent_alias`, but only if it is
+    /// unowned or already owned by that alias.
+    ///
+    /// This exists because routing an inbound message to an agent is not
+    /// permission to seize a transcript another agent already owns. Two
+    /// distinct conversations can normalize onto one storage key (the key
+    /// builder concatenates channel, thread and sender without an
+    /// unambiguous encoding), and an operator reassigning a channel from A
+    /// to B makes the very next inbound message collide with A's history.
+    /// An unconditional write turns either case into a silent ownership
+    /// transfer, after which the reader checks pass against the wrong owner.
+    ///
+    /// Backends that record attribution MUST decide the claim inside the
+    /// mutating statement rather than read-then-write, so two concurrent
+    /// inbound turns cannot both observe "unowned" and both claim.
+    ///
+    /// The default is `Claimed`: a backend that stores no attribution has no
+    /// ownership to defend and must not start refusing traffic.
+    fn claim_session_agent_alias(
+        &self,
+        _session_key: &str,
+        _agent_alias: &str,
+    ) -> std::io::Result<SessionOwnerClaim> {
+        Ok(SessionOwnerClaim::Claimed)
     }
 
     /// Get the agent alias associated with a session, if recorded.

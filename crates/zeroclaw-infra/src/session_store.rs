@@ -867,6 +867,34 @@ impl SessionBackend for SessionStore {
         })
     }
 
+    fn claim_session_agent_alias(
+        &self,
+        session_key: &str,
+        agent_alias: &str,
+    ) -> std::io::Result<crate::session_backend::SessionOwnerClaim> {
+        use crate::session_backend::SessionOwnerClaim;
+
+        // Read and write under one guard so a concurrent claim in this
+        // process cannot interleave between the two. The guard is an
+        // in-process mutex, so this is not a cross-process claim; the SQLite
+        // backend decides it in the statement and is the one that holds under
+        // concurrent writers.
+        let _guard = self.mutation_guard()?;
+        let existing = self
+            .read_metadata(session_key)?
+            .and_then(|metadata| metadata.agent_alias)
+            .filter(|owner| !owner.is_empty());
+        if let Some(owner) = existing
+            && owner != agent_alias
+        {
+            return Ok(SessionOwnerClaim::Foreign(owner));
+        }
+        self.update_metadata_unlocked(session_key, |metadata| {
+            metadata.agent_alias = (!agent_alias.is_empty()).then(|| agent_alias.to_string());
+        })?;
+        Ok(SessionOwnerClaim::Claimed)
+    }
+
     fn get_session_agent_alias(&self, session_key: &str) -> std::io::Result<Option<String>> {
         Ok(self
             .read_metadata(session_key)?
