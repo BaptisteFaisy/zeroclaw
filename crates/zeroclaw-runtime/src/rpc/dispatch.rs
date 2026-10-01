@@ -12481,7 +12481,7 @@ impl RpcDispatcher {
             return Ok(());
         };
         if executes {
-            self.refuse_constrained_tool_selector_for_sop(method, grants)?;
+            self.refuse_constrained_principal_for_sop(method, grants)?;
         }
         let agents = {
             let config = self.ctx.config.read();
@@ -12497,38 +12497,26 @@ impl RpcDispatcher {
         Ok(())
     }
 
-    /// Refuse a procedure run by a principal whose tool selector names a
-    /// subset of the tools rather than the wildcard.
-    ///
-    /// A session composes [`Self::principal_tool_narrowing`] into the agent it
-    /// assembles, so a principal with a named tool list gets a narrowed
-    /// session rather than a refusal. A procedure is dispatched through the
-    /// SOP engine, which builds its own agents from the procedure's own policy
-    /// and never sees that narrowing, so the same principal would run with the
-    /// agent's full tool set. Until the narrowing is plumbed through the
-    /// engine, this path keeps the fail-closed posture the session selector
-    /// used to carry.
-    ///
-    /// Only a principal that [`principal_tool_ceiling`] leaves unnarrowed
-    /// passes. That is the same ceiling its own session gets, so the engine
-    /// assembling the agent's own tool set does not exceed that ceiling. A
-    /// wildcard selector alone is not enough; without the coarse
-    /// `tools:execute` grant the same principal gets a tool-less session.
-    /// This guard does not withhold the nested execution tools that a session
-    /// also removes for a principal without the `"*"` agent selector (see
-    /// [`Self::apply_principal_grants_to_agent`]).
-    fn refuse_constrained_tool_selector_for_sop(
+    /// Headless steps and their descendants do not carry the caller's tool or
+    /// agent ceiling. Until they do, only callers unrestricted on both axes
+    /// may start or resume them. Authoring retains its separate agent checks.
+    fn refuse_constrained_principal_for_sop(
         &self,
         method: Method,
         grants: &zeroclaw_api::grants::ResolvedGrants,
     ) -> Result<(), JsonRpcError> {
-        if principal_tool_ceiling(grants).is_none() {
+        if principal_tool_ceiling(grants).is_none()
+            && (grants.admin
+                || grants
+                    .allowed_agents
+                    .iter()
+                    .any(|alias| alias == zeroclaw_api::grants::WILDCARD))
+        {
             return Ok(());
         }
         let denied = rpc_err(
             FORBIDDEN,
-            "Principal has a constrained tool selector; procedures run outside per-session tool \
-             narrowing and are refused to it",
+            crate::i18n::get_required_cli_string("sop-rpc-principal-ceiling-required"),
         );
         self.audit_auth_denial(
             method,
@@ -12554,7 +12542,7 @@ impl RpcDispatcher {
         let Some(grants) = self.recheck_authority_after_admission(method)? else {
             return Ok(());
         };
-        self.refuse_constrained_tool_selector_for_sop(method, &grants)?;
+        self.refuse_constrained_principal_for_sop(method, &grants)?;
         if let Some(agents) = agents {
             for alias in agents {
                 self.selector_session_agent_with_grants(method, &grants, &alias)?;
@@ -12917,7 +12905,7 @@ impl RpcDispatcher {
         let _guard = span.enter();
 
         if let Some(grants) = self.stamped_grants() {
-            self.refuse_constrained_tool_selector_for_sop(Method::SopsDecide, grants)?;
+            self.refuse_constrained_principal_for_sop(Method::SopsDecide, grants)?;
         }
 
         let mut resolved_outcome = None;
@@ -14532,6 +14520,8 @@ pub(crate) mod connection_test_support {
 
 #[cfg(test)]
 mod tests {
+    mod sop_principal;
+
     use zeroclaw_api::model_provider::ChatMessage;
 
     struct SessionFactoryStubChannel;
@@ -19473,6 +19463,16 @@ mod tests {
         (ctx, engine, sops_dir)
     }
 
+    fn allow_all_sop_agents(ctx: &RpcContext) {
+        let mut config = ctx.config.write();
+        config
+            .permission_profiles
+            .get_mut("cron-alpha")
+            .unwrap()
+            .allowed_agents = vec!["*".into()];
+        ctx.auth.refresh_from_config(&config).unwrap();
+    }
+
     fn park_sop_run(engine: &Arc<std::sync::Mutex<crate::sop::SopEngine>>, name: &str) -> String {
         let action = engine
             .lock()
@@ -19509,10 +19509,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sop_run_and_decide_refuse_a_procedure_run_as_an_agent_outside_the_selector() {
+    async fn sop_run_and_decide_refuse_agent_scoped_execution() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (ctx, engine, _sops_dir) = sop_scoped_ctx(&tmp, 4242);
-        let beta_run = park_sop_run(&engine, "beta-sop");
+        let alpha_run = park_sop_run(&engine, "alpha-sop");
         let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
 
         let run = rpc(
@@ -19520,7 +19520,7 @@ mod tests {
             &mut rx,
             1,
             "sops/run",
-            json!({"name": "beta-sop"}),
+            json!({"name": "alpha-sop"}),
         )
         .await;
         assert_eq!(run["error"]["code"], json!(FORBIDDEN), "{run}");
@@ -19530,7 +19530,7 @@ mod tests {
             &mut rx,
             2,
             "sops/decide",
-            json!({"name": "beta-sop", "run_id": beta_run, "decision": "approve"}),
+            json!({"name": "alpha-sop", "run_id": alpha_run, "decision": "approve"}),
         )
         .await;
         assert_eq!(decided["error"]["code"], json!(FORBIDDEN), "{decided}");
@@ -19538,14 +19538,13 @@ mod tests {
             engine
                 .lock()
                 .expect("engine lock")
-                .get_run(&beta_run)
+                .get_run(&alpha_run)
                 .map(|run| run.status),
             Some(crate::sop::SopRunStatus::WaitingApproval),
             "a refused approval must leave the run parked"
         );
 
-        // alpha's procedure passes the selector. This context has no SOP audit
-        // log, so the run then fails as unavailable rather than as refused.
+        allow_all_sop_agents(&ctx);
         let admitted = rpc(
             &mut alice,
             &mut rx,
@@ -19561,6 +19560,7 @@ mod tests {
     async fn sop_run_refuses_a_constrained_tool_selector_like_a_session() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (ctx, _engine, _sops_dir) = sop_scoped_ctx(&tmp, 4242);
+        allow_all_sop_agents(&ctx);
         let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
         let mut narrowed = ctx.config.read().clone();
         narrowed
@@ -19587,6 +19587,7 @@ mod tests {
     async fn sop_run_and_decide_refuse_a_wildcard_selector_without_tools_execute() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (ctx, engine, _sops_dir) = sop_scoped_ctx(&tmp, 4242);
+        allow_all_sop_agents(&ctx);
         let alpha_run = park_sop_run(&engine, "alpha-sop");
         let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
         let mut without_tools = ctx.config.read().clone();
@@ -19647,6 +19648,7 @@ mod tests {
     async fn sop_missing_definition_cannot_bypass_the_tool_ceiling() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (ctx, engine, _) = sop_scoped_ctx(&tmp, 4242);
+        allow_all_sop_agents(&ctx);
         let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
         let mut revoked = ctx.config.read().clone();
         revoked
@@ -19714,6 +19716,7 @@ mod tests {
             ] {
                 let tmp = tempfile::TempDir::new().unwrap();
                 let (ctx, engine, _) = sop_scoped_ctx(&tmp, 4242);
+                allow_all_sop_agents(&ctx);
                 let model = Arc::new(PausedSopDecision {
                     entered: tokio::sync::Notify::new(),
                     release: tokio::sync::Notify::new(),
@@ -19779,7 +19782,7 @@ mod tests {
                                     .grants
                                     .remove(&zeroclaw_api::grants::Resource::Tools);
                             } else {
-                                profile.allowed_agents.clear();
+                                profile.allowed_agents = vec!["alpha".into()];
                             }
                             ctx.auth.refresh_from_config(&revoked).unwrap();
                         }
@@ -19801,7 +19804,7 @@ mod tests {
                     model.release.notify_one();
                 };
                 let (response, ()) = tokio::join!(request, mutate);
-                if change == "control" {
+                if matches!(change, "control" | "definition") {
                     assert!(response.get("error").is_none(), "{response}");
                     assert_eq!(engine.lock().unwrap().active_runs().len(), 1);
                 } else {
@@ -19823,6 +19826,7 @@ mod tests {
     async fn sop_decide_rechecks_live_authority_after_engine_lock_with_a_stale_stamp() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (ctx, engine, _) = sop_scoped_ctx(&tmp, 4242);
+        allow_all_sop_agents(&ctx);
         let run_id = park_sop_run(&engine, "alpha-sop");
         let (alice, _) = roster_peer(&ctx, 4242).await;
         let engine_guard = engine.lock().unwrap();
@@ -19867,6 +19871,7 @@ mod tests {
     async fn sop_run_is_refused_once_tools_execute_is_revoked() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (ctx, engine, _sops_dir) = sop_scoped_ctx(&tmp, 4242);
+        allow_all_sop_agents(&ctx);
         let alpha_run = park_sop_run(&engine, "alpha-sop");
         let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
 

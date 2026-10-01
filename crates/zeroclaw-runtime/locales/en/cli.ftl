@@ -1516,6 +1516,7 @@ sop-approval-deferred-at-capacity = Approval could not resume run {$run_id}: exe
 sop-approval-policy-unavailable = Approval failed because the parked SOP step is unavailable: {$reason}. The run remains waiting.
 sop-rpc-decision-invalid-state = Run {$run_id} cannot be resolved in its current state.
 sop-rpc-decision-unauthorized = The RPC principal is not authorized to resolve this SOP step.
+sop-rpc-principal-ceiling-required = Principal has constrained tool or agent access; procedures cannot preserve those ceilings.
 sop-rpc-policy-missing = SOP approval policy '{$name}' is not configured.
 sop-rpc-policy-unavailable = The parked SOP policy is unavailable: {$reason}.
 
