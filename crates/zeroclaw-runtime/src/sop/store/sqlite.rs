@@ -119,7 +119,7 @@ impl SqliteRunStore {
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>, StoreError> {
         let conn = if self.nonblocking {
             self.conn.try_lock().map_err(|_| {
-                StoreError::Backend("SOP store busy or poisoned; retry the request".into())
+                StoreError::Backend(crate::i18n::get_required_cli_string("sop-store-busy"))
             })?
         } else {
             self.conn

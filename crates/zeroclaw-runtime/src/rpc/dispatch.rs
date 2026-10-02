@@ -19786,6 +19786,18 @@ mod tests {
             let (mut peer, mut rx) = call.join().unwrap();
             let response = result.expect("RPC must refuse without waiting for SQLite's writer");
             assert!(response.get("error").is_some(), "{response}");
+            assert_ne!(
+                response["error"]["code"],
+                json!(INVALID_PARAMS),
+                "the request must reach storage, not fail argument parsing: {response}"
+            );
+            assert!(
+                response["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("locked"),
+                "the external SQLite writer must cause the refusal: {response}"
+            );
             assert_eq!(store.claim_counts("alpha-sop").unwrap(), (0, 0));
             if let Some(id) = &run_id {
                 assert_eq!(
@@ -19801,7 +19813,7 @@ mod tests {
                     &mut rx,
                     2,
                     "sops/decide",
-                    json!({"name":"alpha-sop","run_id":id,"decision":"deny"}),
+                    json!({"name":"alpha-sop","run_id":id,"decision":{"deny":{}}}),
                 )
                 .await;
                 assert!(

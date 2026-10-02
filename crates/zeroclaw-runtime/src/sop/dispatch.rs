@@ -1248,9 +1248,11 @@ async fn dispatch_sop_event_filtered(
                 let decision = decided.remove(sop_name).unwrap_or_default();
                 let start = if let Some(authorize) = authorize {
                     eng.with_nonblocking_store(|eng| {
-                        let sop = eng
-                            .get_sop(sop_name)
-                            .ok_or_else(|| anyhow::anyhow!("SOP not found"))?;
+                        let sop = eng.get_sop(sop_name).ok_or_else(|| {
+                            anyhow::Error::msg(crate::i18n::get_required_cli_string(
+                                "sop-rpc-definition-unavailable",
+                            ))
+                        })?;
                         let _authority = authorize(sop).map_err(anyhow::Error::msg)?;
                         eng.start_run_with_mode(
                             sop_name,

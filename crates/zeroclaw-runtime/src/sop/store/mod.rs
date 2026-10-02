@@ -23,9 +23,9 @@ pub trait SopRunStore: Send + Sync {
     /// Used only while an RPC holds current authority through a synchronous
     /// effect. Unknown backends fail closed instead of silently waiting.
     fn nonblocking(&self) -> Result<Arc<dyn SopRunStore>, StoreError> {
-        Err(StoreError::Backend(
-            "nonblocking SOP store access unavailable".into(),
-        ))
+        Err(StoreError::Backend(crate::i18n::get_required_cli_string(
+            "sop-store-nonblocking-unavailable",
+        )))
     }
 
     // ── run state (persistence-resume, state-machine) ──
@@ -302,7 +302,7 @@ impl InMemoryRunStore {
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Inner>, StoreError> {
         if self.nonblocking {
             self.inner.try_lock().map_err(|_| {
-                StoreError::Backend("SOP store busy or poisoned; retry the request".into())
+                StoreError::Backend(crate::i18n::get_required_cli_string("sop-store-busy"))
             })
         } else {
             self.inner
