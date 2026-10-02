@@ -1068,6 +1068,12 @@ mod tests {
     async fn enrollment_basic_credentials_round_trip_on_every_endpoint() {
         use base64::engine::general_purpose::STANDARD;
 
+        fn decode_form(body: &[u8]) -> HashMap<String, String> {
+            let mut url = reqwest::Url::parse("http://localhost/").unwrap();
+            url.set_query(Some(std::str::from_utf8(body).unwrap()));
+            url.query_pairs().into_owned().collect()
+        }
+
         for (client_id, secret) in [
             ("daemon-client", Some("plainsecret123")),
             ("daemon: +/%&=", Some("s: +/%&=cret")),
@@ -1108,7 +1114,7 @@ mod tests {
             let posts: Vec<_> = requests.iter().filter(|r| r.method == "POST").collect();
             assert_eq!(posts.len(), if secret.is_some() { 3 } else { 2 });
             for request in posts {
-                let form: HashMap<_, _> = url::form_urlencoded::parse(&request.body).collect();
+                let form = decode_form(&request.body);
                 assert!(!form.contains_key("client_secret"));
                 match secret {
                     Some(secret) => {
@@ -1129,8 +1135,7 @@ mod tests {
                             "literal credential separator reached the wire"
                         );
                         let encoded = format!("id={id}&secret={password}");
-                        let credentials: HashMap<_, _> =
-                            url::form_urlencoded::parse(encoded.as_bytes()).collect();
+                        let credentials = decode_form(encoded.as_bytes());
                         assert_eq!(credentials.len(), 2);
                         assert_eq!(credentials["id"], client_id);
                         assert_eq!(credentials["secret"], secret);
