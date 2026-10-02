@@ -19786,11 +19786,9 @@ mod tests {
             let (mut peer, mut rx) = call.join().unwrap();
             let response = result.expect("RPC must refuse without waiting for SQLite's writer");
             assert!(response.get("error").is_some(), "{response}");
-            assert_ne!(
-                response["error"]["code"],
-                json!(INVALID_PARAMS),
-                "the request must reach storage, not fail argument parsing: {response}"
-            );
+            // Start admission reports storage failures as INVALID_PARAMS, whereas
+            // resume uses INTERNAL_ERROR. Pin the actual SQLite cause below so
+            // a parser/permission refusal cannot satisfy this regression.
             assert!(
                 response["error"]["message"]
                     .as_str()
