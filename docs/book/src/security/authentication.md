@@ -385,13 +385,14 @@ paths do not yet carry both current principal ceilings; the ordinary parent
 turn remains usable. Admin principals and principals with both selectors set
 to `"*"` keep their agent's configured nested capabilities.
 
-RPC `sops/run` and `sops/decide` also refuse a non-admin principal with a
-constrained agent selector, even when the procedure names only permitted
-agents. Headless steps can delegate, and do not carry that caller's agent
-ceiling into their descendants. They require both wildcard selectors and
-`tools:execute`, or administrator grants. This includes deny, amend, and
-revise decisions, matching the existing tool-ceiling restriction on those
-methods. SOP authoring keeps its separate agent-selector checks.
+RPC `sops/run` and `sops/decide` require administrator grants, including
+when a non-admin has wildcard tool and agent selectors. Headless steps do
+not carry the caller's principal restrictions. This includes deny, amend,
+and revise decisions. After decision-model and engine waits, the RPC holds
+current authority through its synchronous store effects. A busy SOP store
+refuses the request immediately; retry once contention clears. Background
+SOP processing keeps its normal storage timeout. SOP authoring retains its
+separate agent-selector checks.
 
 The existing eight-argument Rust `Agent::from_live_config_with_tui_env`
 constructor remains available. RPC uses the additive

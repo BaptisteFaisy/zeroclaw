@@ -12559,7 +12559,7 @@ impl RpcDispatcher {
                 .map_err(|denied| rpc_err(denied.code, denied.message))?;
             self.refuse_constrained_principal_for_sop(method, &grants)?;
         }
-        Ok(Box::new((config, lease)))
+        Ok(Box::new((lease, config)))
     }
 
     /// The procedure as the engine will load it once `save_sop` has written it.
