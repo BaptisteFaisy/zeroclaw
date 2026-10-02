@@ -653,7 +653,11 @@ pub async fn dispatch_sop_event_to_deduplicated(
     .await
 }
 
-type StartAuthorization<'a> = dyn Fn(&super::Sop) -> Result<(), String> + Sync + 'a;
+pub(crate) trait StartEffectGuard {}
+impl<T> StartEffectGuard for T {}
+
+type StartAuthorization<'a> =
+    dyn Fn(&super::Sop) -> Result<Box<dyn StartEffectGuard + 'a>, String> + Sync + 'a;
 
 /// RPC admission hook, borrowed only for this dispatch. It runs under the engine
 /// lock after decision-model waits, against the procedure that will actually
@@ -1242,12 +1246,23 @@ async fn dispatch_sop_event_filtered(
                     SopAdmission::Admit => {}
                 }
                 let decision = decided.remove(sop_name).unwrap_or_default();
-                match eng.start_run_with_mode(
-                    sop_name,
-                    event.clone(),
-                    decision.mode,
-                    decision.parts,
-                ) {
+                let start = if let Some(authorize) = authorize {
+                    eng.with_nonblocking_store(|eng| {
+                        let sop = eng
+                            .get_sop(sop_name)
+                            .ok_or_else(|| anyhow::anyhow!("SOP not found"))?;
+                        let _authority = authorize(sop).map_err(anyhow::Error::msg)?;
+                        eng.start_run_with_mode(
+                            sop_name,
+                            event.clone(),
+                            decision.mode,
+                            decision.parts,
+                        )
+                    })
+                } else {
+                    eng.start_run_with_mode(sop_name, event.clone(), decision.mode, decision.parts)
+                };
+                match start {
                     Ok(action) => {
                         let result =
                             record_started_run(&eng, sop_name, action, &mut pending_deterministic);

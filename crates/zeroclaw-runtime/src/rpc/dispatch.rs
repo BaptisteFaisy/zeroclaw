@@ -12497,21 +12497,16 @@ impl RpcDispatcher {
         Ok(())
     }
 
-    /// Headless steps and their descendants do not carry the caller's tool or
-    /// agent ceiling. Until they do, only callers unrestricted on both axes
-    /// may start or resume them. Authoring retains its separate agent checks.
+    /// Headless steps do not carry the caller's principal or session-data
+    /// restrictions. Until they do, only administrators may start or resume
+    /// them, including when a non-admin has wildcard tool and agent selectors.
+    /// Authoring retains its separate agent checks.
     fn refuse_constrained_principal_for_sop(
         &self,
         method: Method,
         grants: &zeroclaw_api::grants::ResolvedGrants,
     ) -> Result<(), JsonRpcError> {
-        if principal_tool_ceiling(grants).is_none()
-            && (grants.admin
-                || grants
-                    .allowed_agents
-                    .iter()
-                    .any(|alias| alias.as_str() == zeroclaw_api::grants::WILDCARD))
-        {
+        if grants.admin {
             return Ok(());
         }
         let denied = rpc_err(
@@ -12549,6 +12544,22 @@ impl RpcDispatcher {
             }
         }
         Ok(())
+    }
+
+    fn sop_execution_lease<'a>(
+        &'a self,
+        method: Method,
+    ) -> Result<Box<dyn crate::sop::dispatch::StartEffectGuard + 'a>, JsonRpcError> {
+        // Match publication's config -> accepted authority -> pairing order.
+        // Callers use a nonblocking store and drop this before any await.
+        let config = self.ctx.config.read();
+        let lease = self.ctx.auth.hold_authority();
+        if let Some(auth) = self.auth.as_ref() {
+            let grants = current_authority_under(&lease, auth, method)
+                .map_err(|denied| rpc_err(denied.code, denied.message))?;
+            self.refuse_constrained_principal_for_sop(method, &grants)?;
+        }
+        Ok(Box::new((config, lease)))
     }
 
     /// The procedure as the engine will load it once `save_sop` has written it.
@@ -12710,6 +12721,7 @@ impl RpcDispatcher {
         let denied = parking_lot::Mutex::new(None);
         let authorize = |sop: &crate::sop::Sop| {
             self.authorize_sop_execution(Method::SopsRun, Some(sop))
+                .and_then(|()| self.sop_execution_lease(Method::SopsRun))
                 .map_err(|error| {
                     let reason = error.message.clone();
                     *denied.lock() = Some(error);
@@ -12933,10 +12945,21 @@ impl RpcDispatcher {
             self.authorize_sop_execution(Method::SopsDecide, guard.get_sop(&run_sop_name))?;
             use crate::sop::approval::{BrokerOutcome, ResolveOutcome};
             let principal = crate::sop::approval::ApprovalPrincipal::cli(self.tui_id.clone());
-            match guard
-                .resolve_via_broker_deferred(&req.run_id, decision, principal)
-                .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?
-            {
+            let denied = parking_lot::Mutex::new(None);
+            let outcome = guard.with_nonblocking_store(|engine| {
+                let _authority = self
+                    .sop_execution_lease(Method::SopsDecide)
+                    .map_err(|error| {
+                        let reason = error.message.clone();
+                        *denied.lock() = Some(error);
+                        anyhow::Error::msg(reason)
+                    })?;
+                engine.resolve_via_broker_deferred(&req.run_id, decision, principal)
+            });
+            if let Some(error) = denied.into_inner() {
+                return Err(error);
+            }
+            match outcome.map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))? {
                 outcome @ BrokerOutcome::Resolved(ResolveOutcome::Resumed(_)) => {
                     resolved_outcome = Some(outcome);
                 }
@@ -19473,6 +19496,16 @@ mod tests {
         ctx.auth.refresh_from_config(&config).unwrap();
     }
 
+    fn grant_sop_admin(ctx: &RpcContext) {
+        let mut config = ctx.config.write();
+        config
+            .permission_profiles
+            .get_mut("cron-alpha")
+            .unwrap()
+            .admin = true;
+        ctx.auth.refresh_from_config(&config).unwrap();
+    }
+
     fn park_sop_run(engine: &Arc<std::sync::Mutex<crate::sop::SopEngine>>, name: &str) -> String {
         let action = engine
             .lock()
@@ -19553,7 +19586,24 @@ mod tests {
             json!({"name": "alpha-sop"}),
         )
         .await;
-        assert_sop_run_admitted(&admitted);
+        assert_eq!(
+            admitted["error"]["code"],
+            json!(FORBIDDEN),
+            "wildcards do not grant session-data authority: {admitted}"
+        );
+        let decided = rpc(
+            &mut alice,
+            &mut rx,
+            4,
+            "sops/decide",
+            json!({"name":"alpha-sop", "run_id":alpha_run, "decision":"approve"}),
+        )
+        .await;
+        assert_eq!(decided["error"]["code"], json!(FORBIDDEN), "{decided}");
+        assert_eq!(
+            engine.lock().unwrap().get_run(&alpha_run).unwrap().status,
+            crate::sop::SopRunStatus::WaitingApproval
+        );
     }
 
     #[tokio::test]
@@ -19679,6 +19729,105 @@ mod tests {
         assert_eq!(decided["error"]["code"], json!(FORBIDDEN), "{decided}");
     }
 
+    /// The actual RPC must finish its refusal while the external writer is still
+    /// holding SQLite, rather than waiting with an already accepted authority.
+    #[tokio::test]
+    async fn sop_rpc_refuses_sqlite_contention_before_start_or_resume_effects() {
+        use crate::sop::{SopRunStatus, SopRunStore};
+        for resume in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (base, engine, _) = sop_scoped_ctx(&tmp, 4242);
+            grant_sop_admin(&base);
+            let path = tmp.path().join("sop-contention.db");
+            let store = Arc::new(crate::sop::SqliteRunStore::open(&path).unwrap());
+            let mut replacement = crate::sop::SopEngine::new(base.config.read().sop.clone())
+                .with_store(store.clone());
+            replacement.set_sops_for_test(vec![gated_sop("alpha-sop", "alpha")]);
+            *engine.lock().unwrap() = replacement;
+            let run_id = resume.then(|| park_sop_run(&engine, "alpha-sop"));
+            let before = run_id.as_ref().map(|id| {
+                serde_json::to_value(engine.lock().unwrap().get_run(id).unwrap()).unwrap()
+            });
+            let shared: Arc<dyn zeroclaw_memory::traits::Memory> =
+                Arc::new(zeroclaw_memory::SqliteMemory::new("sqlite", tmp.path()).unwrap());
+            let ctx = RpcContext::minimal_with_sop_engine_and_audit(
+                base.config.read().clone(),
+                Arc::clone(&base.sessions),
+                engine.clone(),
+                Arc::new(crate::sop::SopAuditLogger::new(shared)),
+                None,
+            );
+            let (mut peer, mut rx) = roster_peer(&ctx, 4242).await;
+            let method = if resume { "sops/decide" } else { "sops/run" };
+            let params = if let Some(id) = &run_id {
+                json!({"name":"alpha-sop","run_id":id,"decision":"approve"})
+            } else {
+                json!({"name":"alpha-sop"})
+            };
+            let writer = rusqlite::Connection::open(&path).unwrap();
+            writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+            let (done, completed) = std::sync::mpsc::channel();
+            let call = std::thread::Builder::new()
+                .stack_size(8 * 1024 * 1024)
+                .spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    let response = runtime.block_on(rpc(&mut peer, &mut rx, 1, method, params));
+                    done.send(response).unwrap();
+                    (peer, rx)
+                })
+                .unwrap();
+            let result = completed.recv_timeout(std::time::Duration::from_secs(2));
+            // Always release/join, even on the old implementation, so a failed
+            // regression does not leave a worker running behind the fixture.
+            writer.execute_batch("ROLLBACK").unwrap();
+            let (mut peer, mut rx) = call.join().unwrap();
+            let response = result.expect("RPC must refuse without waiting for SQLite's writer");
+            assert!(response.get("error").is_some(), "{response}");
+            assert_eq!(store.claim_counts("alpha-sop").unwrap(), (0, 0));
+            if let Some(id) = &run_id {
+                assert_eq!(
+                    serde_json::to_value(engine.lock().unwrap().get_run(id).unwrap()).unwrap(),
+                    before.unwrap()
+                );
+                assert_eq!(
+                    store.load_run(id).unwrap().unwrap().run.status,
+                    SopRunStatus::WaitingApproval
+                );
+                let denied = rpc(
+                    &mut peer,
+                    &mut rx,
+                    2,
+                    "sops/decide",
+                    json!({"name":"alpha-sop","run_id":id,"decision":"deny"}),
+                )
+                .await;
+                assert!(
+                    denied.get("error").is_none(),
+                    "uncontended operator decision: {denied}"
+                );
+            } else {
+                assert!(engine.lock().unwrap().active_runs().is_empty());
+                assert!(store.load_active_runs().unwrap().is_empty());
+                let admitted = rpc(
+                    &mut peer,
+                    &mut rx,
+                    2,
+                    "sops/run",
+                    json!({"name":"alpha-sop"}),
+                )
+                .await;
+                assert!(
+                    admitted.get("error").is_none(),
+                    "uncontended administrator start: {admitted}"
+                );
+                assert_eq!(engine.lock().unwrap().active_runs().len(), 1);
+            }
+        }
+    }
+
     struct PausedSopDecision {
         entered: tokio::sync::Notify,
         release: tokio::sync::Notify,
@@ -19717,6 +19866,7 @@ mod tests {
                 let tmp = tempfile::TempDir::new().unwrap();
                 let (ctx, engine, _) = sop_scoped_ctx(&tmp, 4242);
                 allow_all_sop_agents(&ctx);
+                grant_sop_admin(&ctx);
                 let model = Arc::new(PausedSopDecision {
                     entered: tokio::sync::Notify::new(),
                     release: tokio::sync::Notify::new(),
@@ -19771,10 +19921,20 @@ mod tests {
                 };
                 let request = async { rpc(&mut alice, &mut rx, 1, "sops/run", params).await };
                 let mutate = async {
-                    model.entered.notified().await;
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        model.entered.notified(),
+                    )
+                    .await
+                    .expect("the authorized request reaches its decision wait");
                     match change {
                         "tools" | "agents" => {
                             let mut revoked = ctx.config.read().clone();
+                            revoked
+                                .permission_profiles
+                                .get_mut("cron-alpha")
+                                .unwrap()
+                                .admin = false;
                             let profile =
                                 revoked.permission_profiles.get_mut("cron-alpha").unwrap();
                             if change == "tools" {
@@ -19794,6 +19954,11 @@ mod tests {
                         // live resolution, independently of the tool selector.
                         "identity" => {
                             let mut revoked = ctx.config.read().clone();
+                            revoked
+                                .permission_profiles
+                                .get_mut("cron-alpha")
+                                .unwrap()
+                                .admin = false;
                             revoked.users.clear();
                             ctx.auth.refresh_from_config(&revoked).unwrap();
                         }
@@ -19827,6 +19992,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (ctx, engine, _) = sop_scoped_ctx(&tmp, 4242);
         allow_all_sop_agents(&ctx);
+        grant_sop_admin(&ctx);
         let run_id = park_sop_run(&engine, "alpha-sop");
         let (alice, _) = roster_peer(&ctx, 4242).await;
         let engine_guard = engine.lock().unwrap();
@@ -19855,6 +20021,11 @@ mod tests {
             .permission_profiles
             .get_mut("cron-alpha")
             .unwrap()
+            .admin = false;
+        revoked
+            .permission_profiles
+            .get_mut("cron-alpha")
+            .unwrap()
             .grants
             .remove(&zeroclaw_api::grants::Resource::Tools);
         ctx.auth.refresh_from_config(&revoked).unwrap();
@@ -19868,10 +20039,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sop_run_is_refused_once_tools_execute_is_revoked() {
+    async fn sop_run_and_decide_are_refused_after_admin_demotion() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (ctx, engine, _sops_dir) = sop_scoped_ctx(&tmp, 4242);
         allow_all_sop_agents(&ctx);
+        grant_sop_admin(&ctx);
         let alpha_run = park_sop_run(&engine, "alpha-sop");
         let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
 
@@ -19908,6 +20080,11 @@ mod tests {
         // Revoke only tools:execute; the wildcard selector and the SOP grants
         // stay, and the same connection is refused on its next run.
         let mut revoked = ctx.config.read().clone();
+        revoked
+            .permission_profiles
+            .get_mut("cron-alpha")
+            .unwrap()
+            .admin = false;
         revoked
             .permission_profiles
             .get_mut("cron-alpha")
