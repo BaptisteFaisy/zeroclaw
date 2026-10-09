@@ -679,8 +679,11 @@ the connection owns it. The frame's transient material is paired only with an
 authorization derived from matching canonical configuration inputs. If policy,
 profile references, or material changes between those views (including while
 DNS is pending), opening the connection fails closed rather than combining
-revisions. A later frame resolves rotated material; already-open connections
-are unchanged. Egress grants remain checked on each request, so a removed
+revisions. The comparison covers the instance's whole configuration entry (its
+grants, its TLS profiles, and every config value) and the deployment's NAT64
+prefixes and connection limit, so any such edit made while a frame runs fails
+that frame's later connections that use a custom CA or client identity. A
+later frame resolves rotated material; already-open connections are unchanged. Egress grants remain checked on each request, so a removed
 profile or grant refuses the next connection. System roots are the exception: a profile that keeps them,
 and a connection without a profile, use the roots plugin HTTPS trusts, which
 are read once per process. A connection that is already open keeps the
