@@ -701,7 +701,7 @@ mod tests {
             "positive control: this graph must enable the canonical config feature"
         );
         assert!(
-            !cfg!(feature = "tool-notion"),
+            !std::hint::black_box(cfg!(feature = "tool-notion")),
             "this graph must leave the concrete tools owner feature disabled"
         );
         let notion = builtin_tool("notion").expect("canonical Notion inventory row");
