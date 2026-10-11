@@ -18,7 +18,7 @@ report_resources() {
 }
 
 check_owned_file() {
-  local name identity owner
+  local name identity
   name="${dist_swap_file##*/}"
   if [[ ! "$name" =~ ^zeroclaw-dist-swap\.[[:alnum:]]{6}$ ]] ||
      [[ "$dist_swap_file" != "$dist_swap_root/$name" ]] ||
@@ -27,9 +27,8 @@ check_owned_file() {
     return 1
   fi
   identity="$(stat -c '%d:%i:%u:%h:%a' -- "$dist_swap_file")" || return 1
-  owner="$(id -u)" || return 1
   if [[ "$identity" != "$dist_swap_identity" ]] ||
-     [[ "$identity" != *":$owner:1:600" ]]; then
+     [[ "$identity" != *":0:1:600" ]]; then
     echo "Refusing cleanup of a replaced, shared or nonprivate swapfile" >&2
     return 1
   fi
@@ -37,7 +36,7 @@ check_owned_file() {
 
 check_inactive() {
   local active_paths active_path
-  active_paths="$(swapon --show --noheadings --raw --output NAME)" || return 1
+  active_paths="$(swapon --show=NAME --noheadings --raw)" || return 1
   while IFS= read -r active_path; do
     if [[ "$active_path" == "$dist_swap_file" ]]; then
       echo "Refusing deletion of an active swapfile" >&2
@@ -78,15 +77,15 @@ case "${1:-}" in
       echo "Need 8 GiB for swap plus 8 GiB of build headroom" >&2
       exit 1
     fi
-    dist_swap_file="$(mktemp "$dist_swap_root/zeroclaw-dist-swap.XXXXXX")"
-    chmod 0600 -- "$dist_swap_file"
+    dist_swap_file="$(sudo mktemp "$dist_swap_root/zeroclaw-dist-swap.XXXXXX")"
+    sudo chmod 0600 -- "$dist_swap_file"
     dist_swap_identity="$(stat -c '%d:%i:%u:%h:%a' -- "$dist_swap_file")"
     check_owned_file
-    fallocate -l 8G -- "$dist_swap_file"
+    sudo fallocate -l 8G -- "$dist_swap_file"
     sudo mkswap -- "$dist_swap_file"
     sudo swapon -- "$dist_swap_file"
     check_owned_file
-    dist_active_paths="$(swapon --show --noheadings --raw --output NAME)"
+    dist_active_paths="$(swapon --show=NAME --noheadings --raw)"
     dist_found=false
     while IFS= read -r dist_active_path; do
       if [[ "$dist_active_path" == "$dist_swap_file" ]]; then

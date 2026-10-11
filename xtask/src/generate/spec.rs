@@ -1681,11 +1681,7 @@ mod tests {
                 "default: dist\n        options:\n          - dist\n          - dist-broad"
             )
         );
-        assert!(
-            manual.contains(
-                "timeout-minutes: ${{ inputs.distribution == 'dist-broad' && 90 || 40 }}"
-            )
-        );
+        assert!(job_block(&manual, "  build:\n").contains("\n    timeout-minutes: 90\n"));
         assert!(manual.contains("--selection \"${{ inputs.distribution }}\""));
         assert!(manual.contains("echo \"- Binary bytes: $bytes\""));
         assert!(manual.contains("echo \"- Resolved features: \\`$FEATURES\\`\""));
@@ -1698,9 +1694,9 @@ mod tests {
         assert!(manual.contains(cross_install));
         assert!(!manual.contains("cargo install cross"));
         assert!(manual.contains(
-            "if [ \"${{ matrix.use_cross || 'false' }}\" = \"true\" ]; then\n              echo \"BUILD_CMD=cross build\""
+            "if [ \"${{ matrix.use_cross || 'false' }}\" = \"true\" ]; then\n              echo \"BUILD_CMD=cross build${dist_build_jobs}\""
         ));
-        assert!(manual.contains("echo \"BUILD_CMD=cargo build\""));
+        assert!(manual.contains("echo \"BUILD_CMD=cargo build${dist_build_jobs}\""));
         assert!(manual.contains(
             "prefix-key: ${{ matrix.os }}-${{ matrix.target }}\n          cache-targets: false\n          save-if: ${{ github.ref == 'refs/heads/master' }}"
         ));
