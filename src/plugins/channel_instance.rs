@@ -21,6 +21,7 @@
 //! Like `egress_ceremony`, this module owns only decisions; every user-facing
 //! string stays in the CLI so it routes through Fluent.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use serde_json::Value;
@@ -599,8 +600,8 @@ pub fn apply_channel_binding(
     Ok(())
 }
 
-/// One entry of a manifest's `config_schema.required` list, as the readiness
-/// report shows it. It carries a name and three facts, never a value.
+/// One unconditional root-object requirement, as the readiness report shows
+/// it. It carries a name and three facts, never a value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequiredKey {
     /// The property name exactly as the manifest spells it: publisher text.
@@ -615,10 +616,13 @@ pub struct RequiredKey {
     pub addressable: bool,
 }
 
-/// The keys `manifest`'s `config_schema` requires, in schema order, each
-/// marked set or missing against `entry`, the instance's `[[plugins.entries]]`
-/// row (`None` when it has none). A manifest without a schema requires
-/// nothing.
+/// Unconditional root-object requirements, including same-object `allOf` and
+/// local `$ref` constraints, marked set or missing against `entry`.
+///
+/// Nested property requirements address a different object; conditional
+/// branches are not unconditional requirements. Defaults are annotations,
+/// not values the canonical resolver adds.
+/// This is only a repair diagnostic; [`config_verdict`] owns validation.
 #[must_use]
 pub fn required_keys(
     manifest: &PluginManifest,
@@ -628,12 +632,41 @@ pub fn required_keys(
         return Vec::new();
     };
     let properties = schema.get("properties").and_then(Value::as_object);
-    schema
-        .get("required")
-        .and_then(Value::as_array)
+    let mut pending = vec![schema];
+    let mut visited = HashSet::new();
+    let mut names = Vec::new();
+    let mut seen_names = HashSet::new();
+    while let Some(node) = pending.pop() {
+        // Local references can revisit a node, so traverse each schema
+        // location once without recursion or an unbounded reference loop.
+        if !visited.insert(std::ptr::from_ref(node)) {
+            continue;
+        }
+        for name in node
+            .get("required")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            if seen_names.insert(name) {
+                names.push(name);
+            }
+        }
+        if let Some(children) = node.get("allOf").and_then(Value::as_array) {
+            pending.extend(children.iter().rev());
+        }
+        if let Some(target) = node
+            .get("$ref")
+            .and_then(Value::as_str)
+            .and_then(|reference| reference.strip_prefix('#'))
+            .and_then(|pointer| schema.pointer(pointer))
+        {
+            pending.push(target);
+        }
+    }
+    names
         .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
         .map(|name| RequiredKey {
             name: name.to_string(),
             secret: properties
@@ -829,11 +862,213 @@ pub fn plugin_bind_decision_commands_for(
 #[cfg(test)]
 mod tests {
     use super::{
-        ALIAS_PLACEHOLDER, ShellDialect, config_set_command_for,
-        config_set_command_to_complete_for, plugin_bind_command_for,
-        plugin_bind_decision_commands_for,
+        ALIAS_PLACEHOLDER, ShellDialect, channel_instance_key, config_set_command_for,
+        config_set_command_to_complete_for, config_verdict, plugin_bind_command_for,
+        plugin_bind_decision_commands_for, required_keys,
     };
+    use serde_json::{Value, json};
     use std::path::Path;
+    use zeroclaw_config::schema::PluginEntryConfig;
+    use zeroclaw_plugins::PluginManifest;
+
+    fn schema_manifest(schema: Value) -> PluginManifest {
+        serde_json::from_value(json!({
+            "name": "schema-channel",
+            "version": "1.0.0",
+            "capabilities": ["channel"],
+            "permissions": ["config_read"],
+            "config_schema": schema,
+        }))
+        .expect("fixture manifest")
+    }
+
+    fn secret_schema() -> Value {
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {"api_token": {"type": "string", "x-secret": true}},
+        })
+    }
+
+    #[test]
+    fn composed_requirements_produce_repairs_for_canonical_config_failures() {
+        let mut all_of = secret_schema();
+        all_of["allOf"] = json!([{"required": ["api_token"]}]);
+        let mut referenced = secret_schema();
+        referenced["$ref"] = json!("#/$defs/requirements");
+        referenced["$defs"] = json!({"requirements": {"required": ["api_token"]}});
+        let mut escaped_pointer = secret_schema();
+        escaped_pointer["allOf"] = json!([{"$ref": "#/$defs/required~1fields"}]);
+        escaped_pointer["$defs"] = json!({"required/fields": {"required": ["api_token"]}});
+
+        for schema in [all_of, referenced, escaped_pointer] {
+            let manifest = schema_manifest(schema);
+            zeroclaw_plugins::config::validate_manifest_config(&manifest)
+                .expect("the canonical contract admits this schema");
+            let mut entry = PluginEntryConfig {
+                name: channel_instance_key(&manifest, "operations").expect("instance key"),
+                ..PluginEntryConfig::default()
+            };
+            assert!(config_verdict(&manifest, "operations", Some(&entry)).is_err());
+            let keys = required_keys(&manifest, Some(&entry));
+            assert_eq!(keys.len(), 1, "the refused row needs a repair command");
+            assert_eq!(keys[0].name, "api_token");
+            assert!(keys[0].secret && keys[0].addressable && !keys[0].set);
+            let command = config_set_command_for(
+                ShellDialect::host(),
+                Path::new("/tmp/schema-profile"),
+                &format!("plugins.entries.{}.config.api_token", entry.name),
+                None,
+            );
+            let line =
+                crate::required_key_line(Path::new("/tmp/schema-profile"), &entry.name, &keys[0]);
+            assert_eq!(
+                line,
+                crate::ta(
+                    "cli-plugin-channel-required-secret-missing",
+                    &[("key", "api_token"), ("command", &command)],
+                    "",
+                )
+            );
+            assert!(line.contains(&command));
+
+            entry
+                .config
+                .insert("api_token".into(), "fixture-secret-value".into());
+            assert!(config_verdict(&manifest, "operations", Some(&entry)).is_ok());
+            let keys = required_keys(&manifest, Some(&entry));
+            assert!(keys[0].set);
+            let line =
+                crate::required_key_line(Path::new("/tmp/schema-profile"), &entry.name, &keys[0]);
+            assert!(!line.contains("fixture-secret-value") && !line.contains(&command));
+        }
+    }
+
+    #[test]
+    fn composed_requirements_preserve_root_order_and_deduplicate_names() {
+        let mut schema = secret_schema();
+        schema["properties"]["label"] = json!({"type": "string"});
+        schema["required"] = json!(["label"]);
+        schema["allOf"] = json!([
+            {"required": ["api_token", "label"]},
+            {"$ref": "#/$defs/requirements"},
+            {"$ref": "#/$defs/requirements"},
+        ]);
+        schema["$defs"] = json!({"requirements": {"required": ["api_token"]}});
+        let manifest = schema_manifest(schema);
+        zeroclaw_plugins::config::validate_manifest_config(&manifest).expect("admitted schema");
+        let mut entry = PluginEntryConfig::default();
+        entry.config.insert("label".into(), "configured".into());
+        assert!(config_verdict(&manifest, "operations", Some(&entry)).is_err());
+        let keys = required_keys(&manifest, Some(&entry));
+        assert_eq!(
+            keys.iter().map(|key| key.name.as_str()).collect::<Vec<_>>(),
+            ["label", "api_token"]
+        );
+        assert!(keys[0].set && !keys[1].set);
+        entry
+            .config
+            .insert("api_token".into(), "fixture-secret-value".into());
+        assert!(config_verdict(&manifest, "operations", Some(&entry)).is_ok());
+    }
+
+    #[test]
+    fn nested_object_requirements_are_not_flattened_into_root_config_keys() {
+        let manifest = schema_manifest(json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {"connection": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {"token": {"type": "string"}},
+                "required": ["token"],
+            }},
+        }));
+        zeroclaw_plugins::config::validate_manifest_config(&manifest)
+            .expect("admitted object schema");
+        let mut entry = PluginEntryConfig::default();
+        assert!(config_verdict(&manifest, "operations", Some(&entry)).is_ok());
+        assert!(required_keys(&manifest, Some(&entry)).is_empty());
+        entry.config.insert("connection".into(), "{}".into());
+        assert!(config_verdict(&manifest, "operations", Some(&entry)).is_err());
+        assert!(required_keys(&manifest, Some(&entry)).is_empty());
+        entry
+            .config
+            .insert("connection".into(), r#"{"token":"configured"}"#.into());
+        assert!(config_verdict(&manifest, "operations", Some(&entry)).is_ok());
+    }
+
+    #[test]
+    fn schema_defaults_do_not_mark_unconfigured_required_keys_as_set() {
+        let mut schema = secret_schema();
+        schema["required"] = json!(["api_token"]);
+        schema["properties"]["api_token"]["default"] = json!("annotation-only");
+        let manifest = schema_manifest(schema);
+        zeroclaw_plugins::config::validate_manifest_config(&manifest)
+            .expect("admitted default annotation");
+        let entry = PluginEntryConfig::default();
+        assert!(config_verdict(&manifest, "operations", Some(&entry)).is_err());
+        let keys = required_keys(&manifest, Some(&entry));
+        assert_eq!(keys.len(), 1);
+        assert!(!keys[0].set);
+        assert!(
+            entry.config.is_empty(),
+            "reporting never materializes a default"
+        );
+    }
+
+    #[test]
+    fn conditional_and_unused_schemas_do_not_add_unconditional_requirements() {
+        let base = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "left": {"type": "string"},
+                "right": {"type": "string"},
+                "trigger": {"type": "boolean"},
+                "dependent": {"type": "string"},
+            },
+            "$defs": {"unused": {"required": ["unused"]}},
+        });
+        for keyword in ["anyOf", "oneOf"] {
+            let mut schema = base.clone();
+            schema[keyword] = json!([{"required": ["left"]}, {"required": ["right"]}]);
+            let manifest = schema_manifest(schema);
+            zeroclaw_plugins::config::validate_manifest_config(&manifest)
+                .expect("admitted alternative schema");
+            let mut entry = PluginEntryConfig::default();
+            assert!(config_verdict(&manifest, "operations", Some(&entry)).is_err());
+            assert!(required_keys(&manifest, Some(&entry)).is_empty());
+            entry.config.insert("left".into(), "configured".into());
+            assert!(config_verdict(&manifest, "operations", Some(&entry)).is_ok());
+        }
+        let mut schema = base;
+        schema["if"] = json!({
+            "required": ["trigger"],
+            "properties": {"trigger": {"const": true}},
+        });
+        schema["then"] = json!({"required": ["dependent"]});
+        let manifest = schema_manifest(schema);
+        zeroclaw_plugins::config::validate_manifest_config(&manifest)
+            .expect("admitted conditional schema");
+        let mut entry = PluginEntryConfig::default();
+        assert!(config_verdict(&manifest, "operations", Some(&entry)).is_ok());
+        assert!(required_keys(&manifest, Some(&entry)).is_empty());
+        entry.config.insert("trigger".into(), "true".into());
+        assert!(config_verdict(&manifest, "operations", Some(&entry)).is_err());
+        assert!(required_keys(&manifest, Some(&entry)).is_empty());
+    }
+
+    #[test]
+    fn local_reference_cycles_terminate_without_duplicate_diagnostics() {
+        let mut schema = secret_schema();
+        schema["allOf"] = json!([{"$ref": "#/$defs/loop"}, {"$ref": "#"}]);
+        schema["$defs"] = json!({"loop": {"required": ["api_token"], "$ref": "#/$defs/loop"}});
+        let manifest = schema_manifest(schema);
+        let keys = required_keys(&manifest, None);
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].name, "api_token");
+    }
 
     /// The marker a Windows line starts with when a value in it is not
     /// literal in `cmd.exe`, spelled out so the forms below are exact.
