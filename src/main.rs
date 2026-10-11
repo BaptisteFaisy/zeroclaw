@@ -14550,6 +14550,89 @@ mod tests {
     use clap::{CommandFactory, Parser};
     use std::net::TcpListener;
 
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn composed_channel_requirements_reach_localized_secret_repairs() {
+        use crate::plugins::channel_instance::{
+            channel_instance_key, config_set_command_for, config_verdict, required_keys,
+        };
+        use crate::plugins::egress_ceremony::ShellDialect;
+        use serde_json::{Value, json};
+        use std::path::Path;
+        use zeroclaw_config::schema::PluginEntryConfig;
+        use zeroclaw_plugins::PluginManifest;
+
+        let schema_manifest = |schema: Value| -> PluginManifest {
+            serde_json::from_value(json!({
+                "name": "schema-channel",
+                "version": "1.0.0",
+                "capabilities": ["channel"],
+                "permissions": ["config_read"],
+                "config_schema": schema,
+            }))
+            .expect("fixture manifest")
+        };
+        let secret_schema = || {
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {"api_token": {"type": "string", "x-secret": true}},
+            })
+        };
+
+        let mut all_of = secret_schema();
+        all_of["allOf"] = json!([{"required": ["api_token"]}]);
+        let mut referenced = secret_schema();
+        referenced["$ref"] = json!("#/$defs/requirements");
+        referenced["$defs"] = json!({"requirements": {"required": ["api_token"]}});
+        let mut escaped_pointer = secret_schema();
+        escaped_pointer["allOf"] = json!([{"$ref": "#/$defs/required~1fields"}]);
+        escaped_pointer["$defs"] = json!({"required/fields": {"required": ["api_token"]}});
+
+        for schema in [all_of, referenced, escaped_pointer] {
+            let manifest = schema_manifest(schema);
+            zeroclaw_plugins::config::validate_manifest_config(&manifest)
+                .expect("the canonical contract admits this schema");
+            let mut entry = PluginEntryConfig {
+                name: channel_instance_key(&manifest, "operations").expect("instance key"),
+                ..PluginEntryConfig::default()
+            };
+            assert!(config_verdict(&manifest, "operations", Some(&entry)).is_err());
+            let keys = required_keys(&manifest, Some(&entry));
+            assert_eq!(keys.len(), 1, "the refused row needs a repair command");
+            assert_eq!(keys[0].name, "api_token");
+            assert!(keys[0].secret && keys[0].addressable && !keys[0].set);
+            let command = config_set_command_for(
+                ShellDialect::host(),
+                Path::new("/tmp/schema-profile"),
+                &format!("plugins.entries.{}.config.api_token", entry.name),
+                None,
+            );
+            let line =
+                required_key_line(Path::new("/tmp/schema-profile"), &entry.name, &keys[0]);
+            assert_eq!(
+                line,
+                ta(
+                    "cli-plugin-channel-required-secret-missing",
+                    &[("key", "api_token"), ("command", &command)],
+                    "",
+                )
+            );
+            assert!(line.contains(&command));
+
+            entry
+                .config
+                .insert("api_token".into(), "fixture-secret-value".into());
+            assert!(config_verdict(&manifest, "operations", Some(&entry)).is_ok());
+            let keys = required_keys(&manifest, Some(&entry));
+            assert!(keys[0].set);
+            let line =
+                required_key_line(Path::new("/tmp/schema-profile"), &entry.name, &keys[0]);
+            assert!(!line.contains("fixture-secret-value") && !line.contains(&command));
+        }
+    }
+
+
     /// `oidc login` prints the access token on stdout and shells capture it, so
     /// the browser opener must not inherit the CLI's standard streams. The probe
     /// child records whether its stdout and stderr are the null device, then

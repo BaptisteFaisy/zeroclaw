@@ -862,7 +862,7 @@ pub fn plugin_bind_decision_commands_for(
 #[cfg(test)]
 mod tests {
     use super::{
-        ALIAS_PLACEHOLDER, ShellDialect, channel_instance_key, config_set_command_for,
+        ALIAS_PLACEHOLDER, ShellDialect, config_set_command_for,
         config_set_command_to_complete_for, config_verdict, plugin_bind_command_for,
         plugin_bind_decision_commands_for, required_keys,
     };
@@ -888,60 +888,6 @@ mod tests {
             "additionalProperties": false,
             "properties": {"api_token": {"type": "string", "x-secret": true}},
         })
-    }
-
-    #[test]
-    fn composed_requirements_produce_repairs_for_canonical_config_failures() {
-        let mut all_of = secret_schema();
-        all_of["allOf"] = json!([{"required": ["api_token"]}]);
-        let mut referenced = secret_schema();
-        referenced["$ref"] = json!("#/$defs/requirements");
-        referenced["$defs"] = json!({"requirements": {"required": ["api_token"]}});
-        let mut escaped_pointer = secret_schema();
-        escaped_pointer["allOf"] = json!([{"$ref": "#/$defs/required~1fields"}]);
-        escaped_pointer["$defs"] = json!({"required/fields": {"required": ["api_token"]}});
-
-        for schema in [all_of, referenced, escaped_pointer] {
-            let manifest = schema_manifest(schema);
-            zeroclaw_plugins::config::validate_manifest_config(&manifest)
-                .expect("the canonical contract admits this schema");
-            let mut entry = PluginEntryConfig {
-                name: channel_instance_key(&manifest, "operations").expect("instance key"),
-                ..PluginEntryConfig::default()
-            };
-            assert!(config_verdict(&manifest, "operations", Some(&entry)).is_err());
-            let keys = required_keys(&manifest, Some(&entry));
-            assert_eq!(keys.len(), 1, "the refused row needs a repair command");
-            assert_eq!(keys[0].name, "api_token");
-            assert!(keys[0].secret && keys[0].addressable && !keys[0].set);
-            let command = config_set_command_for(
-                ShellDialect::host(),
-                Path::new("/tmp/schema-profile"),
-                &format!("plugins.entries.{}.config.api_token", entry.name),
-                None,
-            );
-            let line =
-                crate::required_key_line(Path::new("/tmp/schema-profile"), &entry.name, &keys[0]);
-            assert_eq!(
-                line,
-                crate::ta(
-                    "cli-plugin-channel-required-secret-missing",
-                    &[("key", "api_token"), ("command", &command)],
-                    "",
-                )
-            );
-            assert!(line.contains(&command));
-
-            entry
-                .config
-                .insert("api_token".into(), "fixture-secret-value".into());
-            assert!(config_verdict(&manifest, "operations", Some(&entry)).is_ok());
-            let keys = required_keys(&manifest, Some(&entry));
-            assert!(keys[0].set);
-            let line =
-                crate::required_key_line(Path::new("/tmp/schema-profile"), &entry.name, &keys[0]);
-            assert!(!line.contains("fixture-secret-value") && !line.contains(&command));
-        }
     }
 
     #[test]
