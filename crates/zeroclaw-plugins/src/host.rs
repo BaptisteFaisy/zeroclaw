@@ -1263,9 +1263,7 @@ impl PluginHost {
         if claims.is_empty() {
             // An update another process finished while this one waited for the
             // lock has changed what is installed.
-            if !self.loaded.contains_key(name) {
-                self.loaded = self.discovered()?;
-            }
+            self.loaded = self.discovered()?;
             return Ok(UpdateRecovery::Nothing);
         }
         self.loaded = self.discovered()?;
@@ -5381,6 +5379,95 @@ capabilities = ["tool"]
             tx.mark_deleting().unwrap();
         }
         tx.entry.clone()
+    }
+
+    /// A host that already cached the old generation must refresh even when
+    /// another host completed its update and released every claim.
+    #[test]
+    fn recovery_refreshes_preloaded_generation_after_completed_update_without_claims() {
+        let plugins = tempdir().unwrap();
+        let mut stale = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        install_tool_version(&mut stale, "weather", "1.0.0", b"\0asm v1");
+        let mut updater = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        let replaced = update_tool(&mut updater, "weather", "2.0.0", b"\0asm v2").unwrap();
+        assert_eq!(replaced.previous_version, "1.0.0");
+        assert!(replaced.leftover.is_none());
+        assert!(hidden_entries(plugins.path()).is_empty());
+        assert_eq!(stale.manifest("weather").unwrap().version, "1.0.0");
+        assert_eq!(
+            stale.admitted_component("weather").unwrap().bytes(),
+            b"\0asm v1"
+        );
+
+        assert_eq!(
+            stale.recover_interrupted_update("weather").unwrap(),
+            UpdateRecovery::Nothing
+        );
+        assert_eq!(stale.manifest("weather").unwrap().version, "2.0.0");
+        assert_eq!(
+            stale.admitted_component("weather").unwrap().bytes(),
+            b"\0asm v2"
+        );
+        assert_eq!(
+            stale.loaded.get("weather").unwrap().manifest_toml,
+            std::fs::read_to_string(plugins.path().join("weather/manifest.toml")).unwrap()
+        );
+        // The refreshed generation must also pass the next replacement's
+        // identity comparison, instead of reporting NamespaceChanged.
+        let replaced = update_tool(&mut stale, "weather", "3.0.0", b"\0asm v3").unwrap();
+        assert_eq!(replaced.previous_version, "2.0.0");
+        assert!(replaced.leftover.is_none());
+        assert!(hidden_entries(plugins.path()).is_empty());
+    }
+
+    #[test]
+    fn recovery_forgets_preloaded_removed_package_without_claims() {
+        let plugins = tempdir().unwrap();
+        let mut stale = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        install_tool_version(&mut stale, "weather", "1.0.0", b"\0asm v1");
+        install_tool_version(&mut stale, "kept", "1.0.0", b"\0asm kept");
+        let mut remover = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        remover.remove("weather").unwrap();
+        assert!(!plugins.path().join("weather").exists());
+        assert!(hidden_entries(plugins.path()).is_empty());
+        assert!(stale.manifest("weather").is_some());
+
+        assert_eq!(
+            stale.recover_interrupted_update("weather").unwrap(),
+            UpdateRecovery::Nothing
+        );
+        assert!(stale.manifest("weather").is_none());
+        assert!(stale.get_plugin("weather").is_none());
+        assert!(stale.admitted_component("weather").is_none());
+        assert_eq!(stale.manifest("kept").unwrap().version, "1.0.0");
+        assert_eq!(
+            stale.admitted_component("kept").unwrap().bytes(),
+            b"\0asm kept"
+        );
+        assert!(hidden_entries(plugins.path()).is_empty());
+    }
+
+    #[test]
+    fn recovery_without_claims_keeps_current_generation_and_missing_name_noop() {
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        install_tool_version(&mut host, "weather", "1.0.0", b"\0asm v1");
+        let before = package_bytes(&plugins.path().join("weather"));
+        for name in ["weather", "missing"] {
+            assert_eq!(
+                host.recover_interrupted_update(name).unwrap(),
+                UpdateRecovery::Nothing
+            );
+            assert_eq!(host.manifest("weather").unwrap().version, "1.0.0");
+            assert_eq!(
+                host.admitted_component("weather").unwrap().bytes(),
+                b"\0asm v1"
+            );
+            assert!(host.manifest("missing").is_none());
+            assert_eq!(host.list_plugins().len(), 1);
+            assert_eq!(package_bytes(&plugins.path().join("weather")), before);
+            assert!(hidden_entries(plugins.path()).is_empty());
+        }
     }
 
     /// An update replaces the package where it is installed: the new manifest
