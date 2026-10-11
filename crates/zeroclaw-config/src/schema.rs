@@ -40217,7 +40217,10 @@ group_policy = "disabled"
             let disk = crate::migration::migrate_to_current(&written).unwrap();
             assert_eq!(disk.plugins.entries.len(), previous_rows + 2);
             assert_eq!(disk.plugins.entry_egress("first").0, vec!["first.example"]);
-            assert_eq!(disk.plugins.entry_egress("second").0, vec!["second.example"]);
+            assert_eq!(
+                disk.plugins.entry_egress("second").0,
+                vec!["second.example"]
+            );
             if previous_rows != 0 {
                 assert_eq!(
                     disk.plugins.entry_egress("existing").0,
