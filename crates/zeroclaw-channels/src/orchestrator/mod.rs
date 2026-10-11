@@ -20059,9 +20059,11 @@ pub(crate) mod tests {
         use zeroclaw_config::validation_warnings::TOOL_COMPILED_OUT;
 
         let temp = TempDir::new().expect("temporary workspace");
-        let mut config = Config::default();
-        config.data_dir = temp.path().join("data");
-        config.config_path = temp.path().join("config.toml");
+        let mut config = Config {
+            data_dir: temp.path().join("data"),
+            config_path: temp.path().join("config.toml"),
+            ..Config::default()
+        };
         config.tools.optional = vec!["*".into()];
 
         // Config owns compile availability; channels has no tools-external feature of its own.
