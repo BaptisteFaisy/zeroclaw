@@ -21,18 +21,24 @@ section.
 
 ## Minimal and full tools
 
-New and existing schema-3 configurations use **minimal** unless they explicitly
-select extras: eleven built-ins in Chat, or eight in Code/ACP, which retains its
+New installations use **minimal** unless they explicitly select extras:
+eleven built-ins in Chat, or eight in Code/ACP, which retains its
 exclusion of persistent-memory tools. Chat's eleven are `shell`, `file_read`,
 `file_write`, `file_edit`, `glob_search`, `content_search`, `memory_recall`,
 `memory_store`, `memory_forget`, `web_fetch`, and `git_operations`. Existing
 policy can narrow either catalog.
 
+Existing configuration files without `[tools]` retain full eligible built-in
+availability when upgrading to v0.8.6. Their compatibility selection is
+`optional = ["*"]`; existing explicit selections, including an empty section or
+empty list, are preserved. Existing prerequisites and permission rules still
+apply.
+
 Both settings use the same configuration field:
 
 ```toml
 [tools]
-optional = [] # minimal, also the default when this section is absent
+optional = [] # minimal; the persisted default for new installations
 ```
 
 For **full**, restore all built-ins carried by this binary and allowed by their
@@ -63,16 +69,18 @@ path/network policy and receipts still apply. Explicit MCP servers, skills,
 plugins and peripherals retain their existing activation and authority paths.
 Progressive schema disclosure is a separate feature, not part of these settings.
 
-To opt out of the new minimal default when upgrading, set `optional = ["*"]` in
-`[tools]`, or run:
+To select full availability explicitly, set `optional = ["*"]` in `[tools]`,
+or run:
 
 ```sh
 zeroclaw config set tools.optional '["*"]' --no-interactive
 ```
 
-Reload the daemon after changing selection. Config schema stays version 3;
-existing configurations without `[tools]` take the minimal default without a
-migration. Return to minimal by setting `optional = []`.
+Reload the daemon after changing selection. Config schema stays version 3.
+`zeroclaw config migrate` records the compatibility selection for an existing
+file without `[tools]`; ordinary saves also retain selector intent. Choose
+minimal by setting `optional = []`. Moving existing installations to minimal
+is a v0.9.0 design decision; v0.8.6 upgrades preserve their selection.
 
 ### Builds and upgrade path
 

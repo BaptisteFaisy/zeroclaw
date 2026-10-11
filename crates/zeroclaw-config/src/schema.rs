@@ -26230,6 +26230,17 @@ impl Config {
             .and_then(|v| v.try_into().ok())
             .unwrap_or_default();
         prune_default_values(&mut new_table, &default_table);
+        // Empty is an explicit minimal selection. Pruning it would make a
+        // freshly saved install look like a legacy document that omitted tools.
+        new_table
+            .entry("tools".to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+            .as_table_mut()
+            .context("serialized tools selector is not a TOML table")?
+            .insert(
+                "optional".to_string(),
+                builtin_tool_selection_value(&config_to_save),
+            );
         let new_toml = ensure_blank_line_before_sections(
             &toml::to_string_pretty(&new_table).context("Failed to serialize pruned config")?,
         );
@@ -26328,6 +26339,27 @@ impl Config {
             apply_dirty_path(doc.as_table_mut(), path, &full_table, &default_table)?;
         }
 
+        let selector_dirty = self
+            .dirty_paths
+            .iter()
+            .any(|path| path == "tools" || path == "tools.optional");
+        if selector_dirty || !doc.as_table().contains_key("tools") {
+            // Use the masked canonical selection, not a transient env value.
+            // An unrelated edit leaves any existing malformed tools section
+            // untouched; an explicit selector edit cannot silently fail to save.
+            if let Some(tools) = doc.as_table().get("tools") {
+                anyhow::ensure!(
+                    tools.as_table_like().is_some(),
+                    "cannot persist tools.optional through a malformed tools section"
+                );
+            }
+            set_path_in_doc(
+                doc.as_table_mut(),
+                &["tools", "optional"],
+                &builtin_tool_selection_value(&config_to_save),
+            );
+        }
+
         // Retire the inert `[security.nevis]` table from the file. The shim
         // discards its content at load and `skip_serializing` keeps it out of
         // a full save, but an incremental save reparses the original file and
@@ -26369,6 +26401,18 @@ impl Config {
         self.clear_dirty();
         Ok(())
     }
+}
+
+fn builtin_tool_selection_value(config: &Config) -> toml::Value {
+    toml::Value::Array(
+        config
+            .tools
+            .optional
+            .iter()
+            .cloned()
+            .map(toml::Value::String)
+            .collect(),
+    )
 }
 
 fn collect_onepassword_reference_snapshots(
@@ -34106,6 +34150,215 @@ default_temperature = 0.7
         );
 
         let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    // Upgrade compatibility and durable selector persistence.
+    #[tokio::test]
+    async fn new_install_remains_minimal_after_repeated_load_and_save() {
+        let _env_guard = env_override_lock().await;
+        let dir = TempDir::new().unwrap();
+        let _config_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", dir.path());
+        let _workspace_guard = EnvValueGuard::remove("ZEROCLAW_WORKSPACE");
+        let _data_guard = EnvValueGuard::remove("ZEROCLAW_DATA_DIR");
+        let _tools_guard = EnvValueGuard::remove("ZEROCLAW_tools__optional");
+        for _ in 0..3 {
+            let config = Box::pin(Config::load_or_init()).await.unwrap();
+            assert!(config.tools.optional.is_empty());
+            config.save().await.unwrap();
+            let raw = fs::read_to_string(dir.path().join("config.toml"))
+                .await
+                .unwrap();
+            let value: toml::Value = toml::from_str(&raw).unwrap();
+            assert_eq!(value["tools"]["optional"], toml::Value::Array(Vec::new()));
+            assert!(crate::migration::migrate_file(&raw).unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_load_and_dirty_save_preserve_selector_intent() {
+        let _env_guard = env_override_lock().await;
+        let dir = TempDir::new().unwrap();
+        let _config_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", dir.path());
+        let _workspace_guard = EnvValueGuard::remove("ZEROCLAW_WORKSPACE");
+        let _data_guard = EnvValueGuard::remove("ZEROCLAW_DATA_DIR");
+        let _tools_guard = EnvValueGuard::remove("ZEROCLAW_tools__optional");
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "schema_version = 3\n# operator locale comment\nlocale = \"en\"\n",
+        )
+        .await
+        .unwrap();
+        let mut config = Box::pin(Config::load_or_init()).await.unwrap();
+        assert_eq!(config.tools.optional, ["*"]);
+        config.set_prop("observability.backend", "log").unwrap();
+        config.mark_dirty("observability.backend");
+        config.save_dirty().await.unwrap();
+        let raw = fs::read_to_string(&path).await.unwrap();
+        assert!(raw.contains("# operator locale comment"));
+        assert_eq!(
+            crate::migration::migrate_to_current(&raw)
+                .unwrap()
+                .tools
+                .optional,
+            ["*"]
+        );
+        let value: toml::Value = toml::from_str(&raw).unwrap();
+        assert_eq!(
+            value["tools"]["optional"],
+            toml::Value::Array(vec![toml::Value::String("*".into())])
+        );
+        config.set_prop("tools.optional", "[]").unwrap();
+        config.mark_dirty("tools.optional");
+        config.save_dirty().await.unwrap();
+        let raw = fs::read_to_string(&path).await.unwrap();
+        let value: toml::Value = toml::from_str(&raw).unwrap();
+        assert_eq!(value["tools"]["optional"], toml::Value::Array(Vec::new()));
+        assert!(
+            Box::pin(Config::load_or_init())
+                .await
+                .unwrap()
+                .tools
+                .optional
+                .is_empty()
+        );
+        assert!(config.dirty_paths.is_empty());
+    }
+
+    #[tokio::test]
+    async fn explicit_selections_survive_full_and_incremental_saves() {
+        let _env_guard = env_override_lock().await;
+        let _tools_guard = EnvValueGuard::remove("ZEROCLAW_tools__optional");
+        for selected in [
+            Vec::new(),
+            vec!["calculator".to_string()],
+            vec!["*".to_string()],
+        ] {
+            let dir = TempDir::new().unwrap();
+            let mut config = Config {
+                config_path: dir.path().join("config.toml"),
+                data_dir: dir.path().join("data"),
+                ..Config::default()
+            };
+            config.tools.optional = selected.clone();
+            config.save().await.unwrap();
+            config.set_prop("observability.backend", "log").unwrap();
+            config.mark_dirty("observability.backend");
+            config.save_dirty().await.unwrap();
+            let raw = fs::read_to_string(&config.config_path).await.unwrap();
+            assert_eq!(
+                crate::migration::migrate_to_current(&raw)
+                    .unwrap()
+                    .tools
+                    .optional,
+                selected
+            );
+            assert!(crate::migration::migrate_file(&raw).unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn dirty_save_does_not_repair_an_unrelated_malformed_tools_section() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let raw = "schema_version = 3\n[tools]\noptional = false # preserve invalid selector\n";
+        fs::write(&path, raw).await.unwrap();
+        let original: toml::Value = toml::from_str(raw).unwrap();
+        let load = crate::migration::migrate_to_current_salvaged(raw);
+        let mut config = load.config;
+        config.config_path = path.clone();
+        config.data_dir = dir.path().join("data");
+        config.degraded_sections = load.dropped;
+        config.set_prop("observability.backend", "log").unwrap();
+        config.mark_dirty("observability.backend");
+        config.save_dirty().await.unwrap();
+        let written = fs::read_to_string(path).await.unwrap();
+        let value: toml::Value = toml::from_str(&written).unwrap();
+        assert_eq!(value.get("tools"), original.get("tools"));
+        assert!(written.contains("# preserve invalid selector"));
+        assert!(crate::migration::migrate_to_current(&written).is_err());
+        assert!(
+            crate::migration::migrate_to_current_resilient(&written)
+                .tools
+                .optional
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn selector_dirty_save_refuses_a_malformed_parent_without_clobbering() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let raw = "schema_version = 3\ntools = false # malformed parent\n";
+        fs::write(&path, raw).await.unwrap();
+        let load = crate::migration::migrate_to_current_salvaged(raw);
+        let mut config = load.config;
+        config.config_path = path.clone();
+        config.data_dir = dir.path().join("data");
+        config.degraded_sections = load.dropped;
+        config.mark_dirty("tools.optional");
+        let error = config.save_dirty().await.unwrap_err();
+        assert!(error.to_string().contains("malformed tools section"));
+        assert_eq!(fs::read_to_string(path).await.unwrap(), raw);
+        assert!(config.dirty_paths.contains("tools.optional"));
+    }
+
+    #[tokio::test]
+    async fn selector_env_override_is_masked_for_fresh_and_legacy_saves() {
+        let _env_guard = env_override_lock().await;
+        let _workspace_guard = EnvValueGuard::remove("ZEROCLAW_WORKSPACE");
+        let _data_guard = EnvValueGuard::remove("ZEROCLAW_DATA_DIR");
+        let _tools_guard = EnvValueGuard::set("ZEROCLAW_tools__optional", "[\"calculator\"]");
+        for legacy in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let _config_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", dir.path());
+            let path = dir.path().join("config.toml");
+            if legacy {
+                fs::write(&path, "schema_version = 3\n").await.unwrap();
+            }
+            let mut config = Box::pin(Config::load_or_init()).await.unwrap();
+            assert_eq!(config.tools.optional, ["calculator"]);
+            let expected = if legacy {
+                vec!["*".to_string()]
+            } else {
+                Vec::new()
+            };
+            if legacy {
+                // The omitted selector must persist from the masked snapshot
+                // before a full save has materialized the tools section.
+                config.set_prop("observability.backend", "log").unwrap();
+                config.mark_dirty("observability.backend");
+                config.save_dirty().await.unwrap();
+                let raw = fs::read_to_string(&path).await.unwrap();
+                let value: toml::Value = toml::from_str(&raw).unwrap();
+                assert_eq!(
+                    value["tools"]["optional"],
+                    toml::Value::Array(vec![toml::Value::String("*".into())])
+                );
+                assert_eq!(config.tools.optional, ["calculator"]);
+            }
+            config.save().await.unwrap();
+            let raw = fs::read_to_string(&path).await.unwrap();
+            assert_eq!(
+                crate::migration::migrate_to_current(&raw)
+                    .unwrap()
+                    .tools
+                    .optional,
+                expected
+            );
+            config.set_prop("observability.backend", "log").unwrap();
+            config.mark_dirty("observability.backend");
+            config.save_dirty().await.unwrap();
+            let raw = fs::read_to_string(&path).await.unwrap();
+            assert_eq!(
+                crate::migration::migrate_to_current(&raw)
+                    .unwrap()
+                    .tools
+                    .optional,
+                expected
+            );
+            assert_eq!(config.tools.optional, ["calculator"]);
+        }
     }
 
     #[tokio::test]
