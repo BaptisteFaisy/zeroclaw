@@ -292,7 +292,7 @@ async fn update_refuses_added_authority_until_accepted_with_the_printed_items() 
         &manifest("2.0.0", "permissions = [\"state_read\"]\n"),
         &std::fs::read(fixture()).expect("read fixture"),
     );
-    serve_registry(&server, "2.0.0", archive, 2).await;
+    serve_registry(&server, "2.0.0", archive, 3).await;
     let config_dir = config_dir_with_installed_fixture();
     let registry = format!("{}/registry.json", server.uri());
 
@@ -305,7 +305,7 @@ async fn update_refuses_added_authority_until_accepted_with_the_printed_items() 
         !refused.status.success(),
         "unaccepted authority must fail: {text}"
     );
-    for part in ["--allow", "permission:state_read", "fixture-tool@2.0.0"] {
+    for part in ["--allow-token", "permission:state_read", "fixture-tool@2.0.0"] {
         assert!(
             text.contains(part),
             "the refusal must print {part:?}: {text}"
@@ -329,6 +329,25 @@ async fn update_refuses_added_authority_until_accepted_with_the_printed_items() 
     );
     assert!(accepted.status.success(), "{}", combined(&accepted));
     assert!(installed_manifest(config_dir.path()).contains("state_read"));
+
+    let another_config = config_dir_with_installed_fixture();
+    let complete_token = run_plugin(
+        another_config.path(),
+        &[
+            "update",
+            "fixture-tool@2.0.0",
+            "--registry",
+            &registry,
+            "--allow-token",
+            "permission:state_read",
+        ],
+    );
+    assert!(
+        complete_token.status.success(),
+        "{}",
+        combined(&complete_token)
+    );
+    assert!(installed_manifest(another_config.path()).contains("state_read"));
 }
 
 #[tokio::test]
@@ -666,6 +685,175 @@ fn allow_for_a_registry_update_needs_a_pinned_version() {
         "the refusal names the flag: {text}"
     );
     assert_eq!(installed_manifest(config_dir.path()), before);
+}
+
+/// Missing instance rows must be persisted even when a name appears twice in one
+/// batch. The registry changes the on-disk document after the process has
+/// loaded it, causing a real, deterministic save error without relying on
+/// permission bits or bypassing the component load-check.
+#[tokio::test]
+async fn duplicate_target_cannot_publish_rows_left_by_a_failed_save() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    struct RestoreConfig {
+        path: PathBuf,
+        bytes: Vec<u8>,
+    }
+    impl Drop for RestoreConfig {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.path, &self.bytes);
+        }
+    }
+
+    let config_dir = config_dir_with_installed(CONFIG_SCHEMA, "");
+    let info = run_plugin(config_dir.path(), &["info", PACKAGE]);
+    assert!(info.status.success(), "{}", combined(&info));
+    let config_path = config_dir.path().join("config.toml");
+    let restore = RestoreConfig {
+        bytes: std::fs::read(&config_path).expect("config before update"),
+        path: config_path.clone(),
+    };
+    let before_manifest = installed_manifest(config_dir.path());
+    let old: zeroclaw_plugins::PluginManifest =
+        toml::from_str(&before_manifest).expect("installed manifest");
+    let candidate = manifest("2.0.0", CONFIG_SCHEMA);
+    let new: zeroclaw_plugins::PluginManifest =
+        toml::from_str(&candidate).expect("replacement manifest");
+    assert!(zeroclaw::plugins::update::authority_increase(&old, &new).is_empty());
+    let key = tool_instance_key();
+    let before: toml::Table =
+        toml::from_str(std::str::from_utf8(&restore.bytes).expect("UTF-8 config"))
+            .expect("config before");
+    assert!(before["plugins"].get("entries").is_none_or(|rows| {
+        rows.as_array().is_some_and(Vec::is_empty)
+    }));
+
+    let server = MockServer::start().await;
+    let archive = package_archive(&candidate, &std::fs::read(fixture()).expect("fixture"));
+    let archive_path = format!("/{PACKAGE}-2.0.0.zip");
+    let index = serde_json::json!({
+        "plugins": [{
+            "name": PACKAGE,
+            "version": "2.0.0",
+            "capabilities": ["tool"],
+            "url": format!("{}{archive_path}", server.uri()),
+            "sha256": hex::encode(Sha256::digest(&archive)),
+        }],
+    });
+    Mock::given(method("GET"))
+        .and(path("/registry.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(index))
+        .mount(&server)
+        .await;
+    let fault = Arc::new(AtomicBool::new(true));
+    let response_fault = Arc::clone(&fault);
+    let response_config = config_path.clone();
+    Mock::given(method("GET"))
+        .and(path(archive_path))
+        .respond_with(move |_request: &wiremock::Request| {
+            if response_fault.load(Ordering::SeqCst) {
+                std::fs::write(&response_config, "schema_version = [\n")
+                    .expect("inject a config document save failure after load");
+            }
+            ResponseTemplate::new(200).set_body_bytes(archive.clone())
+        })
+        .expect(3)
+        .mount(&server)
+        .await;
+    let registry = format!("{}/registry.json", server.uri());
+
+    let out = run_plugin(
+        config_dir.path(),
+        &["update", PACKAGE, PACKAGE, "--registry", &registry],
+    );
+    let text = combined(&out);
+    assert!(!out.status.success(), "a failed save fails the batch: {text}");
+    assert!(
+        text.contains("Failed to parse existing config for incremental save"),
+        "{text}"
+    );
+    assert_eq!(
+        installed_manifest(config_dir.path()),
+        before_manifest,
+        "a second visit cannot publish against unsaved in-memory rows: {text}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&config_path).expect("faulted document"),
+        "schema_version = [\n"
+    );
+
+    fault.store(false, Ordering::SeqCst);
+    std::fs::write(&config_path, &restore.bytes).expect("remove the save fault");
+    let retry = run_plugin(
+        config_dir.path(),
+        &["update", PACKAGE, "--registry", &registry],
+    );
+    assert!(retry.status.success(), "{}", combined(&retry));
+    assert!(installed_manifest(config_dir.path()).contains("version = \"2.0.0\""));
+    let saved = std::fs::read_to_string(&config_path).expect("saved config");
+    let reloaded: toml::Table = toml::from_str(&saved).expect("reload config after retry");
+    let row = reloaded["plugins"]["entries"]
+        .as_array()
+        .expect("instance entries")
+        .iter()
+        .find(|row| row.get("name").and_then(toml::Value::as_str) == Some(key.as_str()))
+        .expect("the retry persists the row before publishing");
+    assert!(row.get("egress_hosts").is_none_or(|hosts| {
+        hosts.as_array().is_some_and(Vec::is_empty)
+    }));
+    let info = run_plugin(config_dir.path(), &["info", PACKAGE]);
+    let info_text = combined(&info);
+    assert!(info.status.success(), "{info_text}");
+    assert!(
+        info_text.contains("2.0.0") && info_text.contains(&key),
+        "{info_text}"
+    );
+}
+
+#[test]
+fn allow_token_keeps_version_pin_single_target_and_known_kind_checks() {
+    let config_dir = config_dir_with_installed_fixture();
+    let before = installed_manifest(config_dir.path());
+    let registry = format!("http://127.0.0.1:{}/registry.json", closed_port());
+    for args in [
+        vec![
+            "update",
+            PACKAGE,
+            "--registry",
+            &registry,
+            "--allow-token",
+            "permission:state_read",
+        ],
+        vec![
+            "update",
+            "fixture-tool@2.0.0",
+            "fixture-tool@2.0.0",
+            "--registry",
+            &registry,
+            "--allow-token",
+            "permission:state_read",
+        ],
+        vec![
+            "update",
+            "fixture-tool@2.0.0",
+            "--registry",
+            &registry,
+            "--allow-token",
+            "grant:alpha,beta",
+        ],
+    ] {
+        let out = run_plugin(config_dir.path(), &args);
+        let text = combined(&out);
+        assert!(!out.status.success(), "{text}");
+        assert!(
+            text.contains("--allow"),
+            "usage is rejected before fetching: {text}"
+        );
+        assert_eq!(installed_manifest(config_dir.path()), before);
+    }
 }
 
 /// An update preserves the instance's configuration: the row that holds its

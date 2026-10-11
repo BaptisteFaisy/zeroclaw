@@ -3395,6 +3395,10 @@ enum PluginCommands {
         /// publisher:<key>
         #[arg(long, value_delimiter = ',', conflicts_with = "all")]
         allow: Vec<String>,
+        /// Accept one complete authority token; repeat for multiple tokens
+        /// or values containing commas
+        #[arg(long, value_name = "TOKEN", conflicts_with = "all")]
+        allow_token: Vec<String>,
     },
     /// Remove an installed plugin
     Remove {
@@ -4492,6 +4496,26 @@ fn ensure_plugin_config_entries<'a>(
     Ok(Some(PluginConfigRows { created, existing }))
 }
 
+/// Persist new update rows before publishing them to the batch's live config.
+/// A failed save must leave no rows a later visit could mistake for persisted
+/// operator state. Config's owned clone also keeps earlier successful targets
+/// and the caller's dirty paths and load provenance intact on failure.
+#[cfg(feature = "plugins-wasm")]
+async fn prepare_plugin_update_config_entries<'a>(
+    config: &mut crate::config::schema::Config,
+    package: &str,
+    entries: &'a [(zeroclaw::plugins::PluginCapability, String)],
+    declared_egress: &[String],
+) -> Result<Option<PluginConfigRows<'a>>> {
+    let mut staged = config.clone();
+    let rows = ensure_plugin_config_entries(&mut staged, package, entries, declared_egress)?;
+    if rows.as_ref().is_some_and(|rows| !rows.created.is_empty()) {
+        Box::pin(staged.save_dirty()).await?;
+        *config = staged;
+    }
+    Ok(rows)
+}
+
 /// Seed `[[plugins.entries]]` blocks for a freshly installed plugin's canonical
 /// default instance keys, carrying the manifest's declared egress destinations
 /// into each row this call creates. Rows are found or created by
@@ -5268,7 +5292,11 @@ async fn update_one_plugin(
         Err(error) => return failed(format!("{error:#}")),
     };
     let declared = manifest_declared_egress(&candidate);
-    let rows = match ensure_plugin_config_entries(config, name, &entries, &declared) {
+    let rows = match Box::pin(prepare_plugin_update_config_entries(
+        config, name, &entries, &declared,
+    ))
+    .await
+    {
         Ok(rows) => rows,
         Err(error) => {
             return match error.downcast::<LegacyConfigRow>() {
@@ -5280,11 +5308,6 @@ async fn update_one_plugin(
             };
         }
     };
-    if rows.as_ref().is_some_and(|rows| !rows.created.is_empty())
-        && let Err(error) = Box::pin(config.save_dirty()).await
-    {
-        return failed(format!("{error:#}"));
-    }
     let rejected = plugin_config_rejections(config, &candidate);
 
     let replaced = match host.update_admitted(admitted) {
@@ -11634,8 +11657,10 @@ Add pricing to the active provider profile or supply a catalog entry."
                 all,
                 registry,
                 from,
-                allow,
+                mut allow,
+                allow_token,
             } => {
+                allow.extend(allow_token);
                 Box::pin(run_plugin_update(
                     &mut config,
                     plugins,
@@ -21460,6 +21485,306 @@ hosts = ["api.example.com", "api2.example.com"]
             b_after.contains("gitea.b.example.net"),
             "premise: profile B's operator-only grant is on disk: {b_after}"
         );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "plugins-wasm")]
+    async fn update_config_save_failure_keeps_rows_and_metadata_out_of_live_config() {
+        let dir = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(dir.path());
+        config.loaded_from = Some(config.config_path.clone());
+        let disk = format!(
+            "# operator comment\n{}",
+            toml::to_string_pretty(&config).expect("config document")
+        );
+        std::fs::write(&config.config_path, &disk).expect("operator config");
+        let saved_backend = config.observability.backend.clone();
+        config.observability.backend = "log".to_string();
+        config
+            .env_overridden_paths
+            .insert("observability.backend".to_string());
+        config
+            .pre_override_snapshots
+            .insert("observability.backend".to_string(), saved_backend.clone());
+        let manifest = tool_manifest_with("weather", &[], &["config_read"], true);
+        let entries = manifest_config_entries(&manifest).expect("instance entries");
+        let fault = "cost.rates.providers.models.openai.ghost-model.input_per_mtok";
+        config.mark_dirty(fault);
+        let before = config.clone();
+
+        for _ in 0..2 {
+            let error = Box::pin(prepare_plugin_update_config_entries(
+                &mut config,
+                "weather",
+                &entries,
+                &[],
+            ))
+            .await
+            .err()
+            .expect("every visit must attempt persistence and fail");
+            assert!(error.to_string().contains(fault), "{error:#}");
+            assert_eq!(
+                serde_json::to_value(&config).expect("live config"),
+                serde_json::to_value(&before).expect("prior config")
+            );
+            assert_eq!(config.dirty_paths, before.dirty_paths);
+            assert_eq!(config.loaded_from, before.loaded_from);
+            assert_eq!(config.config_path, before.config_path);
+            assert_eq!(config.env_overridden_paths, before.env_overridden_paths);
+            assert_eq!(config.pre_override_snapshots, before.pre_override_snapshots);
+            assert_eq!(
+                std::fs::read_to_string(&config.config_path).expect("disk config"),
+                disk
+            );
+        }
+
+        config.dirty_paths.remove(fault);
+        let rows = Box::pin(prepare_plugin_update_config_entries(
+            &mut config,
+            "weather",
+            &entries,
+            &[],
+        ))
+        .await
+        .expect("save after removing the fault")
+        .expect("rows");
+        assert_eq!(rows.created.len(), entries.len());
+        assert!(config.dirty_paths.is_empty());
+        let saved = std::fs::read_to_string(&config.config_path).expect("saved config");
+        assert!(saved.contains("# operator comment"));
+        let reloaded: Config = toml::from_str(&saved).expect("reload saved config");
+        assert_eq!(reloaded.observability.backend, saved_backend);
+        assert_eq!(config.observability.backend, "log");
+        assert_eq!(reloaded.plugins.entries.len(), entries.len());
+        for (_, key) in &entries {
+            let row = reloaded
+                .plugins
+                .entries
+                .iter()
+                .find(|row| &row.name == key)
+                .expect("row persisted");
+            assert!(row.egress_hosts.is_empty(), "seeding grants no egress");
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "plugins-wasm")]
+    async fn update_config_failure_preserves_an_earlier_target_and_existing_rows() {
+        let dir = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(dir.path());
+        config.loaded_from = Some(config.config_path.clone());
+        std::fs::write(
+            &config.config_path,
+            toml::to_string_pretty(&config).expect("config document"),
+        )
+        .expect("operator config");
+        let first = tool_manifest_with("first", &[], &["config_read"], true);
+        let first_entries = manifest_config_entries(&first).expect("first entries");
+        Box::pin(prepare_plugin_update_config_entries(
+            &mut config,
+            "first",
+            &first_entries,
+            &[],
+        ))
+        .await
+        .expect("earlier target persists its row");
+        let disk_before = std::fs::read(&config.config_path).expect("prior target on disk");
+        let second = tool_manifest_with("second", &[], &["config_read"], true);
+        let second_entries = manifest_config_entries(&second).expect("second entries");
+        let fault = "cost.rates.providers.models.openai.ghost-model.input_per_mtok";
+        config.mark_dirty(fault);
+        let before = config.clone();
+
+        assert!(
+            Box::pin(prepare_plugin_update_config_entries(
+                &mut config,
+                "second",
+                &second_entries,
+                &[],
+            ))
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(&config).expect("live config"),
+            serde_json::to_value(&before).expect("prior config")
+        );
+        assert_eq!(config.dirty_paths, before.dirty_paths);
+        assert_eq!(config.loaded_from, before.loaded_from);
+        assert_eq!(std::fs::read(&config.config_path).expect("disk"), disk_before);
+
+        // An existing row does not need a save and cannot consume another
+        // target's pending dirty paths, even while that save would fail.
+        let rows = Box::pin(prepare_plugin_update_config_entries(
+            &mut config,
+            "first",
+            &first_entries,
+            &[],
+        ))
+        .await
+        .expect("existing row needs no persistence")
+        .expect("rows");
+        assert!(rows.created.is_empty());
+        assert_eq!(rows.existing.len(), first_entries.len());
+        assert_eq!(config.dirty_paths, before.dirty_paths);
+        assert_eq!(std::fs::read(&config.config_path).expect("disk"), disk_before);
+
+        config.dirty_paths.remove(fault);
+        Box::pin(prepare_plugin_update_config_entries(
+            &mut config,
+            "second",
+            &second_entries,
+            &[],
+        ))
+        .await
+        .expect("next target persists after repair");
+        let saved = std::fs::read_to_string(&config.config_path).expect("saved config");
+        let reloaded: Config = toml::from_str(&saved).expect("reload both targets");
+        for (_, key) in first_entries.iter().chain(&second_entries) {
+            assert!(reloaded.plugins.entries.iter().any(|row| &row.name == key));
+        }
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    fn parsed_update_allow(cli: Cli) -> Vec<String> {
+        let Commands::Plugin { plugin_command } = cli.command else {
+            panic!("expected plugin command");
+        };
+        let PluginCommands::Update {
+            mut allow,
+            allow_token,
+            ..
+        } = plugin_command
+        else {
+            panic!("expected update command");
+        };
+        allow.extend(allow_token);
+        allow
+    }
+
+    #[test]
+    #[cfg(feature = "plugins-wasm")]
+    fn update_allow_token_parser_keeps_commas_and_legacy_csv_and_exact_matching() {
+        use crate::plugins::update::{AuthorityItem, accepts_all, malformed_allow_item};
+        let increase = [
+            AuthorityItem::Permission(zeroclaw::plugins::PluginPermission::StateRead),
+            AuthorityItem::Capability(zeroclaw::plugins::PluginCapability::Channel),
+            AuthorityItem::Provides("alpha,beta".to_string()),
+            AuthorityItem::Publisher(Some("key,other".to_string())),
+        ];
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "plugin",
+            "update",
+            "weather@2.0.0",
+            "--allow",
+            "permission:state_read,capability:channel",
+            "--allow-token",
+            "provides:alpha,beta",
+            "--allow-token=publisher:key,other",
+        ])
+        .expect("legacy CSV and repeated full tokens can be mixed");
+        let allowed = parsed_update_allow(cli);
+        assert_eq!(
+            allowed,
+            increase.iter().map(AuthorityItem::token).collect::<Vec<_>>()
+        );
+        assert_eq!(malformed_allow_item(&allowed), None);
+        assert!(accepts_all(&increase, &allowed));
+
+        let legacy = parsed_update_allow(
+            Cli::try_parse_from([
+                "zeroclaw",
+                "plugin",
+                "update",
+                "weather@2.0.0",
+                "--allow",
+                "provides:alpha,beta",
+            ])
+            .expect("legacy CSV still splits on commas"),
+        );
+        assert_eq!(malformed_allow_item(&legacy), Some("beta"));
+        assert!(!accepts_all(&increase[2..3], &legacy));
+        for bad in ["grant:alpha,beta", "provides:", "alpha,beta"] {
+            let parsed = parsed_update_allow(
+                Cli::try_parse_from([
+                    "zeroclaw",
+                    "plugin",
+                    "update",
+                    "weather@2.0.0",
+                    "--allow-token",
+                    bad,
+                ])
+                .expect("semantic validation follows parsing"),
+            );
+            assert_eq!(malformed_allow_item(&parsed), Some(bad));
+        }
+        let fragments = [
+            "provides:alpha",
+            "provides:beta",
+            "publisher:key",
+            "publisher:other",
+        ]
+        .map(str::to_string);
+        assert_eq!(malformed_allow_item(&fragments), None);
+        for item in &increase[2..] {
+            assert!(!accepts_all(std::slice::from_ref(item), &fragments));
+        }
+        assert!(
+            Cli::try_parse_from([
+                "zeroclaw",
+                "plugin",
+                "update",
+                "--all",
+                "--allow-token",
+                "provides:alpha,beta",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", unix))]
+    fn rendered_update_tokens_roundtrip_through_posix_shell_and_real_clap() {
+        use crate::plugins::egress_ceremony::ShellDialect;
+        use crate::plugins::update::{
+            AuthorityItem, UpdateSource, accepts_all, malformed_allow_item, update_command_for,
+        };
+        let increase = [
+            AuthorityItem::Permission(zeroclaw::plugins::PluginPermission::StateRead),
+            AuthorityItem::Capability(zeroclaw::plugins::PluginCapability::Channel),
+            AuthorityItem::Provides("alpha,beta' $(printf unexpected)".to_string()),
+            AuthorityItem::Publisher(Some("key,other".to_string())),
+        ];
+        let command = update_command_for(
+            ShellDialect::Posix,
+            std::path::Path::new("/tmp/profile with spaces"),
+            "weather",
+            UpdateSource::Registry {
+                version: Some("2.0.0"),
+                registry: Some("https://registry.example.test/index.json"),
+            },
+            &increase,
+        );
+        // The shell only tokenizes these synthetic literals into positional
+        // arguments; it never runs the rendered zeroclaw command.
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("set -- {command}; printf '%s\\0' \"$@\""))
+            .output()
+            .expect("POSIX shell");
+        assert!(out.status.success());
+        let argv = String::from_utf8(out.stdout).expect("literal UTF-8 argv");
+        let cli = Cli::try_parse_from(argv.split_terminator('\0'))
+            .expect("the emitted command must parse");
+        assert_eq!(cli.config_dir.as_deref(), Some("/tmp/profile with spaces"));
+        let allowed = parsed_update_allow(cli);
+        assert_eq!(
+            allowed,
+            increase.iter().map(AuthorityItem::token).collect::<Vec<_>>()
+        );
+        assert_eq!(malformed_allow_item(&allowed), None);
+        assert!(accepts_all(&increase, &allowed));
     }
 
     /// A tool package source whose component is a stub that does not load;

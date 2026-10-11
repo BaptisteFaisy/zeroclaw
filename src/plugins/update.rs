@@ -192,8 +192,8 @@ pub enum UpdateSource<'a> {
 }
 
 /// The `plugin update` command for `name` from `source`, accepting
-/// `increase` with `--allow` when it is not empty, quoted for this host's
-/// shell like every other printed command.
+/// `increase` with repeated `--allow-token` arguments when it is not empty,
+/// quoted for this host's shell like every other printed command.
 #[must_use]
 pub fn update_command(
     config_dir: &Path,
@@ -260,8 +260,7 @@ pub fn update_command_for(
     let allowed = increase
         .iter()
         .map(AuthorityItem::token)
-        .collect::<Vec<_>>()
-        .join(",");
+        .collect::<Vec<_>>();
     let target = match source {
         UpdateSource::Registry {
             version: Some(version),
@@ -279,7 +278,8 @@ pub fn update_command_for(
     };
 
     let dir = config_dir.to_string_lossy();
-    let mut values = vec![dir.as_ref(), target.as_str(), allowed.as_str()];
+    let mut values = vec![dir.as_ref(), target.as_str()];
+    values.extend(allowed.iter().map(String::as_str));
     if let Some((_, value)) = &origin {
         values.push(value.as_str());
     }
@@ -287,11 +287,12 @@ pub fn update_command_for(
     let origin = origin
         .map(|(flag, value)| format!(" {flag} {}", dialect.quote_literal(&value)))
         .unwrap_or_default();
-    let allow = if increase.is_empty() {
-        String::new()
-    } else {
-        format!(" --allow {}", dialect.quote_literal(&allowed))
-    };
+    // CSV is still accepted by --allow, but a manifest value can itself
+    // contain commas. Give Clap each full token through the undelimited form.
+    let allow = allowed
+        .iter()
+        .map(|token| format!(" --allow-token {}", dialect.quote_literal(token)))
+        .collect::<String>();
     format!(
         "{marker}{} plugin update {}{origin}{allow}",
         zeroclaw_invocation_for(dialect, config_dir),
@@ -449,7 +450,7 @@ mod tests {
             "zeroclaw --config-dir '/srv/zeroclaw profile' plugin update \
              'weather@2.0.0'\\''; rm -rf ~; '\\''' \
              --registry 'https://registry.example.com/index.json' \
-             --allow 'permission:http_client,provides:$(id)'"
+             --allow-token 'permission:http_client' --allow-token 'provides:$(id)'"
         );
     }
 
@@ -466,7 +467,7 @@ mod tests {
         assert_eq!(
             command,
             "zeroclaw --config-dir '/cfg' plugin update 'weather' \
-             --from '/work/weather-plugin' --allow 'capability:channel'"
+             --from '/work/weather-plugin' --allow-token 'capability:channel'"
         );
     }
 
@@ -574,7 +575,7 @@ mod tests {
 
         assert!(!command.contains("--registry"), "{command}");
         assert!(
-            command.ends_with("--allow 'permission:state_read'"),
+            command.ends_with("--allow-token 'permission:state_read'"),
             "{command}"
         );
     }
