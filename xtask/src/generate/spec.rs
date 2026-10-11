@@ -1681,7 +1681,9 @@ mod tests {
                 "default: dist\n        options:\n          - dist\n          - dist-broad"
             )
         );
-        assert!(job_block(&manual, "  build:\n").contains("\n    timeout-minutes: 90\n"));
+        assert!(job_block(&manual, "  build:\n").contains(
+            "\n    timeout-minutes: ${{ (matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-apple-darwin') && 180 || 90 }}\n"
+        ));
         assert!(manual.contains("--selection \"${{ inputs.distribution }}\""));
         assert!(manual.contains("echo \"- Binary bytes: $bytes\""));
         assert!(manual.contains("echo \"- Resolved features: \\`$FEATURES\\`\""));
