@@ -21977,6 +21977,8 @@ hosts = ["api.example.com", "api2.example.com"]
     #[tokio::test]
     #[cfg(feature = "plugins-wasm")]
     async fn update_config_save_failure_keeps_rows_and_metadata_out_of_live_config() {
+        use zeroclaw_config::schema::ObservabilityBackend;
+
         let dir = tempfile::tempdir().expect("config dir");
         let mut config = config_in_dir(dir.path());
         config.loaded_from = Some(config.config_path.clone());
@@ -21985,14 +21987,15 @@ hosts = ["api.example.com", "api2.example.com"]
             toml::to_string_pretty(&config).expect("config document")
         );
         std::fs::write(&config.config_path, &disk).expect("operator config");
-        let saved_backend = config.observability.backend.clone();
-        config.observability.backend = "log".to_string();
+        let saved_backend = config.observability.backend;
+        let saved_backend_wire = saved_backend.as_wire().to_owned();
+        config.observability.backend = ObservabilityBackend::Log;
         config
             .env_overridden_paths
             .insert("observability.backend".to_string());
         config
             .pre_override_snapshots
-            .insert("observability.backend".to_string(), saved_backend.clone());
+            .insert("observability.backend".to_string(), saved_backend_wire);
         let manifest = tool_manifest_with("weather", &[], &["config_read"], true);
         let entries = manifest_config_entries(&manifest).expect("instance entries");
         let fault = "cost.rates.providers.models.openai.ghost-model.input_per_mtok";
@@ -22041,7 +22044,7 @@ hosts = ["api.example.com", "api2.example.com"]
         assert!(saved.contains("# operator comment"));
         let reloaded: Config = toml::from_str(&saved).expect("reload saved config");
         assert_eq!(reloaded.observability.backend, saved_backend);
-        assert_eq!(config.observability.backend, "log");
+        assert_eq!(config.observability.backend, ObservabilityBackend::Log);
         assert_eq!(reloaded.plugins.entries.len(), entries.len());
         for (_, key) in &entries {
             let row = reloaded
