@@ -123,7 +123,7 @@ compilation. Target policy comes from `package.metadata.zeroclaw` in `Cargo.toml
 
 ## Built-in tools
 
-The following capabilities are available when compiled and selected; the eleven-tool default is listed above:
+The following built-in capabilities are available when compiled and selected; the eleven-tool default is listed above. This list is not the core set; see [Tiers and the retained core set](../developing/tool-inventory.md#tiers-and-the-retained-core-set) for the core set and the tier of each tool the runtime registry builds.
 
 | Tool | What it does |
 |---|---|

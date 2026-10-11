@@ -3,6 +3,7 @@
 pub mod attribution;
 pub mod helpers;
 pub(crate) mod i18n;
+pub mod inventory;
 #[cfg(feature = "tool-microsoft365")]
 pub mod microsoft365;
 pub mod util_helpers;
