@@ -21984,7 +21984,9 @@ hosts = ["api.example.com", "api2.example.com"]
         config.loaded_from = Some(config.config_path.clone());
         // Use the canonical writer: raw serde output includes `entries = []`,
         // an inline array the incremental natural-key writer cannot extend.
-        Box::pin(config.save()).await.expect("seed canonical config");
+        Box::pin(config.save())
+            .await
+            .expect("seed canonical config");
         let canonical_disk =
             std::fs::read_to_string(&config.config_path).expect("canonical config");
         assert!(
@@ -22074,7 +22076,9 @@ hosts = ["api.example.com", "api2.example.com"]
         let dir = tempfile::tempdir().expect("config dir");
         let mut config = config_in_dir(dir.path());
         config.loaded_from = Some(config.config_path.clone());
-        Box::pin(config.save()).await.expect("seed canonical config");
+        Box::pin(config.save())
+            .await
+            .expect("seed canonical config");
         let first = tool_manifest_with("first", &[], &["config_read"], true);
         let first_entries = manifest_config_entries(&first).expect("first entries");
         Box::pin(prepare_plugin_update_config_entries(
