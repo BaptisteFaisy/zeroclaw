@@ -26638,8 +26638,7 @@ fn apply_dirty_path(
     // the per-field MCP editor's edits go nowhere on disk. See the
     // regression test `save_dirty_persists_mcp_server_field_via_natural_key`.
     if let Some(section) = find_natural_key_section_for_path(dotted) {
-        apply_dirty_natural_key_path(root, &section, dotted, full_table, default_table);
-        return Ok(());
+        return apply_dirty_natural_key_path(root, &section, dotted, full_table, default_table);
     }
 
     // `HashMap<String, T>` sections whose key is a `#[resource_key]`
@@ -26777,6 +26776,10 @@ fn find_natural_key_section_for_path(dotted: &str) -> Option<NaturalKeySection> 
 /// the existing Table-shaped `set_path_in_doc` / `delete_path_in_doc`
 /// helpers against the located entry's table.
 ///
+/// A present-value write refused by the document-shape check fails the
+/// save; the caller must not clear dirty paths or publish unsaved state.
+/// Missing-value delete/no-op paths keep their existing behavior.
+///
 /// **Order-independence invariant.** `Config::dirty_paths` is a
 /// `HashSet<String>`, so the three shapes above can apply in any
 /// interleaving within a single `save_dirty` batch — in particular,
@@ -26797,7 +26800,7 @@ fn apply_dirty_natural_key_path(
     dotted: &str,
     full_table: &toml::Table,
     _default_table: &toml::Table,
-) {
+) -> Result<()> {
     // `dotted` is known to start with `<section_path>.` thanks to
     // `find_natural_key_section_for_path`; split the alias and inner
     // suffix off the tail.
@@ -26806,14 +26809,14 @@ fn apply_dirty_natural_key_path(
         .and_then(|s| s.strip_prefix('.'))
     {
         Some(r) => r,
-        None => return,
+        None => return Ok(()),
     };
     let (alias, inner_suffix) = match rest.split_once('.') {
         Some((a, i)) => (a, Some(i)),
         None => (rest, None),
     };
     if alias.is_empty() {
-        return;
+        return Ok(());
     }
 
     // Walk the in-memory serialized array at `section_path`. Each
@@ -26834,7 +26837,7 @@ fn apply_dirty_natural_key_path(
     // always at the deepest segment of `section_path`; the leading
     // segments are plain struct fields and therefore Tables on disk.
     let Some((array_key, parent_segs)) = section_segs.split_last() else {
-        return;
+        return Ok(());
     };
 
     // Inner-suffix path: per-field edit (case 1). Reconcile the inner
@@ -26888,10 +26891,13 @@ fn apply_dirty_natural_key_path(
                     array_key,
                     section.natural_key_field,
                     alias,
-                );
-                let Some(entry_table) = entry_table else {
-                    return;
-                };
+                )
+                .with_context(|| {
+                    format!(
+                        "Cannot persist natural-key section {}: incompatible document node",
+                        section.section_path
+                    )
+                })?;
                 let mut pruned = value.clone();
                 prune_empty_leaves(&mut pruned);
                 set_path_in_doc(entry_table, &inner_segs, &pruned);
@@ -26908,12 +26914,12 @@ fn apply_dirty_natural_key_path(
                     section.natural_key_field,
                     alias,
                 ) else {
-                    return;
+                    return Ok(());
                 };
                 delete_path_in_doc(entry_table, &inner_segs);
             }
         }
-        return;
+        return Ok(());
     }
 
     // Bare-alias path (cases 2 and 3). No inner suffix → reconcile the
@@ -26932,10 +26938,13 @@ fn apply_dirty_natural_key_path(
                 array_key,
                 section.natural_key_field,
                 alias,
-            );
-            let Some(entry_table) = entry_table else {
-                return;
-            };
+            )
+            .with_context(|| {
+                format!(
+                    "Cannot persist natural-key section {}: incompatible document node",
+                    section.section_path
+                )
+            })?;
             // Replace the table's contents wholesale so removed inner
             // fields actually disappear from disk.
             entry_table.clear();
@@ -26957,6 +26966,7 @@ fn apply_dirty_natural_key_path(
             );
         }
     }
+    Ok(())
 }
 
 /// Return the longest `MapKeyKind::Map` section whose path is a strict
@@ -40280,6 +40290,123 @@ group_policy = "disabled"
             reloaded.mcp.servers[0].url.as_deref(),
             Some("https://mcp.example/")
         );
+    }
+
+    #[test]
+    async fn save_dirty_refuses_inline_plugin_writes_without_clearing_state() {
+        let _env_guard = env_override_lock().await;
+        let _backend_guard = EnvValueGuard::set("ZEROCLAW_observability__backend", "log");
+        for inner_field in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let _config_dir_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", tmp.path());
+            let config_path = tmp.path().join("config.toml");
+            let seed = format!(
+                "schema_version = {}\n\n\
+                 [observability]\n# operator comment\nbackend = \"none\"\n\n\
+                 [plugins]\n# inline entry comment\n\
+                 entries = [{{ name = \"operator_instance\", \
+                 config = {{ token = \"synthetic-private-value\" }}, \
+                 egress_hosts = [\"operator.example\"] }}] # trailing comment\n",
+                crate::migration::CURRENT_SCHEMA_VERSION
+            );
+            let strict = crate::migration::migrate_to_current(&seed).unwrap();
+            assert_eq!(strict.plugins.entries.len(), 1);
+            std::fs::write(&config_path, &seed).unwrap();
+            let live = Box::pin(Config::load_or_init()).await.unwrap();
+            assert!(live.degraded_sections.is_empty());
+            assert!(live.degraded_security.is_empty());
+            assert_eq!(live.loaded_from.as_ref(), Some(&config_path));
+            assert_eq!(live.observability.backend, ObservabilityBackend::Log);
+            let live_before = toml::to_string(&live).unwrap();
+            let mut staged = live.clone();
+            if inner_field {
+                staged.plugins.entries[0].egress_hosts = vec!["replacement.example".into()];
+                staged.mark_dirty("plugins.entries.operator_instance.egress_hosts");
+            } else {
+                assert!(
+                    staged
+                        .create_map_key("plugins.entries", "new_instance")
+                        .unwrap()
+                );
+                staged.plugins.entries.last_mut().unwrap().egress_hosts =
+                    vec!["replacement.example".into()];
+                staged.mark_dirty("plugins.entries.new_instance");
+            }
+            let staged_before = toml::to_string(&staged).unwrap();
+            let dirty_before = staged.dirty_paths.clone();
+            let loaded_from = staged.loaded_from.clone();
+            let env_paths = staged.env_overridden_paths.clone();
+            let env_snapshots = staged.pre_override_snapshots.clone();
+            for _ in 0..2 {
+                let error = staged
+                    .save_dirty()
+                    .await
+                    .expect_err("a refused natural-key write must fail the save");
+                let message = format!("{error:#}");
+                assert!(message.contains("plugins.entries"));
+                for private_value in [
+                    "synthetic-private-value",
+                    "operator_instance",
+                    "new_instance",
+                    "operator.example",
+                    "replacement.example",
+                ] {
+                    assert!(!message.contains(private_value));
+                }
+                assert_eq!(std::fs::read_to_string(&config_path).unwrap(), seed);
+                assert_eq!(toml::to_string(&staged).unwrap(), staged_before);
+                assert_eq!(staged.dirty_paths, dirty_before);
+                assert_eq!(staged.loaded_from, loaded_from);
+                assert_eq!(staged.env_overridden_paths, env_paths);
+                assert_eq!(staged.pre_override_snapshots, env_snapshots);
+                assert_eq!(toml::to_string(&live).unwrap(), live_before);
+                assert!(live.dirty_paths.is_empty());
+                assert_eq!(live.loaded_from, loaded_from);
+                assert_eq!(live.env_overridden_paths, env_paths);
+                assert_eq!(live.pre_override_snapshots, env_snapshots);
+            }
+            let reloaded = Box::pin(Config::load_or_init()).await.unwrap();
+            assert_eq!(reloaded.plugins.entries.len(), 1);
+            assert_eq!(
+                reloaded.plugins.entry_egress("operator_instance").0,
+                vec!["operator.example"]
+            );
+            assert_eq!(
+                reloaded
+                    .plugins
+                    .entry_config("operator_instance")
+                    .unwrap()
+                    .unwrap()
+                    .get("token")
+                    .map(String::as_str),
+                Some("synthetic-private-value")
+            );
+        }
+    }
+
+    #[test]
+    async fn natural_key_missing_write_and_delete_noops_preserve_inline_document() {
+        let source = format!(
+            "schema_version = {}\n\n[plugins]\n\
+             entries = [{{ name = \"operator_instance\", egress_hosts = [\"operator.example\"] }}]\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        let config = crate::migration::migrate_to_current(&source).unwrap();
+        let full_table = toml::Value::try_from(&config)
+            .unwrap()
+            .as_table()
+            .unwrap()
+            .clone();
+        let default_table = toml::Table::new();
+        for path in [
+            "plugins.entries.missing_instance",
+            "plugins.entries.operator_instance.missing_field",
+        ] {
+            let mut doc: toml_edit::DocumentMut = source.parse().unwrap();
+            let before = doc.to_string();
+            apply_dirty_path(doc.as_table_mut(), path, &full_table, &default_table).unwrap();
+            assert_eq!(doc.to_string(), before);
+        }
     }
 
     #[test]
