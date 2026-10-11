@@ -21982,9 +21982,19 @@ hosts = ["api.example.com", "api2.example.com"]
         let dir = tempfile::tempdir().expect("config dir");
         let mut config = config_in_dir(dir.path());
         config.loaded_from = Some(config.config_path.clone());
+        // Use the canonical writer: raw serde output includes `entries = []`,
+        // an inline array the incremental natural-key writer cannot extend.
+        Box::pin(config.save()).await.expect("seed canonical config");
+        let canonical_disk =
+            std::fs::read_to_string(&config.config_path).expect("canonical config");
+        assert!(
+            !canonical_disk.contains("[observability]"),
+            "default observability is pruned from the canonical fixture"
+        );
+        // This table stays untouched; schema_version is replaced on every save.
         let disk = format!(
-            "# operator comment\n{}",
-            toml::to_string_pretty(&config).expect("config document")
+            "{canonical_disk}\n[observability]\n# operator comment\nbackend = {:?}\n",
+            config.observability.backend.as_wire()
         );
         std::fs::write(&config.config_path, &disk).expect("operator config");
         let saved_backend = config.observability.backend;
@@ -22042,7 +22052,8 @@ hosts = ["api.example.com", "api2.example.com"]
         assert!(config.dirty_paths.is_empty());
         let saved = std::fs::read_to_string(&config.config_path).expect("saved config");
         assert!(saved.contains("# operator comment"));
-        let reloaded: Config = toml::from_str(&saved).expect("reload saved config");
+        let reloaded = zeroclaw_config::migration::migrate_to_current(&saved)
+            .expect("reload saved config through canonical migration");
         assert_eq!(reloaded.observability.backend, saved_backend);
         assert_eq!(config.observability.backend, ObservabilityBackend::Log);
         assert_eq!(reloaded.plugins.entries.len(), entries.len());
@@ -22063,11 +22074,7 @@ hosts = ["api.example.com", "api2.example.com"]
         let dir = tempfile::tempdir().expect("config dir");
         let mut config = config_in_dir(dir.path());
         config.loaded_from = Some(config.config_path.clone());
-        std::fs::write(
-            &config.config_path,
-            toml::to_string_pretty(&config).expect("config document"),
-        )
-        .expect("operator config");
+        Box::pin(config.save()).await.expect("seed canonical config");
         let first = tool_manifest_with("first", &[], &["config_read"], true);
         let first_entries = manifest_config_entries(&first).expect("first entries");
         Box::pin(prepare_plugin_update_config_entries(
@@ -22135,7 +22142,8 @@ hosts = ["api.example.com", "api2.example.com"]
         .await
         .expect("next target persists after repair");
         let saved = std::fs::read_to_string(&config.config_path).expect("saved config");
-        let reloaded: Config = toml::from_str(&saved).expect("reload both targets");
+        let reloaded = zeroclaw_config::migration::migrate_to_current(&saved)
+            .expect("reload both targets through canonical migration");
         for (_, key) in first_entries.iter().chain(&second_entries) {
             assert!(reloaded.plugins.entries.iter().any(|row| &row.name == key));
         }
