@@ -305,7 +305,11 @@ async fn update_refuses_added_authority_until_accepted_with_the_printed_items() 
         !refused.status.success(),
         "unaccepted authority must fail: {text}"
     );
-    for part in ["--allow-token", "permission:state_read", "fixture-tool@2.0.0"] {
+    for part in [
+        "--allow-token",
+        "permission:state_read",
+        "fixture-tool@2.0.0",
+    ] {
         assert!(
             text.contains(part),
             "the refusal must print {part:?}: {text}"
@@ -727,9 +731,11 @@ async fn duplicate_target_cannot_publish_rows_left_by_a_failed_save() {
     let before: toml::Table =
         toml::from_str(std::str::from_utf8(&restore.bytes).expect("UTF-8 config"))
             .expect("config before");
-    assert!(before["plugins"].get("entries").is_none_or(|rows| {
-        rows.as_array().is_some_and(Vec::is_empty)
-    }));
+    assert!(
+        before["plugins"]
+            .get("entries")
+            .is_none_or(|rows| { rows.as_array().is_some_and(Vec::is_empty) })
+    );
 
     let server = MockServer::start().await;
     let archive = package_archive(&candidate, &std::fs::read(fixture()).expect("fixture"));
@@ -770,7 +776,10 @@ async fn duplicate_target_cannot_publish_rows_left_by_a_failed_save() {
         &["update", PACKAGE, PACKAGE, "--registry", &registry],
     );
     let text = combined(&out);
-    assert!(!out.status.success(), "a failed save fails the batch: {text}");
+    assert!(
+        !out.status.success(),
+        "a failed save fails the batch: {text}"
+    );
     assert!(
         text.contains("Failed to parse existing config for incremental save"),
         "{text}"
@@ -801,9 +810,10 @@ async fn duplicate_target_cannot_publish_rows_left_by_a_failed_save() {
         .iter()
         .find(|row| row.get("name").and_then(toml::Value::as_str) == Some(key.as_str()))
         .expect("the retry persists the row before publishing");
-    assert!(row.get("egress_hosts").is_none_or(|hosts| {
-        hosts.as_array().is_some_and(Vec::is_empty)
-    }));
+    assert!(
+        row.get("egress_hosts")
+            .is_none_or(|hosts| { hosts.as_array().is_some_and(Vec::is_empty) })
+    );
     let info = run_plugin(config_dir.path(), &["info", PACKAGE]);
     let info_text = combined(&info);
     assert!(info.status.success(), "{info_text}");

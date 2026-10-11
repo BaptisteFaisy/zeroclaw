@@ -289,10 +289,11 @@ pub fn update_command_for(
         .unwrap_or_default();
     // CSV is still accepted by --allow, but a manifest value can itself
     // contain commas. Give Clap each full token through the undelimited form.
-    let allow = allowed
-        .iter()
-        .map(|token| format!(" --allow-token {}", dialect.quote_literal(token)))
-        .collect::<String>();
+    let mut allow = String::new();
+    for token in &allowed {
+        allow.push_str(" --allow-token ");
+        allow.push_str(&dialect.quote_literal(token));
+    }
     format!(
         "{marker}{} plugin update {}{origin}{allow}",
         zeroclaw_invocation_for(dialect, config_dir),

@@ -22098,7 +22098,10 @@ hosts = ["api.example.com", "api2.example.com"]
         );
         assert_eq!(config.dirty_paths, before.dirty_paths);
         assert_eq!(config.loaded_from, before.loaded_from);
-        assert_eq!(std::fs::read(&config.config_path).expect("disk"), disk_before);
+        assert_eq!(
+            std::fs::read(&config.config_path).expect("disk"),
+            disk_before
+        );
 
         // An existing row does not need a save and cannot consume another
         // target's pending dirty paths, even while that save would fail.
@@ -22114,7 +22117,10 @@ hosts = ["api.example.com", "api2.example.com"]
         assert!(rows.created.is_empty());
         assert_eq!(rows.existing.len(), first_entries.len());
         assert_eq!(config.dirty_paths, before.dirty_paths);
-        assert_eq!(std::fs::read(&config.config_path).expect("disk"), disk_before);
+        assert_eq!(
+            std::fs::read(&config.config_path).expect("disk"),
+            disk_before
+        );
 
         config.dirty_paths.remove(fault);
         Box::pin(prepare_plugin_update_config_entries(
@@ -22174,7 +22180,10 @@ hosts = ["api.example.com", "api2.example.com"]
         let allowed = parsed_update_allow(cli);
         assert_eq!(
             allowed,
-            increase.iter().map(AuthorityItem::token).collect::<Vec<_>>()
+            increase
+                .iter()
+                .map(AuthorityItem::token)
+                .collect::<Vec<_>>()
         );
         assert_eq!(malformed_allow_item(&allowed), None);
         assert!(accepts_all(&increase, &allowed));
@@ -22268,7 +22277,10 @@ hosts = ["api.example.com", "api2.example.com"]
         let allowed = parsed_update_allow(cli);
         assert_eq!(
             allowed,
-            increase.iter().map(AuthorityItem::token).collect::<Vec<_>>()
+            increase
+                .iter()
+                .map(AuthorityItem::token)
+                .collect::<Vec<_>>()
         );
         assert_eq!(malformed_allow_item(&allowed), None);
         assert!(accepts_all(&increase, &allowed));
