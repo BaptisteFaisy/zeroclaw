@@ -144,7 +144,7 @@ jobs:
     needs: [web]
     if: ${{ !inputs.release_tools_only }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: ${{ inputs.distribution == 'dist-broad' && 90 || 40 }}
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -233,11 +233,19 @@ jobs:
       - name: Configure target environment
         shell: bash
         run: |
+          dist_build_jobs=""
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            case "${{ matrix.target }}" in
+              aarch64-unknown-linux-gnu|aarch64-unknown-linux-musl)
+                dist_build_jobs=" --jobs 2"
+                ;;
+            esac
+          fi
           {
             if [ "${{ matrix.use_cross || 'false' }}" = "true" ]; then
-              echo "BUILD_CMD=cross build"
+              echo "BUILD_CMD=cross build${dist_build_jobs}"
             else
-              echo "BUILD_CMD=cargo build"
+              echo "BUILD_CMD=cargo build${dist_build_jobs}"
             fi
             if [ -n "${{ matrix.linker_env || '' }}" ] && [ -n "${{ matrix.linker || '' }}" ]; then
               echo "${{ matrix.linker_env }}=${{ matrix.linker }}"
@@ -251,6 +259,13 @@ jobs:
               echo "CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS=-C target-feature=-neon"
             fi
           } >> "$GITHUB_ENV"
+
+      - name: Prepare bounded Linux ARM64 build memory
+        id: dist_memory
+        timeout-minutes: 5
+        if: runner.os == 'Linux' && (matrix.target == 'aarch64-unknown-linux-gnu' || matrix.target == 'aarch64-unknown-linux-musl')
+        shell: bash
+        run: bash scripts/ci/dist_runner_memory.sh prepare
 
       - name: Build release
         shell: bash
@@ -300,6 +315,15 @@ jobs:
           path: target/${{ matrix.target }}/release/${{ runner.os == 'Windows' && 'zerorelay.exe' || 'zerorelay' }}
           if-no-files-found: error
           retention-days: 1
+
+      - name: Report and release owned Linux ARM64 build memory
+        timeout-minutes: 5
+        if: always() && runner.os == 'Linux' && (matrix.target == 'aarch64-unknown-linux-gnu' || matrix.target == 'aarch64-unknown-linux-musl')
+        shell: bash
+        env:
+          ZC_DIST_SWAP_FILE: ${{ steps.dist_memory.outputs.swap_file }}
+          ZC_DIST_SWAP_IDENTITY: ${{ steps.dist_memory.outputs.swap_identity }}
+        run: bash scripts/ci/dist_runner_memory.sh cleanup
 
   # Rehearsal of the release's plugin smoke: the same packages and the same
   # script run against the binary each build leg uploaded, on a runner that
