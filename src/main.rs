@@ -14608,8 +14608,7 @@ mod tests {
                 &format!("plugins.entries.{}.config.api_token", entry.name),
                 None,
             );
-            let line =
-                required_key_line(Path::new("/tmp/schema-profile"), &entry.name, &keys[0]);
+            let line = required_key_line(Path::new("/tmp/schema-profile"), &entry.name, &keys[0]);
             assert_eq!(
                 line,
                 ta(
@@ -14626,12 +14625,10 @@ mod tests {
             assert!(config_verdict(&manifest, "operations", Some(&entry)).is_ok());
             let keys = required_keys(&manifest, Some(&entry));
             assert!(keys[0].set);
-            let line =
-                required_key_line(Path::new("/tmp/schema-profile"), &entry.name, &keys[0]);
+            let line = required_key_line(Path::new("/tmp/schema-profile"), &entry.name, &keys[0]);
             assert!(!line.contains("fixture-secret-value") && !line.contains(&command));
         }
     }
-
 
     /// `oidc login` prints the access token on stdout and shells capture it, so
     /// the browser opener must not inherit the CLI's standard streams. The probe
