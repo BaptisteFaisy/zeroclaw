@@ -21982,8 +21982,8 @@ hosts = ["api.example.com", "api2.example.com"]
         let dir = tempfile::tempdir().expect("config dir");
         let mut config = config_in_dir(dir.path());
         config.loaded_from = Some(config.config_path.clone());
-        // Use the canonical writer: raw serde output includes `entries = []`,
-        // an inline array the incremental natural-key writer cannot extend.
+        // Canonical seeding keeps this control on normal persisted defaults.
+        // Empty-array input has separate config persistence regressions.
         Box::pin(config.save())
             .await
             .expect("seed canonical config");

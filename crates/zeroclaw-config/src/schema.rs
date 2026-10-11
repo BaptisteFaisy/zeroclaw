@@ -27167,7 +27167,8 @@ fn warn_natural_key_doc_kind_mismatch(
 ///   * Parent Tables along `parent_segs` are auto-created if missing
 ///     (mirrors `set_path_in_doc`).
 ///   * The `array_key` slot may not yet exist; insert an
-///     `ArrayOfTables` if so.
+///     `ArrayOfTables` if so. An existing empty `[]` is also a valid
+///     empty Vec; convert it when creating the first keyed table.
 ///   * The array may not yet contain an entry whose natural-key field
 ///     matches `alias`; push a new table with `<natural_key_field> =
 ///     "<alias>"` seeded.
@@ -27213,6 +27214,31 @@ fn ensure_array_of_tables_entry<'a>(
             array_key,
             toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new()),
         );
+    } else if let Some(array) = cursor.get(array_key).and_then(|item| item.as_array())
+        && array.is_empty()
+    {
+        // No existing rows can be lost. Carry the key's leading comments,
+        // comments inside the empty array, and its end-of-line comment onto
+        // the first table. insert() resets the key decor so later tables do
+        // not repeat those comments.
+        let leading = cursor
+            .key(array_key)
+            .and_then(|key| key.leaf_decor().prefix())
+            .and_then(|prefix| prefix.as_str())
+            .unwrap_or("");
+        let inner = array.trailing().as_str().unwrap_or("");
+        let trailing = array
+            .decor()
+            .suffix()
+            .and_then(|suffix| suffix.as_str())
+            .unwrap_or("");
+        let mut first = toml_edit::Table::new();
+        first.insert(natural_key_field, toml_edit::value(alias.to_string()));
+        first.decor_mut().set_prefix(format!("{leading}{inner}"));
+        first.decor_mut().set_suffix(trailing.to_owned());
+        let mut aot = toml_edit::ArrayOfTables::new();
+        aot.push(first);
+        cursor.insert(array_key, toml_edit::Item::ArrayOfTables(aot));
     }
     let aot = cursor
         .get_mut(array_key)
@@ -40100,6 +40126,181 @@ group_policy = "disabled"
             .expect("reparse must surface the new entry by natural key");
         assert_eq!(gh.transport, McpTransport::Http);
         assert_eq!(gh.url.as_deref(), Some("https://mcp.example/"));
+    }
+
+    #[test]
+    async fn save_dirty_persists_rows_from_loaded_empty_plugin_array() {
+        let _env_guard = env_override_lock().await;
+        let _backend_guard = EnvValueGuard::set("ZEROCLAW_observability__backend", "log");
+        for plugin_source in [
+            "[plugins]\nentries = []\n",
+            "[plugins]\n# entry list comment\nentries = [\n# empty array comment\n] # trailing entry comment\n",
+            "",
+            "[[plugins.entries]]\nname = \"existing\"\negress_hosts = [\"existing.example\"]\n",
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let _config_dir_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", tmp.path());
+            let config_path = tmp.path().join("config.toml");
+            let seed = format!(
+                "schema_version = {}\n\n[observability]\n# operator comment\nbackend = \"none\"\n\n{plugin_source}",
+                crate::migration::CURRENT_SCHEMA_VERSION
+            );
+            std::fs::write(&config_path, &seed).unwrap();
+            let strict = crate::migration::migrate_to_current(&seed).unwrap();
+            let previous_rows = strict.plugins.entries.len();
+            let mut config = Box::pin(Config::load_or_init()).await.unwrap();
+            assert!(config.degraded_sections.is_empty());
+            assert!(config.degraded_security.is_empty());
+            assert_eq!(config.plugins.entries.len(), previous_rows);
+            assert_eq!(config.loaded_from.as_ref(), Some(&config_path));
+            assert_eq!(config.observability.backend, ObservabilityBackend::Log);
+            let loaded_from = config.loaded_from.clone();
+            let env_paths = config.env_overridden_paths.clone();
+            let env_snapshots = config.pre_override_snapshots.clone();
+
+            assert!(config.create_map_key("plugins.entries", "first").unwrap());
+            config.plugins.entries.last_mut().unwrap().egress_hosts = vec!["first.example".into()];
+            config.mark_dirty("plugins.entries.first");
+            config.save_dirty().await.unwrap();
+            assert!(config.dirty_paths.is_empty());
+            let first_saved = std::fs::read_to_string(&config_path).unwrap();
+            let first_disk = crate::migration::migrate_to_current(&first_saved).unwrap();
+            assert_eq!(first_disk.plugins.entries.len(), previous_rows + 1);
+            assert_eq!(
+                first_disk.plugins.entry_egress("first").0,
+                vec!["first.example"]
+            );
+            assert_eq!(first_disk.observability.backend, ObservabilityBackend::None);
+            assert!(first_saved.contains("# operator comment"));
+            for comment in [
+                "# entry list comment",
+                "# empty array comment",
+                "# trailing entry comment",
+            ] {
+                if seed.contains(comment) {
+                    assert_eq!(first_saved.matches(comment).count(), 1);
+                }
+            }
+            let reloaded = Box::pin(Config::load_or_init()).await.unwrap();
+            assert_eq!(reloaded.plugins.entries.len(), previous_rows + 1);
+            assert_eq!(
+                reloaded.plugins.entry_egress("first").0,
+                vec!["first.example"]
+            );
+
+            assert!(config.create_map_key("plugins.entries", "second").unwrap());
+            config.plugins.entries.last_mut().unwrap().egress_hosts = vec!["second.example".into()];
+            config.mark_dirty("plugins.entries.second");
+            let bad_path = "cost.rates.providers.models.openai.ghost-model.input_per_mtok";
+            config.mark_dirty(bad_path);
+            let dirty_before = config.dirty_paths.clone();
+            config
+                .save_dirty()
+                .await
+                .expect_err("invalid dirty path must fail");
+            assert_eq!(std::fs::read_to_string(&config_path).unwrap(), first_saved);
+            assert_eq!(config.dirty_paths, dirty_before);
+            assert_eq!(config.loaded_from, loaded_from);
+            assert_eq!(config.env_overridden_paths, env_paths);
+            assert_eq!(config.pre_override_snapshots, env_snapshots);
+            assert_eq!(config.plugins.entries.len(), previous_rows + 2);
+
+            config.dirty_paths.remove(bad_path);
+            config.save_dirty().await.unwrap();
+            assert!(config.dirty_paths.is_empty());
+            assert_eq!(config.loaded_from, loaded_from);
+            assert_eq!(config.env_overridden_paths, env_paths);
+            assert_eq!(config.pre_override_snapshots, env_snapshots);
+            assert_eq!(config.observability.backend, ObservabilityBackend::Log);
+            assert!(!config.create_map_key("plugins.entries", "second").unwrap());
+            let written = std::fs::read_to_string(&config_path).unwrap();
+            let disk = crate::migration::migrate_to_current(&written).unwrap();
+            assert_eq!(disk.plugins.entries.len(), previous_rows + 2);
+            assert_eq!(disk.plugins.entry_egress("first").0, vec!["first.example"]);
+            assert_eq!(disk.plugins.entry_egress("second").0, vec!["second.example"]);
+            if previous_rows != 0 {
+                assert_eq!(
+                    disk.plugins.entry_egress("existing").0,
+                    vec!["existing.example"]
+                );
+            }
+            assert_eq!(disk.observability.backend, ObservabilityBackend::None);
+            assert!(written.contains("# operator comment"));
+            for comment in [
+                "# entry list comment",
+                "# empty array comment",
+                "# trailing entry comment",
+            ] {
+                if seed.contains(comment) {
+                    assert_eq!(written.matches(comment).count(), 1);
+                }
+            }
+            let reloaded = Box::pin(Config::load_or_init()).await.unwrap();
+            assert_eq!(reloaded.plugins.entries.len(), previous_rows + 2);
+            assert_eq!(
+                reloaded.plugins.entry_egress("second").0,
+                vec!["second.example"]
+            );
+        }
+    }
+
+    #[test]
+    async fn save_dirty_persists_inner_fields_from_loaded_empty_mcp_array() {
+        let _env_guard = env_override_lock().await;
+        let tmp = TempDir::new().unwrap();
+        let _config_dir_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", tmp.path());
+        let config_path = tmp.path().join("config.toml");
+        let seed = format!(
+            "schema_version = {}\n\n[mcp]\nservers = []\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+        crate::migration::migrate_to_current(&seed).unwrap();
+        let mut config = Box::pin(Config::load_or_init()).await.unwrap();
+        assert!(config.mcp.servers.is_empty());
+        assert!(config.degraded_sections.is_empty());
+        assert!(config.create_map_key("mcp.servers", "github").unwrap());
+        config
+            .set_prop_persistent("mcp.servers.github.transport", "http")
+            .unwrap();
+        config
+            .set_prop_persistent("mcp.servers.github.url", "https://mcp.example/")
+            .unwrap();
+        assert!(!config.dirty_paths.contains("mcp.servers.github"));
+        config.save_dirty().await.unwrap();
+        assert!(config.dirty_paths.is_empty());
+        let reloaded = Box::pin(Config::load_or_init()).await.unwrap();
+        assert_eq!(reloaded.mcp.servers.len(), 1);
+        assert_eq!(reloaded.mcp.servers[0].name, "github");
+        assert_eq!(reloaded.mcp.servers[0].transport, McpTransport::Http);
+        assert_eq!(
+            reloaded.mcp.servers[0].url.as_deref(),
+            Some("https://mcp.example/")
+        );
+    }
+
+    #[test]
+    async fn natural_key_writer_preserves_unsupported_existing_nodes() {
+        for source in [
+            "[plugins]\nentries = [{ name = \"existing\", egress_hosts = [\"existing.example\"] }] # inline comment\n",
+            "[plugins]\nentries = \"operator value\" # scalar comment\n",
+            "[plugins.entries]\nname = \"operator value\" # table comment\n",
+            "plugins = \"operator value\" # parent comment\n",
+        ] {
+            let mut doc: toml_edit::DocumentMut = source.parse().unwrap();
+            let before = doc.to_string();
+            assert!(
+                ensure_array_of_tables_entry(
+                    doc.as_table_mut(),
+                    &["plugins"],
+                    "entries",
+                    "name",
+                    "new"
+                )
+                .is_none()
+            );
+            assert_eq!(doc.to_string(), before);
+        }
     }
 
     /// `rename_map_key("mcp.servers", "fs", "filesystem")` rewrites the
