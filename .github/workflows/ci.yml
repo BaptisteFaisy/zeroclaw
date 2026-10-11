@@ -1070,7 +1070,7 @@ jobs:
       - name: Run opt-in tool tests
         run: >-
           cargo nextest run --locked --no-fail-fast
-          -p zeroclaw -p zeroclaw-config -p zeroclaw-tools -p zeroclaw-runtime -p zeroclaw-gateway
+          -p zeroclaw -p zeroclaw-config -p zeroclaw-tools -p zeroclaw-runtime -p zeroclaw-channels -p zeroclaw-gateway
           --features tools-compat
           --lib --test integration
           -E 'not binary(integration) or test(/^report_template_tool_test::/)'

@@ -8507,6 +8507,8 @@ data: [DONE]\n\n";
         let (state, _) = production_sse_state(&tmp, &fixture.base_url(), 1.0, false);
         {
             let mut config = state.config.write();
+            // Selection admits the tool; the existing allowlist still controls execution.
+            config.tools.optional = vec!["calculator".into()];
             config
                 .risk_profiles
                 .get_mut("fixture")

@@ -19917,8 +19917,33 @@ pub(crate) mod tests {
 
     #[test]
     fn matrix_safe_policy_fields_match_active_standard_tool_schemas() {
+        use zeroclaw_config::builtin_tools::EXTERNAL_TOOL_NAMES;
+        use zeroclaw_config::validation_warnings::TOOL_COMPILED_OUT;
+
         let temp = TempDir::new().expect("temporary workspace");
-        let config = Arc::new(Config::default());
+        let mut config = Config::default();
+        config.data_dir = temp.path().join("data");
+        config.config_path = temp.path().join("config.toml");
+        config.tools.optional = vec!["*".into()];
+
+        // Config owns compile availability; channels has no tools-external feature of its own.
+        let compiled_out_external = config
+            .collect_warnings()
+            .iter()
+            .filter(|warning| warning.code == TOOL_COMPILED_OUT && warning.path == "tools.optional")
+            .count();
+        assert!(
+            compiled_out_external == 0 || compiled_out_external == EXTERNAL_TOOL_NAMES.len(),
+            "maximal selection must report every external adapter or none as compiled out"
+        );
+        let mut expected_absent_required_tools: Vec<&str> = MATRIX_REQUIRED_SAFE_TOOL_ARGUMENTS
+            .iter()
+            .flat_map(|(tools, _)| tools.iter().copied())
+            .filter(|tool| compiled_out_external != 0 && EXTERNAL_TOOL_NAMES.contains(tool))
+            .collect();
+        expected_absent_required_tools.sort_unstable();
+
+        let config = Arc::new(config);
         let security = Arc::new(SecurityPolicy::default());
         let registry = tools::all_tools(
             Arc::clone(&config),
@@ -19987,9 +20012,10 @@ pub(crate) mod tests {
             checked_tools >= 20,
             "the standard registry unexpectedly exposed only {checked_tools} safe-policy tools"
         );
-        assert!(
-            absent_required_tools.is_empty(),
-            "required Matrix safe policy tools absent from the standard registry: {absent_required_tools:?}"
+        absent_required_tools.sort_unstable();
+        assert_eq!(
+            absent_required_tools, expected_absent_required_tools,
+            "required Matrix safe policy tool absences must exactly match this build's external adapters"
         );
     }
 
