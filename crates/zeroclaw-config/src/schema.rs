@@ -18720,19 +18720,20 @@ pub struct FilesystemConfig {
     /// home directory in `/home`, `/var/home` and each home directory in it,
     /// `/var/roothome`, `/mnt`, `/var/mnt`, `/media`, `/run`, `/run/media`, and
     /// each user's folder in `/run/media`. On macOS this also covers `/Users`
-    /// and each folder in it (every home directory and `Shared`), `/Volumes`
+    /// and each folder in it (its home directories and `Shared`), `/Volumes`
     /// and each mounted volume in it, `/private`, and `/private/etc`,
     /// `/private/tmp`, and `/private/var`. On Windows this also covers every
     /// drive, volume, and network share root, any device path that names
     /// something else, and, beneath a drive root, `Windows`, `Windows\Temp`,
     /// `Users`, each profile in `Users`, `Program Files`, `Program Files (x86)`,
     /// and `ProgramData`. A path is refused when it names one of these as
-    /// written, resolves to one on disk, or cannot be resolved. The
-    /// pseudo-filesystems `/proc` and `/sys` would surface kernel object paths
-    /// in SOP payloads and flood the watcher with events. It also admits
-    /// relative paths, which are refused otherwise because they resolve
-    /// against the daemon's working directory, so the check cannot tell what
-    /// they name. Off unless explicitly enabled.
+    /// written, resolves to one on disk, or cannot be resolved. A home
+    /// directory elsewhere, such as a service account's home under `/var/lib`,
+    /// is not recognized. The pseudo-filesystems `/proc` and `/sys` would
+    /// surface kernel object paths in SOP payloads and flood the watcher with
+    /// events. It also admits relative paths, which are refused otherwise
+    /// because they resolve against the daemon's working directory, so the
+    /// check cannot tell what they name. Off unless explicitly enabled.
     #[tab(Advanced)]
     #[serde(default)]
     pub allow_broad_roots: bool,
@@ -18794,10 +18795,10 @@ const FILESYSTEM_LINUX_BROAD_ROOTS: [&str; 11] = [
 ];
 
 /// macOS broad roots, refused along with the Unix roots and compared
-/// case-insensitively. `*` matches any one name, so `/Users/*` covers every
-/// home directory and `/Volumes/*` every mounted volume, including the
-/// startup disk's entry, which links to `/`. `/etc`, `/tmp`, and `/var` link
-/// to the directories in `/private`.
+/// case-insensitively. `*` matches any one name, so `/Users/*` covers each
+/// home directory in `/Users` and `/Volumes/*` every mounted volume,
+/// including the startup disk's entry, which links to `/`. `/etc`, `/tmp`,
+/// and `/var` link to the directories in `/private`.
 const FILESYSTEM_MACOS_BROAD_ROOTS: [&str; 8] = [
     "/Users",
     "/Users/*",
@@ -30456,7 +30457,7 @@ zeroclaw-operators = "operator"
     /// Spellings of macOS broad roots that the exact Unix check accepts. Each
     /// one needs `allow_broad_roots` on macOS.
     const MACOS_BROAD_ROOT_SPELLINGS: &[&str] = &[
-        // Every home directory, the shared folder, and their parent.
+        // Home directories in `/Users`, the shared folder, and their parent.
         "/Users",
         "/Users/",
         "/Users/tester",
