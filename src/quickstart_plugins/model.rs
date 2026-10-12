@@ -18,7 +18,7 @@ use zeroclaw::plugins::{PluginCapability, PluginInfo, PluginManifest, PluginPerm
 use zeroclaw_config::traits::PropKind;
 use zeroclaw_runtime::quickstart::FieldDescriptor;
 
-use crate::plugins::channel_instance::RequiredKey;
+use crate::plugins::channel_instance::{RequiredKey, unconditional_required_names};
 
 /// The longest piece of publisher text Quickstart prints in one place, in
 /// characters.
@@ -299,8 +299,9 @@ pub(crate) struct ConfigFields {
     /// Terminal-safe names of properties that are not portable plugin keys or
     /// whose type does not resolve; they are reported, never prompted.
     pub(crate) unsupported: Vec<String>,
-    /// Terminal-safe names in the schema's root `required` list that no field
-    /// prompts for: a property in `unsupported`, or a name the root
+    /// Terminal-safe names the schema requires unconditionally, in its root
+    /// `required` list, an `allOf` branch or a local `$ref` target, that no
+    /// field prompts for: a property in `unsupported`, or a name the root
     /// `properties` map does not declare. While any is listed, no answers to
     /// the prompts can satisfy the schema. Sorted, without duplicates.
     pub(crate) required_unprompted: Vec<String>,
@@ -321,13 +322,16 @@ pub(crate) struct ConfigFields {
 /// show on a terminal and to paste into a shell, and the only names a secret
 /// property can have. `config set` itself accepts any declared name the
 /// operator quotes.
+///
+/// A property is required when the schema requires it unconditionally: in
+/// the root `required` list, a same-object `allOf` branch or a local `$ref`
+/// target, the walk the readiness report and the activation check use. The
+/// resolver enforces each of those alike, so a prompt that read only the
+/// root list would offer a required setting as optional, and declining the
+/// optional settings would then skip it.
 #[must_use]
 pub(crate) fn config_fields(schema: &Value) -> ConfigFields {
-    let required: BTreeSet<&str> = schema
-        .get("required")
-        .and_then(Value::as_array)
-        .map(|names| names.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default();
+    let required: BTreeSet<&str> = unconditional_required_names(schema).into_iter().collect();
     let mut out = ConfigFields::default();
     let properties = schema.get("properties").and_then(Value::as_object);
     for (name, property) in properties.into_iter().flatten() {
@@ -1207,6 +1211,56 @@ mod tests {
         assert!(fields.fields.is_empty());
         assert_eq!(fields.required_unprompted, vec!["zone"]);
         assert_eq!(fields.required_undeclared, vec!["zone"]);
+    }
+
+    /// A requirement the schema states through a root `allOf` branch or a
+    /// local `$ref` binds the row exactly like one in the root list, so it
+    /// prompts as required too, and counts when it cannot be prompted. A
+    /// nested object's requirements and a conditional branch do not.
+    #[test]
+    fn schema_fields_treat_composed_root_requirements_as_required() {
+        let mut composed = schema();
+        composed["required"] = json!(["zone"]);
+        composed["allOf"] = json!([
+            { "required": ["api_token"] },
+            { "$ref": "#/$defs/base" }
+        ]);
+        composed["$defs"]["base"] = json!({ "required": ["retries", "bad key", "undeclared"] });
+        composed["properties"]["nested"] = json!({
+            "type": "object",
+            "required": ["inner"],
+            "properties": { "inner": { "type": "string" } }
+        });
+        composed["if"] = json!({ "required": ["verbose"] });
+        composed["then"] = json!({ "required": ["level"] });
+
+        let fields = config_fields(&composed);
+        let required: Vec<&str> = fields
+            .fields
+            .iter()
+            .filter(|field| field.required)
+            .map(|field| field.key.as_str())
+            .collect();
+        assert_eq!(
+            required,
+            vec!["api_token", "retries", "zone"],
+            "the root list, an `allOf` branch and a local `$ref` target all require; \
+             a nested object's list and a conditional branch do not"
+        );
+        assert!(
+            fields
+                .fields
+                .iter()
+                .all(|field| field.key != "inner" && field.key != "verbose" || !field.required),
+            "neither the nested object's requirement nor the conditional one is a field \
+             Quickstart requires"
+        );
+        assert_eq!(
+            fields.required_unprompted,
+            vec!["bad key", "undeclared"],
+            "composed requirements Quickstart cannot prompt for count like root ones"
+        );
+        assert_eq!(fields.required_undeclared, vec!["undeclared"]);
     }
 
     #[test]

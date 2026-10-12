@@ -619,22 +619,16 @@ pub struct RequiredKey {
     pub addressable: bool,
 }
 
-/// Unconditional root-object requirements, including same-object `allOf` and
-/// local `$ref` constraints, marked set or missing against `entry`.
+/// The property names a root object schema requires unconditionally: its own
+/// `required` list and those of its same-object `allOf` branches and local
+/// `$ref` targets, in schema order, each name once.
 ///
 /// Nested property requirements address a different object; conditional
-/// branches are not unconditional requirements. Defaults are annotations,
-/// not values the canonical resolver adds.
-/// This is only a repair diagnostic; [`config_verdict`] owns validation.
+/// branches are not unconditional requirements. The canonical resolver
+/// enforces every name listed here alike, so a prompt or a diagnostic that
+/// read only the root list would miss the composed ones.
 #[must_use]
-pub fn required_keys(
-    manifest: &PluginManifest,
-    entry: Option<&PluginEntryConfig>,
-) -> Vec<RequiredKey> {
-    let Some(schema) = manifest.config_schema.as_ref() else {
-        return Vec::new();
-    };
-    let properties = schema.get("properties").and_then(Value::as_object);
+pub fn unconditional_required_names(schema: &Value) -> Vec<&str> {
     let mut pending = vec![schema];
     let mut visited = HashSet::new();
     let mut names = Vec::new();
@@ -669,6 +663,24 @@ pub fn required_keys(
         }
     }
     names
+}
+
+/// Unconditional root-object requirements, including same-object `allOf` and
+/// local `$ref` constraints, marked set or missing against `entry`: the names
+/// [`unconditional_required_names`] walks.
+///
+/// Defaults are annotations, not values the canonical resolver adds.
+/// This is only a repair diagnostic; [`config_verdict`] owns validation.
+#[must_use]
+pub fn required_keys(
+    manifest: &PluginManifest,
+    entry: Option<&PluginEntryConfig>,
+) -> Vec<RequiredKey> {
+    let Some(schema) = manifest.config_schema.as_ref() else {
+        return Vec::new();
+    };
+    let properties = schema.get("properties").and_then(Value::as_object);
+    unconditional_required_names(schema)
         .into_iter()
         .map(|name| RequiredKey {
             name: name.to_string(),
