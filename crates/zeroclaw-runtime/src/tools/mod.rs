@@ -763,32 +763,14 @@ pub fn shell_tool_for_runtime(
     runtime_shell_assembly(security, runtime, risk_profile, root_config).shell_tool
 }
 
-/// Derive a transient coherence witness from one locked canonical config view.
-/// The process key prevents a witness from becoming an offline secret oracle;
-/// neither key nor digest is logged, serialized, or exposed to the guest.
+/// The TLS coherence witness for one plugin instance, over the inputs read from
+/// the same locked config view as its policy or its frame's values. The keyed
+/// derivation lives in `zeroclaw_plugins`; this only hands over those inputs.
 #[cfg(feature = "plugins-wasm")]
 fn plugin_tls_config_witness(
     config: &Config,
     instance_key: &str,
 ) -> Result<zeroclaw_plugins::egress::TlsConfigWitness, zeroclaw_plugins::error::PluginError> {
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-    static KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
-    struct DigestWriter(Hmac<Sha256>);
-    impl std::io::Write for DigestWriter {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.update(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let error = || {
-        zeroclaw_plugins::error::PluginError::InvalidConfig(
-            "plugin TLS coherence inputs are unavailable".to_string(),
-        )
-    };
     let mut entries = config
         .plugins
         .entries
@@ -796,16 +778,18 @@ fn plugin_tls_config_witness(
         .filter(|entry| entry.name == instance_key);
     let entry = entries.next();
     if entries.next().is_some() {
-        return Err(error());
+        return Err(zeroclaw_plugins::error::PluginError::InvalidConfig(
+            "plugin TLS coherence inputs are unavailable".to_string(),
+        ));
     }
-    // Borrow sorted values: no extra plaintext serialization buffer survives.
+    // Borrow sorted values: no plaintext serialization buffer is built.
     let values = entry.map(|entry| {
         entry
             .config
             .iter()
             .collect::<std::collections::BTreeMap<_, _>>()
     });
-    let inputs = (
+    zeroclaw_plugins::egress::TlsConfigWitness::derive(&(
         instance_key,
         entry.map(|entry| {
             (
@@ -817,13 +801,6 @@ fn plugin_tls_config_witness(
         values,
         &config.security.nat64_prefixes,
         config.plugins.limits.max_connections_per_instance,
-    );
-    let mut writer = DigestWriter(
-        Hmac::<Sha256>::new_from_slice(KEY.get_or_init(rand::random)).map_err(|_| error())?,
-    );
-    serde_json::to_writer(&mut writer, &inputs).map_err(|_| error())?;
-    Ok(zeroclaw_plugins::egress::TlsConfigWitness::new(
-        writer.0.finalize().into_bytes().into(),
     ))
 }
 

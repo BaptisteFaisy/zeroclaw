@@ -385,6 +385,48 @@ impl TlsConfigWitness {
     pub fn new(digest: [u8; 32]) -> Self {
         Self(digest)
     }
+
+    /// Derive the witness for one locked canonical config view.
+    ///
+    /// `inputs` is serialized straight into HMAC-SHA256 under a key drawn once
+    /// per process, so no plaintext copy of it is buffered and a witness cannot
+    /// serve as an offline oracle for the secret values it covers. Neither the
+    /// key nor the digest is logged, serialized, or exposed to a guest.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed with `PluginError::InvalidConfig` when the process key
+    /// cannot be drawn or `inputs` cannot be serialized.
+    pub fn derive(inputs: &impl serde::Serialize) -> Result<Self, crate::error::PluginError> {
+        struct Digest(ring::hmac::Context);
+        impl std::io::Write for Digest {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.update(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        static KEY: OnceLock<Option<ring::hmac::Key>> = OnceLock::new();
+        let unavailable = || {
+            crate::error::PluginError::InvalidConfig(
+                "plugin TLS coherence inputs are unavailable".to_string(),
+            )
+        };
+        let key = KEY
+            .get_or_init(|| {
+                ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &ring::rand::SystemRandom::new())
+                    .ok()
+            })
+            .as_ref()
+            .ok_or_else(unavailable)?;
+        let mut digest = Digest(ring::hmac::Context::with_key(key));
+        serde_json::to_writer(&mut digest, inputs).map_err(|_| unavailable())?;
+        let tag = digest.0.sign();
+        let bytes = <[u8; 32]>::try_from(tag.as_ref()).map_err(|_| unavailable())?;
+        Ok(Self(bytes))
+    }
 }
 
 impl std::fmt::Debug for TlsConfigWitness {
@@ -1302,6 +1344,25 @@ mod tests {
     use crate::{PluginCapability, PluginManifest, PluginPermission};
 
     use super::*;
+
+    #[test]
+    fn a_tls_config_witness_follows_its_inputs_and_is_keyed() {
+        let inputs = ("instance", ["a.example"], 1_usize);
+        let witness = TlsConfigWitness::derive(&inputs).unwrap();
+        assert_eq!(witness, TlsConfigWitness::derive(&inputs).unwrap());
+        assert_ne!(
+            witness,
+            TlsConfigWitness::derive(&("instance", ["b.example"], 1_usize)).unwrap()
+        );
+        assert_ne!(
+            witness,
+            TlsConfigWitness::derive(&("instance", ["a.example"], 2_usize)).unwrap()
+        );
+        let unkeyed =
+            ring::digest::digest(&ring::digest::SHA256, &serde_json::to_vec(&inputs).unwrap());
+        assert_ne!(witness.0.as_slice(), unkeyed.as_ref());
+        assert_eq!(format!("{witness:?}"), "TlsConfigWitness([redacted])");
+    }
 
     fn scope_in_package(
         package: &str,
