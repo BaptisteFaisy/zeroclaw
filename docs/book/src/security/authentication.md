@@ -239,7 +239,11 @@ pairs as the shared operator, and existing tokens are unchanged.
 - **Retiring a user.** Removing a roster entry suspends that user's tokens
   but keeps their bindings, so re-adding an entry with the same principal
   id revives every device still bound to it, lost ones included. Revoke
-  the user's devices when you retire the user.
+  the user's devices when you retire the user. The device list
+  (`GET /api/devices`) reports each device's `principal_id`, the principal
+  its token authenticates as (`null` once that token is revoked), so revoke
+  every device that reports `user:<id>`, with the dashboard's device
+  controls or `DELETE /api/devices/<device id>`.
 - **Downgrading.** A daemon older than this feature ignores
   `gateway.paired_token_users`, so bound tokens stop working there instead
   of turning into operator tokens. Entries left in the file work again

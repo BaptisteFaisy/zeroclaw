@@ -6810,6 +6810,73 @@ path = "{trigger_path}"
     }
 
     #[tokio::test]
+    async fn device_list_reports_who_each_device_pairs_as() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = roster_paircode_state(&tmp);
+        pair_bound_device(&state, "alice-phone").await;
+        let code = state
+            .pairing
+            .generate_new_pairing_code_as(
+                live_pairing_code_policy(&state),
+                PairedTokenSubject::SharedOperator,
+            )
+            .expect("pairing enabled");
+        let operator = state
+            .pairing
+            .try_pair(&code, "laptop")
+            .await
+            .unwrap()
+            .unwrap();
+        let registry = state.device_registry.as_ref().unwrap();
+        for (token_hash, id) in [
+            (PairingGuard::token_hash(&operator), "laptop"),
+            // A row whose token was revoked outside the registry.
+            (PairingGuard::token_hash("zc_no_longer_paired"), "stale"),
+        ] {
+            registry
+                .register(
+                    token_hash,
+                    api_pairing::DeviceInfo {
+                        id: id.to_string(),
+                        name: None,
+                        device_type: None,
+                        paired_at: chrono::Utc::now(),
+                        last_seen: chrono::Utc::now(),
+                        ip_address: None,
+                        capabilities: None,
+                    },
+                )
+                .expect("test device registry insert");
+        }
+
+        let response = api_pairing::list_devices(State(state.clone()), bearer(&operator))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let principal_of = |id: &str| {
+            json["devices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|device| device["id"] == id)
+                .unwrap_or_else(|| panic!("device {id} is listed: {json}"))["principal_id"]
+                .clone()
+        };
+        assert_eq!(principal_of("alice-phone"), "user:alice");
+        assert_eq!(
+            principal_of("laptop"),
+            zeroclaw_api::principal::PrincipalId::SHARED_OPERATOR
+        );
+        assert_eq!(
+            principal_of("stale"),
+            serde_json::Value::Null,
+            "a device whose token is no longer paired authenticates as nobody"
+        );
+    }
+
+    #[tokio::test]
     async fn enhanced_pairing_reports_and_persists_the_binding() {
         let tmp = tempfile::TempDir::new().unwrap();
         let state = roster_paircode_state(&tmp);

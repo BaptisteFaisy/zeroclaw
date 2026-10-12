@@ -194,11 +194,22 @@ impl DeviceRegistry {
     }
 
     pub fn list(&self) -> Result<Vec<DeviceInfo>, rusqlite::Error> {
+        Ok(self
+            .list_with_token_hashes()?
+            .into_iter()
+            .map(|(_, info)| info)
+            .collect())
+    }
+
+    /// Every device with the hash of the token it was paired with, so a
+    /// caller can ask the pairing guard what that token authenticates as.
+    pub fn list_with_token_hashes(&self) -> Result<Vec<(String, DeviceInfo)>, rusqlite::Error> {
         let conn = self.open_db()?;
         let mut stmt = conn.prepare(
             "SELECT token_hash, id, name, device_type, paired_at, last_seen, ip_address, capabilities FROM devices",
         )?;
         let rows = stmt.query_map([], |row| {
+            let token_hash: String = row.get(0)?;
             let id: String = row.get(1)?;
             let name: Option<String> = row.get(2)?;
             let device_type: Option<String> = row.get(3)?;
@@ -215,15 +226,18 @@ impl DeviceRegistry {
             let capabilities = capabilities_json
                 .as_deref()
                 .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok());
-            Ok(DeviceInfo {
-                id,
-                name,
-                device_type,
-                paired_at,
-                last_seen,
-                ip_address,
-                capabilities,
-            })
+            Ok((
+                token_hash,
+                DeviceInfo {
+                    id,
+                    name,
+                    device_type,
+                    paired_at,
+                    last_seen,
+                    ip_address,
+                    capabilities,
+                },
+            ))
         })?;
         rows.collect()
     }
@@ -500,15 +514,35 @@ pub async fn submit_pairing_enhanced(
     }
 }
 
+/// A device as `GET /api/devices` reports it.
+#[derive(Debug, Serialize)]
+struct ListedDevice {
+    #[serde(flatten)]
+    info: DeviceInfo,
+    /// The principal the device's token authenticates as, read from the
+    /// pairing guard when the list is built, so the registry stores nothing
+    /// about bindings. `None` once that token is no longer paired.
+    principal_id: Option<String>,
+}
+
 /// GET /api/devices — list paired devices
 pub async fn list_devices(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
 
-    let devices = match state.device_registry.as_ref() {
-        Some(r) => match r.list() {
-            Ok(devices) => devices,
+    let devices: Vec<ListedDevice> = match state.device_registry.as_ref() {
+        Some(r) => match r.list_with_token_hashes() {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|(token_hash, info)| ListedDevice {
+                    info,
+                    principal_id: state
+                        .pairing
+                        .subject_for_hash(&token_hash)
+                        .map(|subject| super::paired_principal_id(&subject)),
+                })
+                .collect(),
             Err(e) => {
                 ::zeroclaw_log::record!(
                     ERROR,
