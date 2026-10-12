@@ -1738,6 +1738,57 @@ mod tests {
         assert!(manual[target_env..release_step].contains(">> \"$GITHUB_ENV\""));
         assert!(!manual[release_step..companion].contains("matrix.linker_env"));
 
+        let stable_build = job_block(&release, "  build:\n");
+        assert_eq!(
+            stable_build
+                .matches("run: bash scripts/ci/package_release_archive.sh")
+                .count(),
+            2,
+            "both Stable platform steps must consume the one shared archive writer"
+        );
+        assert!(!stable_build.contains("mkdir -p staging/web"));
+        let manual_build = job_block(&manual, "  build:\n");
+        assert!(manual_build.contains("BINARY_SIZE_HARD_LIMIT: \"83886080\""));
+        assert!(
+            manual_build.contains(
+                "bash scripts/ci/package_release_archive.sh \"$target\" \"$main\" \"$ext\" \"$RUNNER_OS\""
+            )
+        );
+        assert!(
+            manual_build.contains(
+                "--web-dist web/dist --source \"$GITHUB_SHA\" --target \"$target\""
+            )
+        );
+        assert!(manual_build.contains("--output archive-evidence/input-manifest.json"));
+        assert!(manual_build.contains("--run \"$GITHUB_RUN_ID\" --attempt \"$GITHUB_RUN_ATTEMPT\""));
+        assert!(manual_build.contains("if [ \"$target\" != aarch64-linux-android ]; then"));
+        let native_smoke = job_block(&manual, "  plugin-smoke:\n");
+        assert!(native_smoke.contains("if: inputs.distribution != 'dist'"));
+        assert!(
+            native_smoke.contains(
+                "name: zeroclaw-manual-${{ inputs.distribution }}-${{ matrix.target }}"
+            )
+        );
+        assert!(
+            native_smoke.contains("name: zeroclaw-manual-archive-dist-${{ matrix.target }}")
+        );
+        assert!(
+            native_smoke.contains("--expected-source \"$GITHUB_SHA\" --expected-target \"$target\"")
+        );
+        assert!(
+            native_smoke.contains("--expected-run \"$GITHUB_RUN_ID\" --expected-attempt \"$GITHUB_RUN_ATTEMPT\"")
+        );
+        assert!(
+            native_smoke.contains("archive_args=(--archive \"${{ steps.archive.outputs.archive }}\")")
+        );
+        assert!(native_smoke.contains("${archive_args[@]+\"${archive_args[@]}\"}"));
+        assert!(
+            native_smoke.find("Run scripted provider tests").unwrap()
+                < native_smoke
+                    .find("Run the plugin smoke against the built binary")
+                    .unwrap()
+        );
+
         for feature in exclusions.values().flatten() {
             assert!(!release.contains(feature));
             assert!(!manual.contains(feature));

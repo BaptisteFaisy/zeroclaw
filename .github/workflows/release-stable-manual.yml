@@ -355,36 +355,12 @@ jobs:
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
-        run: |
-          mkdir -p staging/web
-          cp target/${{ matrix.target }}/release/${{ matrix.artifact }} staging/
-          extra=""
-          for b in zerocode zerorelay; do
-            if [ -f target/${{ matrix.target }}/release/$b ]; then
-              cp target/${{ matrix.target }}/release/$b staging/
-              extra="$extra $b"
-            fi
-          done
-          cp -r web/dist staging/web/dist
-          cd staging
-          tar czf ../zeroclaw-${{ matrix.target }}.${{ matrix.ext }} ${{ matrix.artifact }} $extra web/dist
+        run: bash scripts/ci/package_release_archive.sh "${{ matrix.target }}" "${{ matrix.artifact }}" "${{ matrix.ext }}" "$RUNNER_OS"
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: bash
-        run: |
-          mkdir -p staging/web
-          cp target/${{ matrix.target }}/release/${{ matrix.artifact }} staging/
-          extra=""
-          for b in zerocode.exe zerorelay.exe; do
-            if [ -f target/${{ matrix.target }}/release/$b ]; then
-              cp target/${{ matrix.target }}/release/$b staging/
-              extra="$extra $b"
-            fi
-          done
-          cp -r web/dist staging/web/dist
-          cd staging
-          7z a ../zeroclaw-${{ matrix.target }}.${{ matrix.ext }} ${{ matrix.artifact }} $extra web/dist
+        run: bash scripts/ci/package_release_archive.sh "${{ matrix.target }}" "${{ matrix.artifact }}" "${{ matrix.ext }}" "$RUNNER_OS"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
