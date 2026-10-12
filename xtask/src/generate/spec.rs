@@ -1755,31 +1755,31 @@ mod tests {
             )
         );
         assert!(
-            manual_build.contains(
-                "--web-dist web/dist --source \"$GITHUB_SHA\" --target \"$target\""
-            )
+            manual_build
+                .contains("--web-dist web/dist --source \"$GITHUB_SHA\" --target \"$target\"")
         );
         assert!(manual_build.contains("--output archive-evidence/input-manifest.json"));
-        assert!(manual_build.contains("--run \"$GITHUB_RUN_ID\" --attempt \"$GITHUB_RUN_ATTEMPT\""));
+        assert!(
+            manual_build.contains("--run \"$GITHUB_RUN_ID\" --attempt \"$GITHUB_RUN_ATTEMPT\"")
+        );
         assert!(manual_build.contains("if [ \"$target\" != aarch64-linux-android ]; then"));
         let native_smoke = job_block(&manual, "  plugin-smoke:\n");
         assert!(native_smoke.contains("if: inputs.distribution != 'dist'"));
         assert!(
-            native_smoke.contains(
-                "name: zeroclaw-manual-${{ inputs.distribution }}-${{ matrix.target }}"
-            )
+            native_smoke
+                .contains("name: zeroclaw-manual-${{ inputs.distribution }}-${{ matrix.target }}")
         );
+        assert!(native_smoke.contains("name: zeroclaw-manual-archive-dist-${{ matrix.target }}"));
         assert!(
-            native_smoke.contains("name: zeroclaw-manual-archive-dist-${{ matrix.target }}")
+            native_smoke
+                .contains("--expected-source \"$GITHUB_SHA\" --expected-target \"$target\"")
         );
+        assert!(native_smoke.contains(
+            "--expected-run \"$GITHUB_RUN_ID\" --expected-attempt \"$GITHUB_RUN_ATTEMPT\""
+        ));
         assert!(
-            native_smoke.contains("--expected-source \"$GITHUB_SHA\" --expected-target \"$target\"")
-        );
-        assert!(
-            native_smoke.contains("--expected-run \"$GITHUB_RUN_ID\" --expected-attempt \"$GITHUB_RUN_ATTEMPT\"")
-        );
-        assert!(
-            native_smoke.contains("archive_args=(--archive \"${{ steps.archive.outputs.archive }}\")")
+            native_smoke
+                .contains("archive_args=(--archive \"${{ steps.archive.outputs.archive }}\")")
         );
         assert!(native_smoke.contains("${archive_args[@]+\"${archive_args[@]}\"}"));
         assert!(
