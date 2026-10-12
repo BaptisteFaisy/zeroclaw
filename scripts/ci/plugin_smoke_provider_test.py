@@ -287,6 +287,15 @@ class PluginSmokeProviderTest(unittest.TestCase):
 
         self.assertEqual(output.getvalue(), "label=masked|text=HELLO\n")
 
+    def test_one_line_accepts_a_leading_dash_in_the_joined_form(self) -> None:
+        # The smoke passes `--text=<value>`: a value that starts with a dash
+        # would otherwise be read as an option name.
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            provider.main(["one-line", "--text=--hello"])
+
+        self.assertEqual(output.getvalue(), "--hello\n")
+
 
 if __name__ == "__main__":
     unittest.main()

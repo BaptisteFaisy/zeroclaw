@@ -448,7 +448,7 @@ expect_tool_result() {
     local expected
     [ "$turn_results" = "1" ] \
         || fail "expected one tool result, saw ${turn_results:-none}" || return 1
-    expected="$(py "$provider" one-line --text "$1")" \
+    expected="$(py "$provider" one-line --text="$1")" \
         || fail "could not encode the expected tool result" || return 1
     [ "$turn_result" = "$expected" ] \
         || fail "tool result was '$turn_result', expected '$expected'"
