@@ -581,7 +581,6 @@ mod gateway_support {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use parking_lot::RwLock;
     use zeroclaw::gateway::{self, AppState};
     use zeroclaw_api::attribution::Attributable;
     use zeroclaw_config::schema::Config;
@@ -619,12 +618,13 @@ mod gateway_support {
     }
 
     pub(super) fn gateway_state(config: Config) -> AppState {
+        let authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
         let memory: Arc<dyn zeroclaw_memory::Memory> =
             Arc::new(NoneMemory::new("agents-rename-recovery-cli-test"));
         AppState {
-            config: Arc::new(RwLock::new(config)),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            agent_lifecycle: Default::default(),
+            config: authority.live_handle(),
+            config_authority: authority.clone(),
+            agent_lifecycle: authority.agent_lifecycle(),
             model_provider: Arc::new(MockModelProvider),
             model: "test-model".into(),
             temperature: None,

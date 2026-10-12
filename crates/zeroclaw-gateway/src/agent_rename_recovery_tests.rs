@@ -118,13 +118,15 @@ async fn delete_plan(state: &crate::AppState, alias: &str) -> (StatusCode, serde
 /// Bring the alias a rename retired back into the live config, as a hand edit
 /// would, around the create guards.
 fn configure_again(state: &crate::AppState, alias: &str) {
-    state.config.write().agents.insert(
-        alias.to_string(),
-        AliasedAgentConfig {
-            risk_profile: "default".into(),
-            ..AliasedAgentConfig::default()
-        },
-    );
+    state.publish_test_config(|config| {
+        config.agents.insert(
+            alias.to_string(),
+            AliasedAgentConfig {
+                risk_profile: "default".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+    });
 }
 
 fn message_of(json: &serde_json::Value) -> String {
@@ -637,13 +639,15 @@ async fn deleting_a_retired_alias_re_added_by_hand_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
     let (state, old_ws, _blocker) = blocked_rename(tmp.path()).await;
     // A hand edit brings the retired alias back around the create guards.
-    state.config.write().agents.insert(
-        "agent_a".to_string(),
-        AliasedAgentConfig {
-            risk_profile: "default".into(),
-            ..AliasedAgentConfig::default()
-        },
-    );
+    state.publish_test_config(|config| {
+        config.agents.insert(
+            "agent_a".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "default".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+    });
 
     let (status, json) = delete_agent(&state, "agent_a").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
