@@ -1039,9 +1039,9 @@ pub(crate) async fn run_create_phase(
 /// config file could not be read.
 ///
 /// The agent step runs after the plugins, which change the machine. A
-/// submission it would refuse is therefore refused here, while the plugin
-/// step has changed no config and installed nothing, so the agent step's
-/// usual report applies.
+/// submission or a config it would refuse is therefore refused here, while
+/// the plugin step has changed no config and installed nothing, so the agent
+/// step's usual report applies.
 async fn create_phase_with<P: QuickstartPrompter>(
     config: &mut Config,
     selection: &[PluginChoice],
@@ -1056,9 +1056,51 @@ async fn create_phase_with<P: QuickstartPrompter>(
         prompter.say(&line);
         return Ok(CreatePhase::default());
     }
-    zeroclaw_runtime::quickstart::validate_only_with_surface(submission, config, Surface::Cli)
+    Box::pin(agent_step_dry_run(submission, config))
+        .await
         .map_err(PhaseHalt::AgentRejected)?;
     Box::pin(install_and_activate(config, selection, registry, prompter)).await
+}
+
+/// Every check the agent step runs before its first write, on a copy of
+/// `config`: the submission itself, then the authorization check of the whole
+/// staged config. A config the agent step would refuse for a reason that
+/// predates this run, such as a permission profile naming an agent that no
+/// longer exists, is refused here too, before any plugin is installed.
+///
+/// The agent step runs those checks and then its staged check before it
+/// writes anything, so a staged check that always refuses turns the step into
+/// a dry run that reaches every check the real step reaches and writes
+/// nothing. The only error that refusal produces is the one with the marker
+/// text; any other error is the agent step's own. In the log the dry run
+/// appears as an apply that stops before persisting, under its own run id.
+async fn agent_step_dry_run(
+    submission: &BuilderSubmission,
+    config: &Config,
+) -> Result<(), Vec<QuickstartError>> {
+    const DRY_RUN_MARKER: &str = "quickstart-plugins-dry-run";
+    let mut staged = config.clone();
+    let refuse = |_: &Config| Err(DRY_RUN_MARKER.to_string());
+    match Box::pin(zeroclaw_runtime::quickstart::apply_with_surface_checked(
+        submission.clone(),
+        &mut staged,
+        Surface::Cli,
+        &refuse,
+    ))
+    .await
+    {
+        Err(errors)
+            if errors.len() == 1
+                && errors[0].step == zeroclaw_runtime::quickstart::QuickstartStep::Agent
+                && errors[0].message.contains(DRY_RUN_MARKER) =>
+        {
+            Ok(())
+        }
+        Err(errors) => Err(errors),
+        // The refusing check runs before the write, so the step cannot
+        // succeed; nothing was persisted for the copy to have changed.
+        Ok(_) => Ok(()),
+    }
 }
 
 /// The run-scoped attributes every event of one plugin phase carries: a run id
@@ -6224,6 +6266,91 @@ type = "string"
             prompter.said.is_empty() && prompter.choice_lists.is_empty(),
             "nothing was printed or asked: {:?}",
             prompter.said
+        );
+        server.verify().await;
+    }
+
+    /// A permission profile naming an agent that is not configured. The
+    /// agent step refuses such a config at its authorization check, which
+    /// runs after the submission is staged, so the dry run has to reach it.
+    fn allow_agent(workspace: &mut Workspace, agent: &str) {
+        workspace.config.permission_profiles.insert(
+            "ops".to_string(),
+            crate::config::schema::PermissionProfileConfig {
+                allowed_agents: vec![agent.to_string()],
+                ..Default::default()
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn a_config_the_agent_step_refuses_for_authorization_stops_create_first() {
+        let server = MockServer::start().await;
+        serve_valid_archive(&server, 0).await;
+        let mut workspace = Workspace::new();
+        allow_agent(&mut workspace, "ghost");
+        let before = workspace.config_bytes();
+        let selection = selection(fixture_entry(&server, Some(archive_digest())));
+        let mut prompter = ScriptedPrompter::new([]);
+
+        let halt = run(&mut workspace, &selection, &mut prompter)
+            .await
+            .expect_err("a config the agent step refuses stops Create");
+
+        let PhaseHalt::AgentRejected(errors) = &halt else {
+            panic!("expected the agent step's refusal, got {halt:?}");
+        };
+        assert!(
+            errors.iter().any(|error| {
+                error.step == QuickstartStep::Agent && error.message.contains("allowed_agents")
+            }),
+            "the refusal is the agent step's own authorization check: {errors:?}"
+        );
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("request recording is on")
+                .is_empty(),
+            "no archive was requested"
+        );
+        assert!(
+            !workspace.plugins_dir().exists(),
+            "not even the plugins directory was created"
+        );
+        assert_eq!(workspace.config_bytes(), before);
+        assert!(
+            prompter.said.is_empty() && prompter.choice_lists.is_empty(),
+            "nothing was printed or asked: {:?}",
+            prompter.said
+        );
+        server.verify().await;
+    }
+
+    /// The dry run is the agent step's own check, not a stricter one: a
+    /// reference the submission's agent satisfies passes, so the plugins are
+    /// installed as they would be without the profile.
+    #[tokio::test]
+    async fn a_dangling_agent_reference_the_submission_satisfies_passes_the_dry_run() {
+        let server = MockServer::start().await;
+        serve_valid_archive(&server, 1).await;
+        let mut workspace = Workspace::new();
+        allow_agent(&mut workspace, "bot");
+        let selection = selection(fixture_entry(&server, Some(archive_digest())));
+        let mut answers = install_answers(GRANT);
+        answers.push(Answer::Confirm(Some(false)));
+        let mut prompter = ScriptedPrompter::new(answers);
+
+        let phase = run(&mut workspace, &selection, &mut prompter)
+            .await
+            .expect("the agent step accepts a config its own agent completes");
+
+        prompter.assert_done();
+        assert_eq!(
+            phase.outcomes,
+            vec![PackageOutcome::Installed {
+                name: FIXTURE_NAME.to_string(),
+            }]
         );
         server.verify().await;
     }

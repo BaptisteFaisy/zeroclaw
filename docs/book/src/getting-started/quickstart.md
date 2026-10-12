@@ -98,10 +98,13 @@ of fetching the registry. It offers nothing to pick, and **Create** installs no
 plugin. Repair the file, then run Quickstart again to install plugins.
 
 When you choose **Create**, Quickstart installs the picked plugins before it
-creates the agent. First it checks the rest of your choices the way the agent
-step will: if the agent step would refuse them, Quickstart reports the problems
-and stops before any plugin is downloaded or written. Then it installs the
-plugins one at a time, through the pipeline `zeroclaw plugin install` uses:
+creates the agent. First it checks the rest of your choices, and the
+configuration they land in, the way the agent step will, including the
+authorization check the agent step runs before it writes anything. If the
+agent step would refuse them, for example because a permission profile names
+an agent that no longer exists, Quickstart reports the problems and stops
+before any plugin is downloaded or written. Then it installs the plugins one
+at a time, through the pipeline `zeroclaw plugin install` uses:
 
 1. It resolves the package from the registry and refuses a registry entry that
    has no `sha256` digest for its archive, before requesting the archive.
