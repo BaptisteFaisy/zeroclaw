@@ -2,7 +2,7 @@ name: Quality Gate
 
 on:
   pull_request:
-    branches: [master]
+    branches: [master, test/10994-plugin-artifact-smoke]
   push:
     branches: [master]
   # Merge queue: GitHub builds a temporary `gh-readonly-queue/master/…` branch
