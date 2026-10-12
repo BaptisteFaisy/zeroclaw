@@ -29,7 +29,9 @@ use std::sync::{
 use parking_lot::RwLock;
 
 use zeroclaw_api::grants::{ResolvedGrants, Resource, Verb};
-use zeroclaw_api::jsonrpc::error_codes::{AUTH_REQUIRED, FORBIDDEN, INVALID_PARAMS};
+use zeroclaw_api::jsonrpc::error_codes::{
+    AUTH_REQUIRED, FORBIDDEN, INVALID_PARAMS, SESSION_NOT_OWNED,
+};
 use zeroclaw_api::principal::{
     AuthMethod, AuthOutcome, AuthenticatedIdentity, DenyReason, Principal,
 };
@@ -159,6 +161,9 @@ pub enum RpcDenialReason {
     SopDefinitionUnreadable,
     /// The request names a session the principal does not own.
     SessionNotOwned,
+    /// A remote caller asked to act on a session that holds local
+    /// capabilities, such as a channel other than RPC.
+    SessionLocalCapabilities,
 }
 
 impl RpcDenialReason {
@@ -192,6 +197,7 @@ impl RpcDenialReason {
             Self::SopToolSelectorConstrained => "sop_tool_selector_constrained",
             Self::SopDefinitionUnreadable => "sop_definition_unreadable",
             Self::SessionNotOwned => "session_not_owned",
+            Self::SessionLocalCapabilities => "session_local_capabilities",
         }
     }
 
@@ -227,6 +233,9 @@ impl RpcDenialReason {
             // The client is told the job was not found, the answer a missing
             // job gets, so the refusal does not confirm that the job exists.
             Self::CronJobAgentNotEntitled => INVALID_PARAMS,
+            // The code a remote caller's session/new or resume gets for the
+            // same refusal.
+            Self::SessionLocalCapabilities => SESSION_NOT_OWNED,
         }
     }
 
@@ -261,6 +270,7 @@ impl RpcDenialReason {
             Self::SopToolSelectorConstrained => "rpc-auth-sop-tool-selector-constrained",
             Self::SopDefinitionUnreadable => "rpc-auth-sop-definition-unreadable",
             Self::SessionNotOwned => "rpc-auth-session-not-owned",
+            Self::SessionLocalCapabilities => "rpc-auth-session-local-capabilities",
         }
     }
 }
@@ -471,6 +481,10 @@ impl AuthDenied {
 
     pub(crate) fn session_not_owned() -> Self {
         Self::with_message(RpcDenialReason::SessionNotOwned)
+    }
+
+    pub(crate) fn session_local_capabilities() -> Self {
+        Self::with_message(RpcDenialReason::SessionLocalCapabilities)
     }
 }
 
@@ -2373,6 +2387,7 @@ mod tests {
                 "sop_tool_selector_constrained",
                 "sop_definition_unreadable",
                 "session_not_owned",
+                "session_local_capabilities",
             ]
         );
         let unique: std::collections::HashSet<&str> = identifiers.iter().copied().collect();
@@ -2512,6 +2527,11 @@ mod tests {
                 &["\"nightly-report\""],
             ),
             RpcDenialReason::SessionNotOwned => (AuthDenied::session_not_owned(), FORBIDDEN, &[]),
+            RpcDenialReason::SessionLocalCapabilities => (
+                AuthDenied::session_local_capabilities(),
+                SESSION_NOT_OWNED,
+                &[],
+            ),
         }
     }
 
@@ -2568,7 +2588,7 @@ mod tests {
         /// text the replaced literal produced for them.
         type WordingCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a str);
 
-        let cases: [WordingCase<'_>; 13] = [
+        let cases: [WordingCase<'_>; 14] = [
             (
                 "rpc-auth-grant-missing",
                 &[
@@ -2648,6 +2668,11 @@ mod tests {
                 "rpc-auth-session-not-owned",
                 &[],
                 "Session not found or not owned by this principal",
+            ),
+            (
+                "rpc-auth-session-local-capabilities",
+                &[],
+                "Remote caller cannot use this session's local capabilities",
             ),
         ];
         for (key, values, expected) in cases {
