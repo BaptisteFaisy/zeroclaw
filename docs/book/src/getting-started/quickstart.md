@@ -97,6 +97,13 @@ because that section or the whole file is malformed, the row says so instead
 of fetching the registry. It offers nothing to pick, and **Create** installs no
 plugin. Repair the file, then run Quickstart again to install plugins.
 
+If the config file was written by an older ZeroClaw version, **Create** stops
+before installing any plugin or creating the agent, and prints the
+`zeroclaw config migrate` command that updates the file, as `zeroclaw plugin
+bind` does. Run that command, then run Quickstart again. Saving plugin settings
+into the older file would mark it as current without moving its older
+settings, which later runs would then stop reading.
+
 When you choose **Create**, Quickstart installs the picked plugins before it
 creates the agent. First it checks the rest of your choices, and the
 configuration they land in, the way the agent step will, including the

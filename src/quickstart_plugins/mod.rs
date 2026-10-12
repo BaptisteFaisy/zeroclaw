@@ -431,6 +431,14 @@ pub(crate) enum PhaseHalt {
     /// The agent step would refuse the submission. It is dry-run before any
     /// plugin is touched, so no config was changed and nothing installed.
     AgentRejected(Vec<QuickstartError>),
+    /// The config file on disk is not at the schema version this binary
+    /// writes: older, which the load migrated in memory only, or newer. It is
+    /// refused before any plugin is touched, as `plugin bind` refuses it,
+    /// because every save this phase makes stamps the file with this binary's
+    /// version without moving older sections, which the next load would then
+    /// no longer migrate. The error names the file and, for an older one,
+    /// the command that migrates it.
+    ConfigVersion(anyhow::Error),
     /// Ctrl+C at a prompt.
     Interrupted { outcomes: Vec<PackageOutcome> },
     /// A prompt failed for any other reason.
@@ -455,6 +463,8 @@ impl PhaseHalt {
             // The plugin step changed no config and installed nothing, so the
             // agent step's own report applies, as without a plugin step.
             Self::AgentRejected(errors) => Some(crate::report_agent_not_created(&errors, None)),
+            // Nothing was installed or asked: the error alone says why.
+            Self::ConfigVersion(error) => Some(error),
             Self::Interrupted { outcomes } => {
                 print_progress(&outcomes);
                 None
@@ -1034,9 +1044,9 @@ pub(crate) async fn run_create_phase(
     .await
 }
 
-/// The Create-time phase for a non-empty selection: the agent step's dry run,
-/// then the plugins. Nothing at all when the `[plugins]` section of the
-/// config file could not be read.
+/// The Create-time phase for a non-empty selection: the config file's schema
+/// version check, the agent step's dry run, then the plugins. Nothing at all
+/// when the `[plugins]` section of the config file could not be read.
 ///
 /// The agent step runs after the plugins, which change the machine. A
 /// submission or a config it would refuse is therefore refused here, while
@@ -1056,6 +1066,12 @@ async fn create_phase_with<P: QuickstartPrompter>(
         prompter.say(&line);
         return Ok(CreatePhase::default());
     }
+    // Before any work on the file, as `plugin bind` checks: the load migrated
+    // an older file in memory only, and a save from this phase would stamp it
+    // with the current schema version while its older sections stayed where
+    // they were, so the next load would no longer migrate them.
+    crate::config::migration::ensure_disk_at_current_version(&config.config_path)
+        .map_err(PhaseHalt::ConfigVersion)?;
     Box::pin(agent_step_dry_run(submission, config))
         .await
         .map_err(PhaseHalt::AgentRejected)?;
@@ -6275,6 +6291,63 @@ type = "string"
     /// A permission profile naming an agent that is not configured. The
     /// agent step refuses such a config at its authorization check, which
     /// runs after the submission is staged, so the dry run has to reach it.
+    /// A config file an older binary wrote is refused before any plugin work,
+    /// as `plugin bind` refuses it, and before the agent step's dry run: the
+    /// load migrated such a file in memory only, and a save from this phase
+    /// would stamp it with the current schema version while its older
+    /// sections stayed where they were, so an interrupted run would leave a
+    /// file the next load no longer migrates.
+    #[tokio::test]
+    async fn an_older_config_file_is_refused_before_any_plugin_work() {
+        let server = MockServer::start().await;
+        serve_valid_archive(&server, 0).await;
+        let mut workspace = Workspace::new();
+        std::fs::write(
+            &workspace.config.config_path,
+            "schema_version = 2\n\n[autonomy]\nmax_actions_per_hour = 7\n",
+        )
+        .expect("seed an older config file");
+        // Refused for the file's version even when the agent step would
+        // refuse the config too: the dry run is work on a file this binary
+        // must not write.
+        allow_agent(&mut workspace, "ghost");
+        let before = workspace.config_bytes();
+        let selection = selection(fixture_entry(&server, Some(archive_digest())));
+        let mut prompter = ScriptedPrompter::new([]);
+
+        let halt = run(&mut workspace, &selection, &mut prompter)
+            .await
+            .expect_err("an older config file stops Create");
+
+        let PhaseHalt::ConfigVersion(error) = &halt else {
+            panic!("expected the config file's version refusal, got {halt:?}");
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("schema_version 2") && message.contains("zeroclaw config migrate"),
+            "the refusal names the file's version and the command that migrates it: {message}"
+        );
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("request recording is on")
+                .is_empty(),
+            "no archive was requested"
+        );
+        assert!(
+            !workspace.plugins_dir().exists(),
+            "not even the plugins directory was created"
+        );
+        assert_eq!(workspace.config_bytes(), before);
+        assert!(
+            prompter.said.is_empty() && prompter.choice_lists.is_empty(),
+            "nothing was printed or asked: {:?}",
+            prompter.said
+        );
+        server.verify().await;
+    }
+
     fn allow_agent(workspace: &mut Workspace, agent: &str) {
         workspace.config.permission_profiles.insert(
             "ops".to_string(),
