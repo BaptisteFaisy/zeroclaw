@@ -4375,7 +4375,10 @@ fn channel_binding_report_lines(
 /// Whether the channel instance `alias` of `manifest`'s package is ready to
 /// run, as a derived view of live config computed on demand. `plugin bind`
 /// prints it after binding, `plugin install` after installing a package with
-/// a bound alias, and `plugin info` for each bound alias.
+/// a bound alias, and `plugin info` for each bound alias, through
+/// [`bound_channel_readiness`], which asks the runtime about a package's bound
+/// aliases together; `plugin install` reports the aliases already bound to the
+/// package the same way.
 ///
 /// In order: the permissions the manifest requests, which the instance holds
 /// as requested; the keys its `config_schema` requires, each set or missing,
@@ -4397,6 +4400,36 @@ fn channel_instance_readiness_lines(
     manifest: &zeroclaw::plugins::PluginManifest,
     alias: &str,
     report_egress_gap: bool,
+) -> Vec<String> {
+    let admission =
+        zeroclaw_runtime::plugin_runtime::channel_binding_admission(config, host, &[alias]);
+    channel_instance_readiness_lines_with_admission(
+        config,
+        manifest,
+        alias,
+        report_egress_gap,
+        // One verdict per alias asked, so the one binding's is the first.
+        admission.as_ref().map(|verdicts| &verdicts[0]),
+    )
+}
+
+/// The readiness block of `alias` given `admission`, the activation plan's
+/// verdict on its binding from
+/// `zeroclaw_runtime::plugin_runtime::channel_binding_admission`.
+/// [`channel_instance_readiness_lines`] asks for the one binding it reports;
+/// [`bound_channel_readiness`] asks for every bound alias of a package at
+/// once, so a `plugin info` report builds the activation plan once when it
+/// can be built, and asks about each alias alone when it cannot.
+#[cfg(feature = "plugins-wasm")]
+fn channel_instance_readiness_lines_with_admission(
+    config: &crate::config::schema::Config,
+    manifest: &zeroclaw::plugins::PluginManifest,
+    alias: &str,
+    report_egress_gap: bool,
+    admission: Result<
+        &zeroclaw_runtime::plugin_runtime::ChannelBindingAdmission,
+        &zeroclaw::plugins::error::PluginError,
+    >,
 ) -> Vec<String> {
     use crate::plugins::channel_instance::{
         channel_instance_key, channel_instance_row, config_verdict, declared_hosts_for_row,
@@ -4597,7 +4630,7 @@ fn channel_instance_readiness_lines(
         }
     }
 
-    lines.extend(channel_activation_line(config, host, alias));
+    lines.extend(channel_activation_line(config, alias, admission));
     lines.push(ta(
         "cli-plugin-channel-restart-note",
         &[("alias", &shown)],
@@ -4727,25 +4760,29 @@ fn required_key_line(
     }
 }
 
-/// The activation plan's verdict on the binding `alias`, from
-/// `zeroclaw_runtime::plugin_runtime::channel_binding_admission`, so the
-/// report cannot drift from what the runtime does with the same config and
-/// installed packages. Each unmet precondition names what supplies it.
+/// The line for `verdict`, the activation plan's verdict on the binding
+/// `alias` from `zeroclaw_runtime::plugin_runtime::channel_binding_admission`,
+/// so the report cannot drift from what the runtime does with the same config
+/// and installed packages. Each unmet precondition names what supplies it; an
+/// error is the plan's own failure to build.
 #[cfg(feature = "plugins-wasm")]
 fn channel_activation_line(
     config: &crate::config::schema::Config,
-    host: &zeroclaw::plugins::host::PluginHost,
     alias: &str,
+    verdict: Result<
+        &zeroclaw_runtime::plugin_runtime::ChannelBindingAdmission,
+        &zeroclaw::plugins::error::PluginError,
+    >,
 ) -> Option<String> {
     use crate::plugins::channel_instance::config_set_command_for;
     use crate::plugins::egress_ceremony::ShellDialect;
-    use zeroclaw_runtime::plugin_runtime::{ChannelBindingAdmission, channel_binding_admission};
+    use zeroclaw_runtime::plugin_runtime::ChannelBindingAdmission;
 
     let config_dir = egress_command_config_dir(config);
     // Printed escaped, as the rest of the readiness block prints it; the
     // lookup and the config path inside a command use it as written.
     let shown = alias.escape_debug().to_string();
-    let verdict = match channel_binding_admission(config, host, alias) {
+    let verdict = match verdict {
         Ok(verdict) => verdict,
         // The runtime's own plan fails the same way, so it starts no plugin
         // instance at all.
@@ -4842,12 +4879,12 @@ fn channel_activation_line(
         ),
         ChannelBindingAdmission::PackageNotInstalled { package } => ta(
             "cli-plugin-channel-activation-package-missing",
-            &[("alias", &shown), ("name", &package)],
+            &[("alias", &shown), ("name", package)],
             format!("plugin.{shown} will not activate: package '{package}' is not installed."),
         ),
         ChannelBindingAdmission::NotAChannelPackage { package } => ta(
             "cli-plugin-channel-activation-not-a-channel",
-            &[("alias", &shown), ("name", &package)],
+            &[("alias", &shown), ("name", package)],
             format!(
                 "plugin.{shown} will not activate: package '{package}' does not provide a channel."
             ),
@@ -4961,6 +4998,14 @@ fn unkeyed_alias_line(package: &str, alias: &str, reason: &str) -> String {
 /// channel instances. An alias no instance can be keyed by gets the line
 /// that says so in place of a block. Empty for a package without the
 /// `channel` capability, and for one no binding names.
+///
+/// The runtime is asked about every alias that gets a block in one query, so
+/// the report builds at most one activation plan however many aliases it
+/// covers. When that plan cannot be built, the aliases are asked about alone
+/// instead, as `plugin bind` asks, so each block is what the one-alias
+/// report prints: a binding that fails a precondition before the plan keeps
+/// its own line, and only a binding the plan would have judged reports the
+/// plan's failure.
 #[cfg(feature = "plugins-wasm")]
 fn bound_channel_readiness(
     config: &crate::config::schema::Config,
@@ -4968,6 +5013,7 @@ fn bound_channel_readiness(
     manifest: &zeroclaw::plugins::PluginManifest,
 ) -> Vec<(String, Vec<String>)> {
     use crate::plugins::channel_instance::{bound_channel_aliases, unkeyed_channel_aliases};
+    use zeroclaw_runtime::plugin_runtime::channel_binding_admission;
 
     if !manifest
         .capabilities
@@ -4976,14 +5022,58 @@ fn bound_channel_readiness(
         return Vec::new();
     }
     let unkeyed = unkeyed_channel_aliases(config, manifest);
-    bound_channel_aliases(config, &manifest.name)
-        .into_iter()
-        .map(|alias| {
-            let lines = match unkeyed.iter().find(|(skipped, _)| *skipped == alias) {
-                Some((_, reason)) => vec![unkeyed_alias_line(&manifest.name, &alias, reason)],
-                None => channel_instance_readiness_lines(config, host, manifest, &alias, true),
+    let aliases = bound_channel_aliases(config, &manifest.name);
+
+    /// What an alias gets: the reason no instance can be keyed by it, or a
+    /// readiness block, by its position among the aliases asked about.
+    enum Block<'a> {
+        Unkeyed(&'a str),
+        Readiness(usize),
+    }
+    let mut asked: Vec<&str> = Vec::new();
+    let blocks: Vec<Block<'_>> = aliases
+        .iter()
+        .map(
+            |alias| match unkeyed.iter().find(|(skipped, _)| skipped == alias) {
+                Some((_, reason)) => Block::Unkeyed(reason),
+                None => {
+                    asked.push(alias);
+                    Block::Readiness(asked.len() - 1)
+                }
+            },
+        )
+        .collect();
+    let together = channel_binding_admission(config, host, &asked);
+
+    aliases
+        .iter()
+        .zip(blocks)
+        .map(|(alias, block)| {
+            let lines = match (block, &together) {
+                (Block::Unkeyed(reason), _) => {
+                    vec![unkeyed_alias_line(&manifest.name, alias, reason)]
+                }
+                // One verdict per alias asked, in the order asked.
+                (Block::Readiness(index), Ok(verdicts)) => {
+                    channel_instance_readiness_lines_with_admission(
+                        config,
+                        manifest,
+                        alias,
+                        true,
+                        Ok(&verdicts[index]),
+                    )
+                }
+                // The plan could not be built, which leaves no binding a
+                // verdict. Asked about alone, a binding that fails a
+                // precondition before the plan still gets its own line, and
+                // only one the plan would have judged reports the plan's
+                // failure. The plan is then attempted once per such binding,
+                // as every report did before it asked about them together.
+                (Block::Readiness(_), Err(_)) => {
+                    channel_instance_readiness_lines(config, host, manifest, alias, true)
+                }
             };
-            (alias, lines)
+            (alias.clone(), lines)
         })
         .collect()
 }
@@ -25130,6 +25220,190 @@ hosts = ["api.example.com", "api2.example.com"]
                 .any(|line| line.contains(&format!("plugin.{escaped}")))
                 && bindings.iter().all(|line| !line.contains('\u{1b}')),
             "remove prints the alias escaped: {bindings:?}"
+        );
+    }
+
+    /// `plugin info` reports every bound alias of a package from one runtime
+    /// query, so one report builds at most one activation plan. Block for
+    /// block, it prints what asking about each alias alone prints: the same
+    /// verdicts under a ceiling that admits one binding and not the other, and
+    /// the one line for an alias no instance can be keyed by, which is not
+    /// asked about.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn the_package_report_prints_the_per_alias_readiness_blocks_from_one_query() {
+        use crate::plugins::channel_instance::unkeyed_channel_aliases;
+
+        let installed = install_package(&package_manifest_toml(
+            "chat-bridge",
+            &["channel"],
+            &["http_client"],
+            &["api.example.com"],
+        ));
+        let manifest = installed.host.manifest("chat-bridge").expect("installed");
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+        config.plugins.enabled = true;
+        config.plugins.max_active_instances = 1;
+        let unkeyable = "ops\u{1}team";
+        for alias in ["alpha", "beta", unkeyable] {
+            bind_channel_alias(&mut config, alias, "chat-bridge", true);
+        }
+        config.agents.insert(
+            "operator".to_string(),
+            crate::config::schema::AliasedAgentConfig {
+                channels: vec![
+                    crate::config::providers::ChannelRef::new("plugin.alpha"),
+                    crate::config::providers::ChannelRef::new("plugin.beta"),
+                ],
+                ..crate::config::schema::AliasedAgentConfig::default()
+            },
+        );
+        let unkeyed = unkeyed_channel_aliases(&config, manifest);
+        assert_eq!(
+            unkeyed.len(),
+            1,
+            "premise: one alias cannot key an instance"
+        );
+
+        let report = bound_channel_readiness(&config, &installed.host, manifest);
+
+        assert_eq!(
+            report
+                .iter()
+                .map(|(alias, _)| alias.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta", unkeyable]
+        );
+        for (alias, lines) in &report {
+            let expected = if alias == unkeyable {
+                vec![unkeyed_alias_line("chat-bridge", alias, &unkeyed[0].1)]
+            } else {
+                channel_instance_readiness_lines(&config, &installed.host, manifest, alias, true)
+            };
+            assert_eq!(lines, &expected, "alias {alias:?}");
+        }
+        // Not vacuous: the one slot goes to `alpha`, so the two blocks carry
+        // different verdicts from the same plan.
+        assert!(
+            report[0].1.contains(&ta(
+                "cli-plugin-channel-activation-ready",
+                &[("alias", "alpha")],
+                "",
+            )),
+            "{:#?}",
+            report[0].1
+        );
+        assert!(
+            report[1].1.contains(&ta(
+                "cli-plugin-channel-activation-over-ceiling",
+                &[("alias", "beta")],
+                "",
+            )),
+            "{:#?}",
+            report[1].1
+        );
+    }
+
+    /// When the runtime cannot build its activation plan, the one query that
+    /// asks about every alias together answers for none of them. The report
+    /// then asks about each alias alone, as `plugin bind` does, so a binding
+    /// that fails a precondition before the plan keeps its own line and fix
+    /// command, and only a binding the plan would have judged reports the
+    /// plan's failure. Block for block, that is what the one-alias report
+    /// prints.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn the_package_report_asks_about_each_alias_alone_when_the_plan_cannot_be_built() {
+        use crate::plugins::channel_instance::{config_set_command_for, unkeyed_channel_aliases};
+        use crate::plugins::egress_ceremony::ShellDialect;
+        use zeroclaw_runtime::plugin_runtime::channel_binding_admission;
+
+        let installed = install_package(&package_manifest_toml(
+            "chat-bridge",
+            &["channel"],
+            &["http_client"],
+            &["api.example.com"],
+        ));
+        let manifest = installed.host.manifest("chat-bridge").expect("installed");
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+        config.plugins.enabled = true;
+        // Owned and enabled, so the plan's explicit pass reaches identity
+        // formation for this alias and refuses the control character, which
+        // fails the plan as a whole.
+        let unkeyable = "bad\u{1}alias";
+        bind_channel_alias(&mut config, "alpha", "chat-bridge", true);
+        bind_channel_alias(&mut config, "beta", "chat-bridge", false);
+        bind_channel_alias(&mut config, unkeyable, "chat-bridge", true);
+        config.agents.insert(
+            "operator".to_string(),
+            crate::config::schema::AliasedAgentConfig {
+                channels: vec![
+                    crate::config::providers::ChannelRef::new("plugin.alpha"),
+                    crate::config::providers::ChannelRef::new(format!("plugin.{unkeyable}")),
+                ],
+                ..crate::config::schema::AliasedAgentConfig::default()
+            },
+        );
+        let unkeyed = unkeyed_channel_aliases(&config, manifest);
+        assert_eq!(
+            unkeyed.len(),
+            1,
+            "premise: one alias cannot key an instance"
+        );
+        let plan_error = channel_binding_admission(&config, &installed.host, &["alpha", "beta"])
+            .expect_err("premise: the plan cannot be built, so the one query answers for nothing")
+            .to_string();
+
+        let report = bound_channel_readiness(&config, &installed.host, manifest);
+
+        assert_eq!(
+            report
+                .iter()
+                .map(|(alias, _)| alias.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", unkeyable, "beta"]
+        );
+        for (alias, lines) in &report {
+            let expected = if alias == unkeyable {
+                vec![unkeyed_alias_line("chat-bridge", alias, &unkeyed[0].1)]
+            } else {
+                channel_instance_readiness_lines(&config, &installed.host, manifest, alias, true)
+            };
+            assert_eq!(lines, &expected, "alias {alias:?}");
+        }
+        // `alpha` needs the plan, so its block reports the plan's failure;
+        // `beta` fails its own precondition first and keeps its line and
+        // command, as it did when every alias was asked about alone.
+        assert!(
+            report[0].1.contains(&ta(
+                "cli-plugin-channel-activation-plan-failed",
+                &[("alias", "alpha"), ("error", &plan_error)],
+                "",
+            )),
+            "{:#?}",
+            report[0].1
+        );
+        let enable_beta = config_set_command_for(
+            ShellDialect::host(),
+            egress_command_config_dir(&config),
+            "channels.plugin.beta.enabled",
+            Some("true"),
+        );
+        assert!(
+            report[2].1.contains(&ta(
+                "cli-plugin-channel-activation-binding-disabled",
+                &[("alias", "beta"), ("command", &enable_beta)],
+                "",
+            )),
+            "{:#?}",
+            report[2].1
+        );
+        assert!(
+            !report[2].1.iter().any(|line| line.contains(&plan_error)),
+            "a binding the plan never judged does not report the plan's failure: {:#?}",
+            report[2].1
         );
     }
 
