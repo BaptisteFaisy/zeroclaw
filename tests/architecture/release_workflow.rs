@@ -489,8 +489,8 @@ fn plugin_execution_smoke_gates_the_release() {
     );
 
     // Each leg executes an archive the build matrix produces, and the manual
-    // cross-platform workflow rehearses exactly the same legs from the binary
-    // it built, so a distribution change is proven before a release runs.
+    // cross-platform workflow rehearses exactly the same legs: standard dist
+    // consumes its product archive, while dist-broad retains the raw route.
     let build = yaml_block(&release, "  build:\n");
     let smoke_targets = matrix_targets(smoke);
     assert!(!smoke_targets.is_empty(), "the plugin smoke has no legs");
@@ -516,6 +516,7 @@ fn plugin_execution_smoke_gates_the_release() {
 --expect host \\\n            \
 --packages plugin-smoke-packages \\\n            \
 --label \"${{ inputs.distribution }} / ${{ matrix.target }}\" \\\n            \
+${archive_args[@]+\"${archive_args[@]}\"} \\\n            \
 --evidence \"plugin-smoke-${{ matrix.target }}.md\"\n";
     for required in [
         "needs: [build, plugin-smoke-packages]",
@@ -530,9 +531,52 @@ fn plugin_execution_smoke_gates_the_release() {
     }
     assert_eq!(
         step_conditions(rehearsal),
-        ["if: ${{ !cancelled() }}"],
+        [
+            "if: inputs.distribution != 'dist'",
+            "if: inputs.distribution == 'dist'",
+            "if: inputs.distribution == 'dist'",
+            "if: ${{ !cancelled() }}",
+        ],
+        "raw download, archive download, extraction and evidence conditions must retain their order"
+    );
+    for binding in [
+        "if: inputs.distribution != 'dist'\n        with:\n          name: zeroclaw-manual-${{ inputs.distribution }}-${{ matrix.target }}\n          path: binary",
+        "if: inputs.distribution == 'dist'\n        with:\n          name: zeroclaw-manual-archive-dist-${{ matrix.target }}\n          path: archive",
+    ] {
+        assert!(
+            rehearsal.contains(binding),
+            "each distribution selector must bind its corresponding artifact: {binding}"
+        );
+    }
+    let archive_extraction = yaml_block(
+        rehearsal,
+        "      - name: Verify and extract standard release archive\n",
+    );
+    assert!(archive_extraction.starts_with("        if: inputs.distribution == 'dist'\n"));
+    assert!(archive_extraction.contains("id: archive"));
+    assert!(archive_extraction.contains("--archive \"archive/zeroclaw-$target.$ext\""));
+    assert!(archive_extraction.contains("--manifest archive/archive-evidence/input-manifest.json"));
+    // Download/extraction conditions must not make the actual smoke optional
+    // or let it ignore a failed control. Scope these checks to that step.
+    let rehearsal_smoke = yaml_block(
+        rehearsal,
+        "      - name: Run the plugin smoke against the built binary\n",
+    );
+    assert!(
+        step_conditions(rehearsal_smoke).is_empty(),
         "the rehearsal smoke step must run unconditionally"
     );
+    assert!(
+        !rehearsal_smoke.contains("continue-on-error"),
+        "the actual rehearsal smoke step must propagate every failed control"
+    );
+    assert!(rehearsal_smoke.contains(rehearsal_invocation));
+    assert!(rehearsal_smoke.contains(
+        "if [ \"${{ inputs.distribution }}\" = dist ]; then\n            binary=\"${{ steps.archive.outputs.binary }}\"\n          else\n            binary=\"binary/${{ runner.os == 'Windows' && 'zeroclaw.exe' || 'zeroclaw' }}\"\n          fi"
+    ));
+    assert!(rehearsal_smoke.contains(
+        "archive_args=()\n          if [ \"${{ inputs.distribution }}\" = dist ]; then\n            archive_args=(--archive \"${{ steps.archive.outputs.archive }}\")\n          fi"
+    ));
     assert!(
         yaml_block(&manual, "  plugin-smoke-packages:\n")
             .contains("run: bash scripts/ci/build_plugin_smoke_packages.sh"),
