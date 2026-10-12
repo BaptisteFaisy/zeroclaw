@@ -430,7 +430,8 @@ pub enum ChannelBindingAdmission {
     OverInstanceCeiling,
 }
 
-/// The activation plan's own verdict on one explicit channel binding.
+/// The activation plan's own verdict on each explicit channel binding in
+/// `aliases`, in that order.
 ///
 /// Anything that reports whether a `[channels.plugin.<alias>]` instance will
 /// start, such as the CLI after binding one, asks this rather than restating
@@ -438,50 +439,72 @@ pub enum ChannelBindingAdmission {
 /// with the same config and installed packages. The per-declaration checks
 /// run through the helper the plan's explicit pass uses, in the same order.
 /// The ceiling verdict comes from building that plan and asking whether it
-/// admitted this instance.
+/// admitted the instance. The plan is built at most once per call, so a
+/// report over every binding of one package, as `plugin info` prints, asks
+/// about them together and, when the plan can be built, costs one plan
+/// rather than one per binding.
 ///
 /// Like the plan, this is guest-free: it reads canonical config and the
 /// manifests the host already admitted, never touches component bytes, and
 /// runs no guest code. That is also why `Admitted` promises admission and not
 /// a running channel.
 ///
-/// The verdict describes `config` as given. A running daemon keeps acting on
+/// The verdicts describe `config` as given. A running daemon keeps acting on
 /// the config it loaded until it restarts or reloads.
 ///
 /// # Errors
 ///
-/// Returns the plan's own error when this binding's instance identity cannot
-/// be formed, for example from an alias containing control characters, and,
-/// for a binding that meets every precondition, when the whole plan cannot be
-/// built. The runtime starts no plugin instance in either case, because its
-/// own plan fails the same way.
+/// Returns the plan's own error when the instance identity of a binding in
+/// `aliases` cannot be formed, for example from an alias containing control
+/// characters, and, when a binding meets every precondition, when the whole
+/// plan cannot be built. No binding gets a verdict then: the runtime starts
+/// no plugin instance in either case, because its own plan fails the same
+/// way.
 #[cfg(feature = "plugins-wasm")]
 pub fn channel_binding_admission(
     config: &Config,
     host: &PluginHost,
-    alias: &str,
-) -> Result<ChannelBindingAdmission, PluginError> {
+    aliases: &[&str],
+) -> Result<Vec<ChannelBindingAdmission>, PluginError> {
     if !config.plugins.enabled {
-        return Ok(ChannelBindingAdmission::PluginsDisabled);
+        return Ok(vec![
+            ChannelBindingAdmission::PluginsDisabled;
+            aliases.len()
+        ]);
     }
-    let Some(declaration) = config.channels.plugin.get(alias) else {
-        return Ok(ChannelBindingAdmission::Undeclared);
-    };
     let channel_packages = channel_package_names(host);
-    let decision = decide_explicit_channel(config, host, &channel_packages, alias, declaration)?;
-    let scope = match decision {
-        ExplicitChannelDecision::Candidate(scope) => scope,
-        ExplicitChannelDecision::Unmet(unmet) => return Ok(unmet),
-    };
-    // Nothing but the ceiling removes an explicit candidate from the plan: it
-    // truncates the one sorted candidate sequence. So a candidate the plan
-    // does not admit is one the ceiling left out.
-    let plan = PluginActivationPlan::build(config, host)?;
-    if plan.admits(scope.id().package(), PluginCapability::Channel, alias) {
-        Ok(ChannelBindingAdmission::Admitted)
-    } else {
-        Ok(ChannelBindingAdmission::OverInstanceCeiling)
+    let mut verdicts = Vec::with_capacity(aliases.len());
+    // The bindings that meet every per-declaration precondition, with their
+    // positions in `verdicts`. Only these need the plan.
+    let mut candidates = Vec::new();
+    for alias in aliases.iter().copied() {
+        let Some(declaration) = config.channels.plugin.get(alias) else {
+            verdicts.push(ChannelBindingAdmission::Undeclared);
+            continue;
+        };
+        match decide_explicit_channel(config, host, &channel_packages, alias, declaration)? {
+            ExplicitChannelDecision::Unmet(unmet) => verdicts.push(unmet),
+            ExplicitChannelDecision::Candidate(scope) => {
+                // Nothing but the ceiling removes an explicit candidate from
+                // the plan: it truncates the one sorted candidate sequence.
+                // So this is the candidate's verdict until the plan, built
+                // once below, shows it admitted.
+                candidates.push((verdicts.len(), scope));
+                verdicts.push(ChannelBindingAdmission::OverInstanceCeiling);
+            }
+        }
     }
+    if candidates.is_empty() {
+        return Ok(verdicts);
+    }
+    let plan = PluginActivationPlan::build(config, host)?;
+    for (index, scope) in candidates {
+        let id = scope.id();
+        if plan.admits(id.package(), PluginCapability::Channel, id.binding()) {
+            verdicts[index] = ChannelBindingAdmission::Admitted;
+        }
+    }
+    Ok(verdicts)
 }
 
 /// One declaration's outcome in the plan's explicit pass.
@@ -1961,12 +1984,19 @@ mod tests {
         }
     }
 
+    /// The query for one binding, as `plugin bind` asks it.
+    fn admission(config: &Config, host: &PluginHost, alias: &str) -> ChannelBindingAdmission {
+        let mut verdicts = channel_binding_admission(config, host, &[alias]).unwrap();
+        assert_eq!(verdicts.len(), 1, "one verdict per alias asked");
+        verdicts.pop().unwrap()
+    }
+
     #[test]
     fn binding_admission_admits_an_enabled_owned_channel_binding() {
         let (_plugins, config, host) = fixture();
 
         assert_eq!(
-            channel_binding_admission(&config, &host, "ops").unwrap(),
+            admission(&config, &host, "ops"),
             ChannelBindingAdmission::Admitted
         );
         let plan = PluginActivationPlan::build(&config, &host).unwrap();
@@ -1986,7 +2016,7 @@ mod tests {
 
         for alias in ["ops", "backup", "absent"] {
             assert_eq!(
-                channel_binding_admission(&config, &host, alias).unwrap(),
+                admission(&config, &host, alias),
                 ChannelBindingAdmission::PluginsDisabled,
                 "alias {alias}"
             );
@@ -2005,7 +2035,7 @@ mod tests {
             .push(ChannelRef::new("plugin.absent"));
 
         assert_eq!(
-            channel_binding_admission(&config, &host, "absent").unwrap(),
+            admission(&config, &host, "absent"),
             ChannelBindingAdmission::Undeclared
         );
     }
@@ -2018,7 +2048,7 @@ mod tests {
         config.agents.get_mut("operator").unwrap().enabled = false;
 
         assert_eq!(
-            channel_binding_admission(&config, &host, "ops").unwrap(),
+            admission(&config, &host, "ops"),
             ChannelBindingAdmission::BindingDisabled
         );
     }
@@ -2031,14 +2061,14 @@ mod tests {
         declare_binding(&mut config, "orphan", "not-installed", true, false);
 
         assert_eq!(
-            channel_binding_admission(&config, &host, "orphan").unwrap(),
+            admission(&config, &host, "orphan"),
             ChannelBindingAdmission::NoEnabledOwner
         );
 
         // A route from a disabled agent does not own a binding either.
         config.agents.get_mut("operator").unwrap().enabled = false;
         assert_eq!(
-            channel_binding_admission(&config, &host, "ops").unwrap(),
+            admission(&config, &host, "ops"),
             ChannelBindingAdmission::NoEnabledOwner
         );
     }
@@ -2049,7 +2079,7 @@ mod tests {
         declare_binding(&mut config, "missing", "not-installed", true, true);
 
         assert_eq!(
-            channel_binding_admission(&config, &host, "missing").unwrap(),
+            admission(&config, &host, "missing"),
             ChannelBindingAdmission::PackageNotInstalled {
                 package: "not-installed".to_string()
             }
@@ -2064,13 +2094,13 @@ mod tests {
         declare_binding(&mut config, "skillonly", "beta", true, true);
 
         assert_eq!(
-            channel_binding_admission(&config, &host, "toolonly").unwrap(),
+            admission(&config, &host, "toolonly"),
             ChannelBindingAdmission::NotAChannelPackage {
                 package: "zeta".to_string()
             }
         );
         assert_eq!(
-            channel_binding_admission(&config, &host, "skillonly").unwrap(),
+            admission(&config, &host, "skillonly"),
             ChannelBindingAdmission::NotAChannelPackage {
                 package: "beta".to_string()
             }
@@ -2086,11 +2116,11 @@ mod tests {
         config.plugins.max_active_instances = 1;
 
         assert_eq!(
-            channel_binding_admission(&config, &host, "backup").unwrap(),
+            admission(&config, &host, "backup"),
             ChannelBindingAdmission::Admitted
         );
         assert_eq!(
-            channel_binding_admission(&config, &host, "ops").unwrap(),
+            admission(&config, &host, "ops"),
             ChannelBindingAdmission::OverInstanceCeiling
         );
 
@@ -2098,11 +2128,92 @@ mod tests {
         config.plugins.max_active_instances = 0;
         for alias in ["backup", "ops"] {
             assert_eq!(
-                channel_binding_admission(&config, &host, alias).unwrap(),
+                admission(&config, &host, alias),
                 ChannelBindingAdmission::OverInstanceCeiling,
                 "alias {alias}"
             );
         }
+    }
+
+    #[test]
+    fn binding_admission_answers_the_bindings_of_one_report_together() {
+        let (_plugins, mut config, host) = fixture();
+        declare_binding(&mut config, "disabled", "alpha", false, true);
+        declare_binding(&mut config, "orphan", "alpha", true, false);
+        declare_binding(&mut config, "missing", "not-installed", true, true);
+        declare_binding(&mut config, "toolonly", "zeta", true, true);
+        // Valid, but sorts after `backup` and `ops` under a two-slot ceiling.
+        declare_binding(&mut config, "zulu", "alpha", true, true);
+        config.plugins.max_active_instances = 2;
+        // Out of alias order, with an undeclared alias among them: the
+        // verdicts come back in the order asked, one per alias.
+        let aliases = [
+            "zulu", "absent", "ops", "disabled", "missing", "orphan", "backup", "toolonly",
+        ];
+
+        let verdicts = channel_binding_admission(&config, &host, &aliases).unwrap();
+
+        assert_eq!(
+            verdicts,
+            vec![
+                ChannelBindingAdmission::OverInstanceCeiling,
+                ChannelBindingAdmission::Undeclared,
+                ChannelBindingAdmission::Admitted,
+                ChannelBindingAdmission::BindingDisabled,
+                ChannelBindingAdmission::PackageNotInstalled {
+                    package: "not-installed".to_string(),
+                },
+                ChannelBindingAdmission::NoEnabledOwner,
+                ChannelBindingAdmission::Admitted,
+                ChannelBindingAdmission::NotAChannelPackage {
+                    package: "zeta".to_string(),
+                },
+            ]
+        );
+        // The same answers as asking about each binding alone.
+        for (alias, verdict) in aliases.iter().zip(&verdicts) {
+            assert_eq!(&admission(&config, &host, alias), verdict, "alias {alias}");
+        }
+        assert!(
+            channel_binding_admission(&config, &host, &[])
+                .unwrap()
+                .is_empty()
+        );
+
+        // A disabled plugin system answers every binding without a plan.
+        config.plugins.enabled = false;
+        assert_eq!(
+            channel_binding_admission(&config, &host, &aliases).unwrap(),
+            vec![ChannelBindingAdmission::PluginsDisabled; aliases.len()]
+        );
+    }
+
+    #[test]
+    fn binding_admission_fails_the_whole_report_when_the_plan_would_fail() {
+        let (_plugins, mut config, host) = fixture();
+        // Owned, enabled and naming a channel package, so the explicit pass
+        // reaches identity formation, which refuses the control character.
+        declare_binding(&mut config, "bad\u{1}alias", "alpha", true, true);
+
+        assert!(
+            PluginActivationPlan::build(&config, &host).is_err(),
+            "premise: the runtime's own plan fails on this declaration"
+        );
+        // The report fails as a whole whether or not the bad binding is among
+        // the ones asked about: `ops` alone needs the plan for its ceiling
+        // verdict, and that plan fails.
+        assert!(channel_binding_admission(&config, &host, &["ops", "bad\u{1}alias"]).is_err());
+        assert!(channel_binding_admission(&config, &host, &["ops"]).is_err());
+        // A binding that fails a precondition before the plan is answered
+        // when nothing asked about with it needs the plan. Asked together
+        // with `backup`, which does, the report fails as a whole: the plan's
+        // failure is the one error, and it leaves no binding a verdict.
+        config.channels.plugin.get_mut("ops").unwrap().enabled = false;
+        assert_eq!(
+            channel_binding_admission(&config, &host, &["ops"]).unwrap(),
+            vec![ChannelBindingAdmission::BindingDisabled]
+        );
+        assert!(channel_binding_admission(&config, &host, &["backup", "ops"]).is_err());
     }
 
     #[test]
@@ -2122,7 +2233,7 @@ mod tests {
 
             let mut verdicts = std::collections::BTreeMap::new();
             for (alias, declaration) in &config.channels.plugin {
-                let verdict = channel_binding_admission(&config, &host, alias).unwrap();
+                let verdict = admission(&config, &host, alias);
                 let planned = plan
                     .scope(&declaration.package, PluginCapability::Channel, alias)
                     .is_some();
