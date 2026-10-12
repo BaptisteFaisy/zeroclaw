@@ -24,6 +24,10 @@ pub(super) struct Root {
     pub dir: Dir,
     identity: same_file::Handle,
     lock: std::sync::OnceLock<File>,
+    /// Held for as long as a [`Guard`] lives. The package lock is a lock on
+    /// one open file, which a second lock through that same file takes at
+    /// once, so two threads sharing this root would otherwise both hold it.
+    held: std::sync::Mutex<()>,
     path: PathBuf,
     // cap-std's Windows operations reconstruct paths. Pin every canonical
     // ancestor without FILE_SHARE_DELETE, not just the package root, so those
@@ -32,12 +36,17 @@ pub(super) struct Root {
     ancestors: Vec<Dir>,
 }
 
-pub(super) struct Guard<'a>(&'a File);
+pub(super) struct Guard<'a> {
+    file: &'a File,
+    // Released after `drop` has unlocked the file, so the next thread in this
+    // process takes the file lock only once this one has let it go.
+    _thread: std::sync::MutexGuard<'a, ()>,
+}
 impl Drop for Guard<'_> {
     fn drop(&mut self) {
         // Closing the retained descriptor also releases the lock. There is no
         // mutation in this destructor, and unlock errors cannot confer ownership.
-        let _ = self.0.unlock();
+        let _ = self.file.unlock();
     }
 }
 
@@ -55,6 +64,7 @@ impl Root {
             dir,
             identity,
             lock: std::sync::OnceLock::new(),
+            held: std::sync::Mutex::new(()),
             path: path.to_path_buf(),
             #[cfg(windows)]
             ancestors,
@@ -142,6 +152,28 @@ impl Root {
             .ok_or_else(|| std::io::Error::other("package lock unavailable"))?;
         let started = std::time::Instant::now();
         let mut pause = std::time::Duration::from_millis(10);
+        // Another thread of this process holding the lock through this root
+        // is waited for first, within the same bound. A thread that panicked
+        // while holding it unlocked the file as its guard dropped.
+        let thread = loop {
+            match self.held.try_lock() {
+                Ok(thread) => break thread,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) if started.elapsed() < wait => {
+                    std::thread::sleep(pause);
+                    pause = (pause * 2).min(std::time::Duration::from_millis(250));
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    return Err(PluginError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "another operation in this process did not release the package lock at {} within {wait:?}; try again once it finishes",
+                            self.path.join(LOCK).display()
+                        ),
+                    )));
+                }
+            }
+        };
         loop {
             match lock.try_lock() {
                 Ok(()) => break,
@@ -161,7 +193,10 @@ impl Root {
                 Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
             }
         }
-        let guard = Guard(lock);
+        let guard = Guard {
+            file: lock,
+            _thread: thread,
+        };
         self.check()?;
         Ok(guard)
     }
@@ -551,6 +586,28 @@ mod lock_wait_tests {
         );
         drop(held);
         drop(waiter.lock_within(Duration::from_millis(300)).unwrap());
+    }
+
+    /// Two threads sharing one root do not both hold the package lock. The
+    /// lock is a lock on one open file, which a second lock through that same
+    /// file would take at once, so the second thread waits and then gives up.
+    #[test]
+    fn a_second_thread_sharing_the_root_waits_for_the_package_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = Root::open(temp.path()).unwrap();
+        let held = root.lock().unwrap();
+        let second = std::thread::scope(|scope| {
+            scope
+                .spawn(|| root.lock_within(Duration::from_millis(300)).map(drop))
+                .join()
+                .unwrap()
+        });
+        let Err(error) = second else {
+            panic!("a second thread took a package lock this root already holds");
+        };
+        assert!(error.to_string().contains("did not release"), "{error}");
+        drop(held);
+        drop(root.lock_within(Duration::from_millis(300)).unwrap());
     }
 }
 
