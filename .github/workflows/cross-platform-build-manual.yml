@@ -57,6 +57,10 @@ jobs:
             echo "- Runner: \`$RUNNER_OS/$RUNNER_ARCH\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Verify current release archive baseline
+        shell: bash
+        run: bash scripts/ci/package_release_archive.test.sh
+
       - name: Resolve Cargo bin directory
         shell: bash
         run: |
