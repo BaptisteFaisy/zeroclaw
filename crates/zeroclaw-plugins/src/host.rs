@@ -261,6 +261,18 @@ impl PluginHost {
 
     /// The packages discovery admits from the plugins directory as it is now.
     fn discovered(&self) -> Result<HashMap<String, LoadedPlugin>, PluginError> {
+        self.discovered_named(None)
+    }
+
+    /// What [`Self::discovered`] admits, restricted to the entries whose
+    /// manifest names `only` when it is given. Every check after a manifest is
+    /// read is keyed by that manifest's name, so skipping the other names
+    /// leaves the outcome for `only` as full discovery decides it, without
+    /// reading any other package's component.
+    fn discovered_named(
+        &self,
+        only: Option<&str>,
+    ) -> Result<HashMap<String, LoadedPlugin>, PluginError> {
         let mut loaded = HashMap::new();
         if !self.plugins_dir.exists() {
             return Ok(loaded);
@@ -282,6 +294,9 @@ impl PluginHost {
                 if manifest_path.exists()
                     && let Ok((manifest, manifest_toml)) = self.load_manifest(&manifest_path)
                 {
+                    if only.is_some_and(|only| manifest.name != only) {
+                        continue;
+                    }
                     if let Err(e) = validate_manifest_shape(&manifest, &path) {
                         ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"plugin": path.display().to_string(), "error": format!("{}", e)})), "skipping plugin due to invalid manifest shape");
                         continue;
@@ -342,6 +357,13 @@ impl PluginHost {
         }
 
         Ok(loaded)
+    }
+
+    /// What discovery admits under `name` from the plugins directory as it is
+    /// now, judged as discovery would judge it, without reading any other
+    /// package. [`set_loaded`] records it.
+    fn rediscovered(&self, name: &str) -> Result<Option<LoadedPlugin>, PluginError> {
+        Ok(self.discovered_named(Some(name))?.remove(name))
     }
 
     fn load_manifest(&self, path: &Path) -> Result<(PluginManifest, String), PluginError> {
@@ -1231,7 +1253,10 @@ impl PluginHost {
     /// has not finished, and its claimed generation is never touched. Whether
     /// the package is installed is judged from the plugins directory as it is
     /// under the lock, not from this host's earlier view, which can predate
-    /// the update that left the claims. When it is installed, every claimed
+    /// the update that left the claims. Only `name` is judged again, and every
+    /// other package keeps this host's earlier view, so a batch that recovers
+    /// each of its names does not admit every installed package once per name.
+    /// When it is installed, every claimed
     /// generation of it is out of date, so each is marked for deletion and
     /// deleted through its handle; one that cannot be is reported and left.
     /// When it is not, the one generation an interrupted update claimed is
@@ -1263,10 +1288,12 @@ impl PluginHost {
         if claims.is_empty() {
             // An update another process finished while this one waited for the
             // lock has changed what is installed.
-            self.loaded = self.discovered()?;
+            let current = self.rediscovered(name)?;
+            set_loaded(&mut self.loaded, name, current);
             return Ok(UpdateRecovery::Nothing);
         }
-        self.loaded = self.discovered()?;
+        let current = self.rediscovered(name)?;
+        set_loaded(&mut self.loaded, name, current);
         let installed = self.loaded.contains_key(name);
 
         let mut restorable = Vec::new();
@@ -1318,7 +1345,8 @@ impl PluginHost {
         }
         held.publish(root, name)?;
         let _ = held.finish(root);
-        self.loaded = self.discovered()?;
+        let current = self.rediscovered(name)?;
+        set_loaded(&mut self.loaded, name, current);
         Ok(UpdateRecovery::Restored)
     }
 
@@ -2616,6 +2644,25 @@ fn opened_root<'a>(
     }
     let root = recovery::Root::open(plugins_dir)?;
     Ok(cell.get_or_init(|| root))
+}
+
+/// Record `current`, what discovery now admits under `name`, in place of this
+/// host's earlier view of that one package, leaving every other package as
+/// the host last admitted it. A free function over the loaded map, so it can
+/// run while the plugins root, a field of its own, is held.
+fn set_loaded(
+    loaded: &mut HashMap<String, LoadedPlugin>,
+    name: &str,
+    current: Option<LoadedPlugin>,
+) {
+    match current {
+        Some(plugin) => {
+            loaded.insert(name.to_owned(), plugin);
+        }
+        None => {
+            loaded.remove(name);
+        }
+    }
 }
 
 /// Finish `tx` once its package is gone or back at its name. Only the
@@ -5805,6 +5852,65 @@ capabilities = ["tool"]
             assert_eq!(package_bytes(&plugins.path().join("weather")), before);
             assert!(hidden_entries(plugins.path()).is_empty());
         }
+    }
+
+    /// Recovery judges again only the package it was asked about: a batch
+    /// refreshes each package when it reaches it, instead of admitting every
+    /// installed package once per name.
+    #[test]
+    fn recovery_without_claims_refreshes_only_the_named_package() {
+        let plugins = tempdir().unwrap();
+        let mut stale = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        install_tool_version(&mut stale, "weather", "1.0.0", b"\0asm weather v1");
+        install_tool_version(&mut stale, "tides", "1.0.0", b"\0asm tides v1");
+        let mut updater = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        update_tool(&mut updater, "weather", "2.0.0", b"\0asm weather v2").unwrap();
+        update_tool(&mut updater, "tides", "2.0.0", b"\0asm tides v2").unwrap();
+
+        assert_eq!(
+            stale.recover_interrupted_update("weather").unwrap(),
+            UpdateRecovery::Nothing
+        );
+        assert_eq!(stale.manifest("weather").unwrap().version, "2.0.0");
+        assert_eq!(stale.manifest("tides").unwrap().version, "1.0.0");
+        assert_eq!(
+            stale.admitted_component("tides").unwrap().bytes(),
+            b"\0asm tides v1"
+        );
+
+        assert_eq!(
+            stale.recover_interrupted_update("tides").unwrap(),
+            UpdateRecovery::Nothing
+        );
+        assert_eq!(stale.manifest("tides").unwrap().version, "2.0.0");
+        assert_eq!(
+            stale.admitted_component("tides").unwrap().bytes(),
+            b"\0asm tides v2"
+        );
+        assert_eq!(stale.manifest("weather").unwrap().version, "2.0.0");
+    }
+
+    /// Judging one package again keeps discovery's rule for a name that two
+    /// package directories claim: neither is admitted.
+    #[test]
+    fn recovery_refresh_admits_neither_package_of_a_name_two_directories_claim() {
+        let plugins = tempdir().unwrap();
+        let mut stale = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        install_tool_version(&mut stale, "weather", "1.0.0", b"\0asm v1");
+        install_tool_version(&mut stale, "tides", "1.0.0", b"\0asm tides v1");
+        let copy = plugins.path().join("weather-copy");
+        std::fs::create_dir(&copy).unwrap();
+        write_tool_version(&copy, "weather", "1.0.0", b"\0asm v1");
+        let fresh = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        assert!(fresh.manifest("weather").is_none());
+
+        assert_eq!(
+            stale.recover_interrupted_update("weather").unwrap(),
+            UpdateRecovery::Nothing
+        );
+        assert!(stale.manifest("weather").is_none());
+        assert!(stale.admitted_component("weather").is_none());
+        assert_eq!(stale.manifest("tides").unwrap().version, "1.0.0");
     }
 
     /// An update replaces the package where it is installed: the new manifest
