@@ -28,7 +28,7 @@ On these systems, repeated and trailing `/` are ignored, so `//etc` and `/home//
 
 On macOS it also refuses:
 
-- `/Users` and each folder in it: every home directory (`/Users/<name>`) and `/Users/Shared`
+- `/Users` and each folder in it: its home directories (`/Users/<name>`) and `/Users/Shared`
 - `/Volumes` and each mounted volume in it (`/Volumes/<name>`), including the startup disk's entry, which links to `/`
 - `/private`, and `/private/etc`, `/private/tmp`, and `/private/var`, the directories that `/etc`, `/tmp`, and `/var` link to
 
