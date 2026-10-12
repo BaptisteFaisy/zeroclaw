@@ -23,7 +23,12 @@ summarize
     `key=value` lines for a shell caller to assert on: how many requests
     arrived, the largest tool list any of them offered, whether a tool
     matching the script was among them, and the tool results the host sent
-    back.
+    back. A result is printed on one line: backslashes are doubled and line
+    breaks become `\\r` and `\\n`.
+
+one-line
+    Prints a text with the encoding `summarize` applies to a result, so a
+    caller can compare an expected result with the summary byte for byte.
 """
 
 from __future__ import annotations
@@ -175,6 +180,11 @@ def one_line(text: str) -> str:
     return text.replace("\\", "\\\\").replace("\r", "\\r").replace("\n", "\\n")
 
 
+def print_one_line(args: argparse.Namespace) -> int:
+    print(one_line(args.text))
+    return 0
+
+
 def summarize(args: argparse.Namespace) -> int:
     requests = 0
     tools_offered = 0
@@ -220,6 +230,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     summarize_parser.add_argument("--log", type=Path, required=True)
     summarize_parser.add_argument("--tool-match", required=True)
     summarize_parser.set_defaults(run=summarize)
+
+    one_line_parser = commands.add_parser("one-line")
+    one_line_parser.add_argument("--text", required=True)
+    one_line_parser.set_defaults(run=print_one_line)
 
     return parser.parse_args(argv)
 

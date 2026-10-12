@@ -260,6 +260,33 @@ class PluginSmokeProviderTest(unittest.TestCase):
         with self.assertRaises(json.JSONDecodeError):
             self.provider.set_script("config-echo", "{not json")
 
+    def test_one_line_encodes_an_expected_result_like_the_summary(self) -> None:
+        # A result with line breaks and backslashes (a Windows path, say) must
+        # compare equal to its summary line once both sides are encoded.
+        result = "first\r\nsecond\\third C:\\plugins\\redact.wasm"
+        self.provider.set_script("config-echo")
+        self.provider.post(
+            {
+                "messages": [USER, asked_for("config-echo"), answered(result)],
+                "tools": [ECHO_TOOL],
+            }
+        )
+        summary = self.provider.summary("config-echo")["tool_result"]
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            provider.main(["one-line", "--text", result])
+
+        self.assertEqual(output.getvalue(), summary + "\n")
+        self.assertNotEqual(summary, result, "the summary must have encoded something")
+
+    def test_one_line_leaves_plain_text_alone(self) -> None:
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            provider.main(["one-line", "--text", "label=masked|text=HELLO"])
+
+        self.assertEqual(output.getvalue(), "label=masked|text=HELLO\n")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -26,8 +26,9 @@
 #   --registry-arguments <json> --registry-expect <text>
 #                      Also install the plugin from the plugin registry and
 #                      require the tool whose name contains <match> to return
-#                      <text> for <json>. <match> must not name a built-in
-#                      tool. Needs network access. All four go together.
+#                      <text> for <json>; <text> may span lines and contain
+#                      backslashes. <match> must not name a built-in tool.
+#                      Needs network access. All four go together.
 #
 # Exit status: 0 when every check passed, 1 when a check failed, 2 when the
 # smoke could not run.
@@ -440,10 +441,17 @@ expect_offered() {
     [ "$turn_offered" = "yes" ] || fail "the provider was never offered a '$1' tool"
 }
 
+# The summary prints a result on one line (backslashes doubled, line breaks
+# as \r and \n), so the expected text is encoded the same way before the two
+# are compared.
 expect_tool_result() {
+    local expected
     [ "$turn_results" = "1" ] \
         || fail "expected one tool result, saw ${turn_results:-none}" || return 1
-    [ "$turn_result" = "$1" ] || fail "tool result was '$turn_result', expected '$1'"
+    expected="$(py "$provider" one-line --text "$1")" \
+        || fail "could not encode the expected tool result" || return 1
+    [ "$turn_result" = "$expected" ] \
+        || fail "tool result was '$turn_result', expected '$expected'"
 }
 
 record() {
