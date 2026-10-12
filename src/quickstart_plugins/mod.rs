@@ -1071,16 +1071,24 @@ async fn create_phase_with<P: QuickstartPrompter>(
 /// The agent step runs those checks and then its staged check before it
 /// writes anything, so a staged check that always refuses turns the step into
 /// a dry run that reaches every check the real step reaches and writes
-/// nothing. The only error that refusal produces is the one with the marker
-/// text; any other error is the agent step's own. In the log the dry run
-/// appears as an apply that stops before persisting, under its own run id.
+/// nothing. The check records that it ran: the step reaches it only after
+/// every earlier check passed, so reaching it is the pass, and its own
+/// refusal is then the only error. Error text decides nothing, because the
+/// agent step's messages quote config values an operator chose. In the log
+/// the dry run appears as an apply that stops before persisting, under its
+/// own run id.
 async fn agent_step_dry_run(
     submission: &BuilderSubmission,
     config: &Config,
 ) -> Result<(), Vec<QuickstartError>> {
-    const DRY_RUN_MARKER: &str = "quickstart-plugins-dry-run";
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     let mut staged = config.clone();
-    let refuse = |_: &Config| Err(DRY_RUN_MARKER.to_string());
+    let reached = AtomicBool::new(false);
+    let refuse = |_: &Config| {
+        reached.store(true, Ordering::Relaxed);
+        Err("quickstart-plugins-dry-run".to_string())
+    };
     match Box::pin(zeroclaw_runtime::quickstart::apply_with_surface_checked(
         submission.clone(),
         &mut staged,
@@ -1089,13 +1097,7 @@ async fn agent_step_dry_run(
     ))
     .await
     {
-        Err(errors)
-            if errors.len() == 1
-                && errors[0].step == zeroclaw_runtime::quickstart::QuickstartStep::Agent
-                && errors[0].message.contains(DRY_RUN_MARKER) =>
-        {
-            Ok(())
-        }
+        Err(errors) if reached.load(Ordering::Relaxed) && errors.len() == 1 => Ok(()),
         Err(errors) => Err(errors),
         // The refusing check runs before the write, so the step cannot
         // succeed; nothing was persisted for the copy to have changed.
@@ -6324,6 +6326,45 @@ type = "string"
             "nothing was printed or asked: {:?}",
             prompter.said
         );
+        server.verify().await;
+    }
+
+    /// The dry run's verdict never comes from error text: a config value
+    /// that happens to contain the refusing check's own marker is still a
+    /// refusal, because the check records whether it ran.
+    #[tokio::test]
+    async fn a_config_error_quoting_the_dry_run_marker_is_still_a_refusal() {
+        let server = MockServer::start().await;
+        serve_valid_archive(&server, 0).await;
+        let mut workspace = Workspace::new();
+        allow_agent(&mut workspace, "quickstart-plugins-dry-run");
+        let before = workspace.config_bytes();
+        let selection = selection(fixture_entry(&server, Some(archive_digest())));
+        let mut prompter = ScriptedPrompter::new([]);
+
+        let halt = run(&mut workspace, &selection, &mut prompter)
+            .await
+            .expect_err("a config the agent step refuses stops Create, whatever its text");
+
+        let PhaseHalt::AgentRejected(errors) = &halt else {
+            panic!("expected the agent step's refusal, got {halt:?}");
+        };
+        assert!(
+            errors.iter().any(|error| {
+                error.step == QuickstartStep::Agent && error.message.contains("allowed_agents")
+            }),
+            "the refusal is the agent step's own authorization check: {errors:?}"
+        );
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("request recording is on")
+                .is_empty(),
+            "no archive was requested"
+        );
+        assert!(!workspace.plugins_dir().exists());
+        assert_eq!(workspace.config_bytes(), before);
         server.verify().await;
     }
 
