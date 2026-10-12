@@ -241,12 +241,17 @@ both settings unchanged and prints the `zeroclaw config set` commands that turn
 them on later. When both settings are already on, there is nothing to ask.
 
 Once the agent is created, Quickstart prints the status of each picked plugin
-that is installed: active as a tool, with its config entry key, or the reason
-it is not active, such as `plugins.enabled` or `plugins.auto_discover` being
-off or the `plugins.max_active_instances` limit being reached. A plugin is
-reported active only when its config entry passes the settings check the
-runtime applies on every call. Otherwise, for example when you installed it
-without its required settings, its status shows the reason the check gives,
+that is installed: admitted as a tool, with its config entry key, or the
+reason it is not admitted, such as `plugins.enabled` or
+`plugins.auto_discover` being off or the `plugins.max_active_instances` limit
+being reached. A plugin is reported admitted only when its config entry passes
+the settings check the runtime applies on every call. Admitted is not yet
+registered: the tool registry registers the plugin when it is next built, and
+it still refuses a package whose name clashes with a tool already registered,
+such as a built-in tool, or whose tool description it cannot read. The runtime
+log records those refusals. When the settings check fails instead, for example
+when you installed the plugin without its required settings, its status shows
+the reason the check gives,
 names the required settings that are missing, and prints the
 `zeroclaw config set` command that asks for each value. Quickstart prints
 commands only for setting names in the portable key grammar, which are safe to

@@ -775,8 +775,10 @@ fn package_readiness(
                 )));
             }
         }
-        // The active line names the instance's config entry, which a tool
-        // that owns no state never gets.
+        // The admitted line names the instance's config entry, which a tool
+        // that owns no state never gets. Admission, settings and the load
+        // check are what Quickstart verified; registration still runs its
+        // own name-clash and metadata checks, which the line says.
         Ok(InstanceSettings::AcceptedWithoutRow) if admitted && loads => {
             lines.push(indented(&qta(
                 "cli-quickstart-plugins-ready-no-entry-needed",
