@@ -17,6 +17,32 @@ pub struct SqliteSessionBackend {
     conn: Mutex<Connection>,
 }
 
+/// Run `write` on `conn` with `PRAGMA synchronous = FULL`, then put back the
+/// level the connection had before, whether `write` succeeded or not.
+///
+/// The store runs WAL with `synchronous = NORMAL`, under which a committed
+/// transaction can still roll back on power loss. `FULL` syncs the log on
+/// every commit, so whatever `write` committed is durable once it returns.
+fn with_full_sync<T>(conn: &Connection, write: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    let previous: i64 = conn
+        .query_row("PRAGMA synchronous", [], |row| row.get(0))
+        .context("Failed to read the session DB synchronous level")?;
+    conn.execute_batch("PRAGMA synchronous = FULL;")
+        .context("Failed to enable full session DB synchronization")?;
+    let written = write(conn);
+    let restored = conn.execute_batch(&format!("PRAGMA synchronous = {previous};"));
+    match (written, restored) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(e)) => Err(anyhow::Error::new(e).context(
+            "The write committed, but the previous session DB synchronous level could not be restored",
+        )),
+        (Err(e), Ok(())) => Err(e),
+        (Err(e), Err(restore)) => Err(e.context(format!(
+            "The previous session DB synchronous level could not be restored either: {restore}"
+        ))),
+    }
+}
+
 fn committed_jsonl_import_receipts_exist(conn: &Connection) -> Result<bool> {
     conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM jsonl_import_receipts LIMIT 1)",
@@ -1233,13 +1259,15 @@ impl SessionBackend for SqliteSessionBackend {
 
     fn rename_agent_attribution(&self, from: &str, to: &str) -> std::io::Result<usize> {
         let conn = self.conn.lock();
-        let rows = conn
-            .execute(
+        // Committed with full sync: an agent rename clears its recovery record
+        // right after this move, so the move must survive a power loss by then.
+        with_full_sync(&conn, |conn| {
+            Ok(conn.execute(
                 "UPDATE session_metadata SET agent_alias = ?2 WHERE agent_alias = ?1",
                 params![from, to],
-            )
-            .map_err(std::io::Error::other)?;
-        Ok(rows)
+            )?)
+        })
+        .map_err(|e| std::io::Error::other(format!("{e:#}")))
     }
 
     fn count_agent_attribution(&self, agent_alias: &str) -> std::io::Result<usize> {
@@ -3127,6 +3155,54 @@ mod tests {
         );
         // unknown source → 0
         assert_eq!(backend.rename_agent_attribution("ghost", "x").unwrap(), 0);
+    }
+
+    #[test]
+    fn rename_agent_attribution_syncs_fully_and_restores_the_synchronous_level() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let synchronous = |backend: &SqliteSessionBackend| -> i64 {
+            backend
+                .conn
+                .lock()
+                .query_row("PRAGMA synchronous", [], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(synchronous(&backend), 1, "the store runs NORMAL");
+        let in_write = with_full_sync(&backend.conn.lock(), |conn| {
+            Ok(conn.query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))?)
+        })
+        .unwrap();
+        assert_eq!(in_write, 2, "the write runs under FULL");
+        assert!(
+            with_full_sync(&backend.conn.lock(), |_| -> Result<()> { bail!("refused") }).is_err()
+        );
+        assert_eq!(synchronous(&backend), 1, "a failed write restores it too");
+
+        backend.append("s1", &ChatMessage::user("hi")).unwrap();
+        backend.set_session_agent_alias("s1", "scout").unwrap();
+        assert_eq!(
+            backend.rename_agent_attribution("scout", "ranger").unwrap(),
+            1
+        );
+        assert_eq!(
+            backend.get_session_agent_alias("s1").unwrap().as_deref(),
+            Some("ranger")
+        );
+        assert_eq!(synchronous(&backend), 1);
+
+        // Whatever level the connection had is what comes back.
+        backend
+            .conn
+            .lock()
+            .execute_batch("PRAGMA synchronous = EXTRA;")
+            .unwrap();
+        assert_eq!(
+            backend.rename_agent_attribution("ranger", "scout").unwrap(),
+            1
+        );
+        assert_eq!(backend.count_agent_attribution("scout").unwrap(), 1);
+        assert_eq!(synchronous(&backend), 3);
     }
 
     #[test]

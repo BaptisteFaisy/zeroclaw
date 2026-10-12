@@ -10,6 +10,9 @@
 //! Two differently spelled paths can also name one directory, through a
 //! symlink or on a case-insensitive filesystem; [`same_existing_file`] tells
 //! an operation so before it treats one as the other's destination.
+//!
+//! Once an operation has moved or removed something, [`sync_directory`] makes
+//! that change durable before the operation counts it as done.
 
 use std::path::Path;
 
@@ -113,6 +116,24 @@ pub fn same_existing_file(a: &Path, b: &Path) -> std::io::Result<bool> {
     }
 }
 
+/// Make the entries of the directory `dir` durable, so a rename into or out
+/// of it, or a removal from it, survives a power loss once this returns.
+///
+/// Unix syncs a handle on the directory itself. Other platforms expose no
+/// portable directory sync, so there this does nothing, as the agent
+/// lifecycle recovery journal does for its own directory.
+pub async fn sync_directory(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        tokio::fs::File::open(dir).await?.sync_all().await
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
 /// The metadata of `path`, following symlinks, or `None` when nothing exists
 /// there: the path is missing, or one of its ancestors is not a directory.
 fn existing_metadata(path: &Path) -> std::io::Result<Option<std::fs::Metadata>> {
@@ -195,6 +216,22 @@ mod tests {
         assert_eq!(inspect_lifecycle_path(&dir).await, PathPresence::Present);
         assert_eq!(inspect_lifecycle_path(&file).await, PathPresence::Present);
         assert!(!PathPresence::Present.is_uninspectable());
+    }
+
+    #[tokio::test]
+    async fn sync_directory_syncs_a_real_directory() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("agents");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("entry"), "").unwrap();
+
+        sync_directory(&dir).await.unwrap();
+        assert!(dir.join("entry").is_file(), "syncing changes nothing");
+        #[cfg(unix)]
+        assert!(
+            sync_directory(&tmp.path().join("missing")).await.is_err(),
+            "a directory that does not exist cannot be synced"
+        );
     }
 
     #[test]

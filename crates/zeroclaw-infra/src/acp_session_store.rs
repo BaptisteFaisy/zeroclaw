@@ -202,6 +202,32 @@ const WORKSPACE_ROOT_MATCH: &str = "(workspace_dir = ?1
      OR (substr(workspace_dir, 1, length(?1)) = ?1
          AND substr(workspace_dir, length(?1) + 1, 1) IN (?2, ?3)))";
 
+/// Run `write` on `conn` with `PRAGMA synchronous = FULL`, then put back the
+/// level the connection had before, whether `write` succeeded or not.
+///
+/// The store runs WAL with `synchronous = NORMAL`, under which a committed
+/// transaction can still roll back on power loss. `FULL` syncs the log on
+/// every commit, so whatever `write` committed is durable once it returns.
+fn with_full_sync<T>(conn: &Connection, write: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    let previous: i64 = conn
+        .query_row("PRAGMA synchronous", [], |row| row.get(0))
+        .context("Failed to read the ACP session DB synchronous level")?;
+    conn.execute_batch("PRAGMA synchronous = FULL;")
+        .context("Failed to enable full ACP session DB synchronization")?;
+    let written = write(conn);
+    let restored = conn.execute_batch(&format!("PRAGMA synchronous = {previous};"));
+    match (written, restored) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(e)) => Err(anyhow::Error::new(e).context(
+            "The write committed, but the previous ACP session DB synchronous level could not be restored",
+        )),
+        (Err(e), Ok(())) => Err(e),
+        (Err(e), Err(restore)) => Err(e.context(format!(
+            "The previous ACP session DB synchronous level could not be restored either: {restore}"
+        ))),
+    }
+}
+
 /// `root` without trailing separators, so `/x/ws/` and `/x/ws` name the same
 /// root. A root that names no directory below the filesystem root (empty, or
 /// the filesystem root itself) is refused: every stored workspace lies below
@@ -3034,15 +3060,18 @@ impl AcpSessionStore {
     /// returning the row count. The agent-rename cascadekeeps the
     /// session and its transcript; only the owning alias moves. Unlike delete,
     /// a live session (`killed_at IS NULL`) is no obstacle to rename.
+    ///
+    /// The update commits with full sync, so it survives a power loss once
+    /// this returns: an agent rename clears its recovery record right after.
     pub fn rename_sessions_by_agent(&self, from: &str, to: &str) -> Result<usize> {
         let conn = self.conn.lock();
-        let rows = conn
-            .execute(
+        with_full_sync(&conn, |conn| {
+            conn.execute(
                 "UPDATE acp_sessions SET agent_alias = ?2 WHERE agent_alias = ?1",
                 params![from, to],
             )
-            .context("Failed to rename ACP session owner")?;
-        Ok(rows)
+            .context("Failed to rename ACP session owner")
+        })
     }
 
     /// Count every ACP session (live or killed) attributed to `agent_alias`,
@@ -3084,6 +3113,9 @@ impl AcpSessionStore {
     /// rewritten, no row is left under `old_root`, so a repeat call rewrites
     /// none. Equal roots are a no-op, and roots of which one lies below the
     /// other are refused, since the rewrite would then match its own output.
+    ///
+    /// The update commits with full sync, like
+    /// [`Self::rename_sessions_by_agent`].
     pub fn relocate_session_workspaces(&self, old_root: &str, new_root: &str) -> Result<usize> {
         let old_root = normalized_workspace_root(old_root)?;
         let new_root = normalized_workspace_root(new_root)?;
@@ -3098,8 +3130,8 @@ impl AcpSessionStore {
         }
         let [separator, alt_separator] = WORKSPACE_SEPARATORS.map(String::from);
         let conn = self.conn.lock();
-        let rows = conn
-            .execute(
+        with_full_sync(&conn, |conn| {
+            conn.execute(
                 &format!(
                     "UPDATE acp_sessions
                         SET workspace_dir = ?4 || substr(workspace_dir, length(?1) + 1)
@@ -3107,8 +3139,8 @@ impl AcpSessionStore {
                 ),
                 params![old_root, separator, alt_separator, new_root],
             )
-            .context("Failed to relocate ACP session workspaces")?;
-        Ok(rows)
+            .context("Failed to relocate ACP session workspaces")
+        })
     }
 
     /// Atomically persist that an admin intentionally killed this ACP session.
@@ -7215,6 +7247,71 @@ mod tests {
             0
         );
         assert_eq!(store.count_sessions_under_workspace(new_root).unwrap(), 3);
+    }
+
+    #[test]
+    fn rename_and_relocation_sync_fully_and_restore_the_synchronous_level() {
+        let (_tmp, store) = open_store();
+        let synchronous = |store: &AcpSessionStore| -> i64 {
+            store
+                .conn
+                .lock()
+                .query_row("PRAGMA synchronous", [], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(synchronous(&store), 1, "the store runs NORMAL");
+        let in_write = with_full_sync(&store.conn.lock(), |conn| {
+            Ok(conn.query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))?)
+        })
+        .unwrap();
+        assert_eq!(in_write, 2, "the write runs under FULL");
+        assert!(
+            with_full_sync(&store.conn.lock(), |_| -> Result<()> {
+                anyhow::bail!("refused")
+            })
+            .is_err()
+        );
+        assert_eq!(synchronous(&store), 1, "a failed write restores it too");
+
+        store
+            .create_session("s", "alpha", "/x/agents/alpha/workspace/proj", None)
+            .unwrap();
+        assert_eq!(store.rename_sessions_by_agent("alpha", "beta").unwrap(), 1);
+        assert_eq!(store.count_sessions_by_agent("beta").unwrap(), 1);
+        assert_eq!(synchronous(&store), 1);
+        assert_eq!(
+            store
+                .relocate_session_workspaces(
+                    "/x/agents/alpha/workspace",
+                    "/x/agents/beta/workspace"
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            raw_workspace_dir(&store, "s"),
+            "/x/agents/beta/workspace/proj"
+        );
+        assert_eq!(synchronous(&store), 1);
+
+        // Whatever level the connection had is what comes back.
+        store
+            .conn
+            .lock()
+            .execute_batch("PRAGMA synchronous = OFF;")
+            .unwrap();
+        assert_eq!(store.rename_sessions_by_agent("beta", "gamma").unwrap(), 1);
+        assert_eq!(synchronous(&store), 0);
+        assert_eq!(
+            store
+                .relocate_session_workspaces(
+                    "/x/agents/beta/workspace",
+                    "/x/agents/gamma/workspace"
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(synchronous(&store), 0);
     }
 
     #[test]

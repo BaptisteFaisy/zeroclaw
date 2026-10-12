@@ -53,7 +53,7 @@ pub enum RecoveryOperation {
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryPhase {
     /// Armed before the config commit. Whether the commit landed is read off
-    /// the live config.
+    /// the live config, see [`RecoveryRecord::is_effective`].
     Prepared,
     /// The config commit landed; the followers have not all converged.
     Committed,
@@ -80,20 +80,26 @@ pub struct RecoveryRecord {
 }
 
 impl RecoveryRecord {
-    /// Whether the record retires `from`. A `Committed` record always does;
-    /// a `Prepared` one does once the live config no longer has `from`.
-    /// Whether `to` is configured does not matter: a `from` that is gone may
-    /// have left state behind whatever happened to `to` since, so the record
-    /// fails closed and keeps `from` retired.
+    /// Whether the record retires `from`. A `Committed` record always does.
+    /// A `Prepared` one does unless the live config still has `from` and does
+    /// not have `to`, the only shape that proves its commit never landed.
     ///
-    /// A `Prepared` record that is not effective is void: `from` is still
-    /// configured, so its commit never landed, and it retires nothing and has
-    /// nothing to converge.
+    /// Every other shape fails closed and keeps `from` retired. A `from` that
+    /// is gone may have left state behind whatever happened to `to` since.
+    /// With both aliases configured the record is ambiguous: a crash after
+    /// the commit followed by `from` coming back looks the same as a crash
+    /// before the commit followed by `to` being created another way, so the
+    /// record stays effective until the rename converges or is abandoned.
+    ///
+    /// A `Prepared` record that is not effective is void: it retires nothing
+    /// and has nothing to converge.
     #[must_use]
     pub fn is_effective(&self, config: &Config) -> bool {
         match self.phase {
             RecoveryPhase::Committed => true,
-            RecoveryPhase::Prepared => !config.agents.contains_key(&self.from),
+            RecoveryPhase::Prepared => {
+                !config.agents.contains_key(&self.from) || config.agents.contains_key(&self.to)
+            }
         }
     }
 }
@@ -323,8 +329,10 @@ impl AgentRecoveryJournal {
         Ok(true)
     }
 
-    /// Drop every void record, a `Prepared` one whose commit never landed in
-    /// `config`, and return how many were dropped.
+    /// Drop every void record, a `Prepared` one whose `from` is still in
+    /// `config` and whose `to` is not, so its commit never landed, and return
+    /// how many were dropped. A `Prepared` record whose aliases are both
+    /// configured is ambiguous and stays.
     ///
     /// A record is void only once its operation can no longer commit, so run
     /// this while no operation sits between its prepare and its commit.
@@ -638,7 +646,8 @@ mod tests {
         journal.upsert(&guard, prepared("alpha", "beta")).unwrap();
         journal.upsert(&guard, prepared("epsilon", "zeta")).unwrap();
 
-        // `alpha` is still configured, so its rename never committed: void.
+        // `alpha` is still configured and `beta` is not, so that rename never
+        // committed: void.
         // `epsilon` is gone and `zeta` exists, so that rename committed.
         let config = config_with_agents(dir.path(), &["alpha", "zeta"]);
         assert_eq!(journal.collect_void(&guard, &config).unwrap(), 1);
@@ -821,8 +830,8 @@ mod tests {
         let pending = prepared("alpha", "beta");
         assert!(!pending.is_effective(&has_from), "commit never landed");
         assert!(
-            !pending.is_effective(&has_both),
-            "`from` is still configured"
+            pending.is_effective(&has_both),
+            "both aliases configured is ambiguous, so it fails closed"
         );
         assert!(pending.is_effective(&has_to), "commit landed");
         assert!(
@@ -834,6 +843,32 @@ mod tests {
         for config in [&has_from, &has_to, &has_both, &has_neither] {
             assert!(landed.is_effective(config));
         }
+    }
+
+    #[test]
+    fn a_prepared_record_with_both_aliases_configured_stays_effective() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = AgentRecoveryJournal::for_data_dir(dir.path());
+        let guard = journal.lock(Duration::ZERO).unwrap();
+        journal.upsert(&guard, prepared("alpha", "beta")).unwrap();
+
+        // `beta` appeared beside `alpha`: whether the commit landed cannot be
+        // told, so collection keeps the record and both guards see it.
+        let both = config_with_agents(dir.path(), &["alpha", "beta"]);
+        assert_eq!(journal.collect_void(&guard, &both).unwrap(), 0);
+        assert_eq!(
+            retired_alias(&both, "alpha").unwrap(),
+            Some(prepared("alpha", "beta"))
+        );
+        assert_eq!(
+            pending_target(&both, "beta").unwrap(),
+            Some(prepared("alpha", "beta"))
+        );
+
+        // Only `alpha` without `beta` proves the commit never landed.
+        let source_only = config_with_agents(dir.path(), &["alpha"]);
+        assert_eq!(journal.collect_void(&guard, &source_only).unwrap(), 1);
+        assert_eq!(journal.load().unwrap(), Vec::new());
     }
 
     #[test]

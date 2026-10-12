@@ -57,6 +57,16 @@ The owned state that follows a rename is:
 
 The record lives at `<data_dir>/agent-lifecycle-recovery.json` with a sidecar `.lock` file, and agent file tools cannot modify it. Because it is cleared only in the last step, an interrupted or partial rename leaves it open. A store that exists but cannot be read counts as unfinished work, not as empty: the rename reports it and keeps the record. Removing leftover state by hand outside the rename does not clear the record; re-running the same rename does, once it verifies that nothing is left.
 
+Every move is made durable before the record is cleared: the SQLite memory, ACP, and session stores commit their moves with full sync, and a workspace move syncs the directories it changes. A power loss after a rename converges therefore cannot leave state under the old alias with nothing retiring it.
+
+A recovery journal that cannot be read, because the file is corrupt or declares a `schema_version` this build does not support, may hold an unfinished rename, so every agent creation, rename, and delete is refused until it is repaired. To repair it:
+
+1. Stop the daemon.
+2. Move `<data_dir>/agent-lifecycle-recovery.json` aside.
+3. Inspect the moved file for records of renames that have not finished.
+4. If any rename is unfinished, re-create the journal at the same path as `{"schema_version": 1, "records": [...]}`, holding the records you can still read. Leave it removed only if no rename is unfinished.
+5. Restart the daemon, then re-run each unfinished rename to finish it.
+
 To finish a rename that reported unfinished work, re-run it with the same aliases: `zeroclaw agents rename <old> <new>`, or the same gateway API or daemon RPC request. The CLI exits non-zero until the rename has fully converged, and while a record is open it never reports the old alias as not configured. The gateway API and daemon RPC keep returning `renamed: true` with a `warnings` list while any owned state is unfinished; an empty `warnings` list means the rename has converged. A request whose old alias is not configured, has no open record, and has no leftover state is still reported as not configured.
 
 Two conflicts need an operator and keep the record open: the destination workspace already exists and is not empty, or the destination alias already owns memory rows. Resolve them by moving or merging that state by hand, then re-run the same rename.

@@ -13,7 +13,9 @@
 //! 3. The surface commits, then calls [`acknowledge_commit`], or [`abandon`]
 //!    when the commit failed.
 //! 4. [`converge`] moves every follower, re-checks all of them, and clears the
-//!    record only once nothing is left under the old alias.
+//!    record only once nothing is left under the old alias. Each move is
+//!    durable before the record clears: the SQLite stores commit it with full
+//!    sync, and a workspace move syncs the directories it changes.
 //!
 //! The record keeps the recovery durable across the window after the commit
 //! and across processes. While it is open the old alias cannot be reused, and
@@ -38,7 +40,9 @@ use zeroclaw_infra::session_backend::SessionBackend;
 use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
 use zeroclaw_memory::MemoryBackendKind;
 
-use crate::lifecycle_path::{PathPresence, inspect_lifecycle_path, same_existing_file};
+use crate::lifecycle_path::{
+    PathPresence, inspect_lifecycle_path, same_existing_file, sync_directory,
+};
 
 /// How long [`arm`], and a rename discovered without a record, wait for the
 /// journal lock. Callers hold their config write lock while arming, so a
@@ -59,6 +63,7 @@ const KEY_REFUSED: &str = "agents.rename_recovery.refused";
 const KEY_UNREADABLE: &str = "agents.rename_recovery.unreadable";
 const KEY_RECORD_FAILED: &str = "agents.rename_recovery.record_failed";
 const KEY_ABANDONED: &str = "agents.rename_recovery.abandoned";
+const KEY_UNSYNCED: &str = "agents.rename_recovery.unsynced";
 
 /// Store handles a rename surface already holds. `None` means the surface
 /// holds no handle for that store, not that the store is unconfigured: the
@@ -395,8 +400,9 @@ pub async fn resolve(
 /// journal lock so no other lifecycle operation writes the journal until the
 /// surface has committed and called [`acknowledge_commit`] or [`abandon`].
 ///
-/// `config_before_commit` is the config the commit starts from. The record
-/// keeps `from`'s workspace for the move only when `from` sets no
+/// `config_before_commit` is the config the commit starts from, and must not
+/// configure `to` yet: a rename onto a configured alias is refused. The
+/// record keeps `from`'s workspace for the move only when `from` sets no
 /// `workspace.path` and so follows its alias; a custom path never moves.
 pub async fn arm(
     config_before_commit: &Config,
@@ -440,7 +446,8 @@ pub async fn arm(
 ///
 /// `config_after_commit` must show the commit, with `from` gone. Otherwise
 /// the record is left prepared, and void while the live config still has
-/// `from`, rather than retiring an alias that is still configured.
+/// `from` and lacks `to`, rather than retiring an alias that is still
+/// configured.
 pub async fn acknowledge_commit(config_after_commit: &Config, armed: Armed) {
     let Armed { mut record, guard } = armed;
     let (from, to) = (record.from.clone(), record.to.clone());
@@ -469,10 +476,12 @@ pub async fn acknowledge_commit(config_after_commit: &Config, armed: Armed) {
 
 /// The surface's config commit failed: drop the prepared record and release
 /// the journal lock. Best effort: a failure is logged, and the record, whose
-/// commit never landed, retires nothing and is dropped by the next [`arm`].
+/// commit never landed, retires nothing while the config keeps `from` and
+/// lacks `to`, and is dropped by the next [`arm`].
 ///
-/// A `config` that shows the commit after all keeps the record, so the
-/// rename's recovery is not lost.
+/// A `config` that does not prove the commit failed, one without `from` or
+/// with both aliases, keeps the record, so the rename's recovery is not
+/// lost.
 pub async fn abandon(config: &Config, armed: Armed) {
     let Armed { record, guard } = armed;
     let (from, to) = (record.from.clone(), record.to.clone());
@@ -542,9 +551,9 @@ pub async fn converge(
             ),
         });
     }
-    // A prepared record retires `from` only while the config lacks it. Once
-    // state starts moving that must no longer hang on the config, so the
-    // record is committed first.
+    // Whether a prepared record retires `from` hangs on the config. Once
+    // state starts moving that must no longer be so, so the record is
+    // committed first.
     let record = match record {
         Some(record) if record.phase == RecoveryPhase::Prepared => Some(
             promote_record(&journal, record)
@@ -852,8 +861,8 @@ enum RecordMatch<'r> {
 /// `from` configured again while a rename of it is unfinished; `to` retired
 /// by another rename; `from` still receiving another rename's state; `from`
 /// retired, by this rename (pending) or another; `to` still receiving another
-/// rename's state. Only effective records count: a prepared record whose
-/// commit never landed retires nothing.
+/// rename's state. Only effective records count: a void prepared record,
+/// whose `from` is still configured and whose `to` is not, retires nothing.
 fn match_records<'r>(
     records: &'r [RecoveryRecord],
     config: &Config,
@@ -917,8 +926,9 @@ async fn prepare_record(
     off_async_worker(move || {
         let guard = journal.lock(ARM_LOCK_WAIT).map_err(journal_error)?;
         // Holding the lock, no other operation sits between its prepare and
-        // its commit, so every prepared record whose commit did not land is
-        // void.
+        // its commit, so a prepared record whose `from` is still configured
+        // and whose `to` is not never committed and is void. One whose `to`
+        // has appeared as well is ambiguous and stays.
         journal
             .collect_void(&guard, &config)
             .map_err(journal_error)?;
@@ -933,6 +943,16 @@ async fn prepare_record(
                 });
             }
             RecordMatch::Refused(error) => return Err(error),
+        }
+        // A prepared record stands before its commit only because it is void
+        // while `from` is configured and `to` is not. A rename onto an alias
+        // that is already configured never commits, so it is refused rather
+        // than recorded as an ambiguous record that would retire `from`.
+        if config.agent(&to).is_some() {
+            return Err(RenameRecoveryError::InvalidAlias {
+                alias: to.clone(),
+                reason: format!("agents.{to} is already configured"),
+            });
         }
         let source_workspace = armed_source_workspace(&config, &from);
         let record = new_record(&from, &to, RecoveryPhase::Prepared, source_workspace);
@@ -1657,7 +1677,35 @@ async fn move_workspace(workspace: &WorkspaceMove) -> Result<(), FollowerIssue> 
     }
     tokio::fs::rename(source, destination)
         .await
-        .map_err(|e| move_failed(&e))
+        .map_err(|e| move_failed(&e))?;
+    // The move is visible now. Make it durable before anything can clear the
+    // record: the entry it added, then the entry it removed.
+    if let Some(parent) = destination.parent() {
+        sync_changed_directory(parent).await;
+    }
+    if let Some(parent) = source.parent() {
+        sync_changed_directory(parent).await;
+    }
+    Ok(())
+}
+
+/// Sync `dir`, a directory a workspace move or cleanup changed, so the change
+/// survives a power loss. A failure cannot undo a change that has already
+/// happened, so it is logged.
+async fn sync_changed_directory(dir: &Path) {
+    if let Err(e) = sync_directory(dir).await {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "error_key": KEY_UNSYNCED,
+                    "dir": dir.display().to_string(),
+                    "error": e.to_string(),
+                })),
+            "a directory an agent rename changed could not be synced; a power loss could still undo that change"
+        );
+    }
 }
 
 /// Whether `path` is a real directory with nothing in it. A symlink or a file
@@ -1674,11 +1722,16 @@ async fn is_empty_directory(path: &Path) -> std::io::Result<bool> {
 }
 
 /// Best effort: remove `<install>/agents/<from>` once the old default
-/// workspace below it is gone. It stays when anything else was kept beside
-/// the workspace.
+/// workspace below it is gone, then sync `<install>/agents` so the removal is
+/// durable. It stays when anything else was kept beside the workspace.
 async fn remove_alias_dir(old_workspace: &Path) {
-    if let Some(alias_dir) = old_workspace.parent() {
-        let _ = tokio::fs::remove_dir(alias_dir).await;
+    let Some(alias_dir) = old_workspace.parent() else {
+        return;
+    };
+    if tokio::fs::remove_dir(alias_dir).await.is_ok()
+        && let Some(agents_dir) = alias_dir.parent()
+    {
+        sync_changed_directory(agents_dir).await;
     }
 }
 
@@ -3000,6 +3053,172 @@ mod tests {
         let outcome = converge(&after, FROM, TO, &stores).await.unwrap();
         assert!(outcome.is_converged(), "{:?}", outcome.warnings());
         assert!(records(&after).is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unacknowledged_commit_keeps_the_old_alias_retired_when_it_comes_back() {
+        let tmp = TempDir::new().unwrap();
+        let before = fixture(&tmp, &[FROM]);
+        let source = seed_workspace(&before, FROM);
+        let armed = arm(&before, FROM, TO).await.unwrap();
+        let after = committed(&before);
+        // The process stops after the commit, before acknowledging it, and a
+        // hand edit then brings the old alias back beside the new one.
+        drop(armed);
+        let mut readded = after.clone();
+        readded.agents.insert(FROM.to_string(), agent());
+        let stores = SurfaceStores::none();
+
+        let retired = retired_alias(&readded, FROM)
+            .unwrap()
+            .expect("both aliases configured is ambiguous, so the old alias stays retired");
+        assert_eq!(
+            (retired.to.as_str(), retired.phase),
+            (TO, RecoveryPhase::Prepared)
+        );
+        assert!(pending_target(&readded, TO).unwrap().is_some());
+        assert!(matches!(
+            ensure_alias_not_retired(&readded, FROM).await,
+            Err(RenameRecoveryError::AliasRetired { .. })
+        ));
+        let mut recreate = readded.clone();
+        assert!(matches!(
+            alias_refs::create_map_key_checked(&mut recreate, "agents", FROM),
+            Err(alias_refs::CreateError::Retired { .. })
+        ));
+
+        // The contract treats it as a committed rename whose old alias is
+        // configured again, and another rename of the old alias must not
+        // collect the record as void.
+        let refusals = [
+            resolve(&readded, FROM, TO, &stores).await.unwrap_err(),
+            arm(&readded, FROM, "wolf").await.unwrap_err(),
+            converge(&readded, FROM, TO, &stores).await.unwrap_err(),
+        ];
+        for refusal in &refusals {
+            assert!(
+                matches!(refusal, RenameRecoveryError::SourceReconfigured { from, to } if from == FROM && to == TO),
+                "{refusal:?}"
+            );
+        }
+        let recorded = records(&readded);
+        assert_eq!(recorded.len(), 1, "the record survives: {recorded:?}");
+        assert_eq!(
+            (
+                recorded[0].from.as_str(),
+                recorded[0].to.as_str(),
+                recorded[0].phase
+            ),
+            (FROM, TO, RecoveryPhase::Prepared)
+        );
+        assert!(source.join("MEMORY.md").is_file(), "nothing moved");
+
+        // With the hand-added entry gone again, the same rename finishes.
+        let outcome = converge(&after, FROM, TO, &stores).await.unwrap();
+        assert!(outcome.is_converged(), "{:?}", outcome.warnings());
+        assert!(records(&after).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_target_created_beside_an_uncommitted_rename_keeps_it_open_until_abandoned() {
+        let tmp = TempDir::new().unwrap();
+        let before = fixture(&tmp, &[FROM]);
+        let source = seed_workspace(&before, FROM);
+        let armed = arm(&before, FROM, TO).await.unwrap();
+        // The process stops before the commit, and another door then creates
+        // the new alias while the old one is still configured.
+        drop(armed);
+        assert_eq!(retired_alias(&before, FROM).unwrap(), None);
+        let mut both = before.clone();
+        both.agents.insert(TO.to_string(), agent());
+
+        let record = records(&both).remove(0);
+        assert_eq!(record.phase, RecoveryPhase::Prepared);
+        assert!(
+            record.is_effective(&both),
+            "both aliases configured is ambiguous, so the record fails closed"
+        );
+        assert_eq!(pending_target(&both, TO).unwrap(), Some(record.clone()));
+        assert!(matches!(
+            ensure_not_pending_target(&both, TO).await,
+            Err(RenameRecoveryError::RecoveryPending { .. })
+        ));
+        assert!(matches!(
+            ensure_alias_not_retired(&both, FROM).await,
+            Err(RenameRecoveryError::AliasRetired { .. })
+        ));
+        assert!(matches!(
+            resolve(&both, FROM, TO, &SurfaceStores::none()).await,
+            Err(RenameRecoveryError::SourceReconfigured { .. })
+        ));
+
+        // Abandoning the rename is the way out, and it moves nothing.
+        let abandoned = abandon_rename(&both, FROM, TO).await.unwrap();
+        assert_eq!(abandoned.record, record);
+        assert!(records(&both).is_empty());
+        assert!(source.join("MEMORY.md").is_file());
+        assert_eq!(pending_target(&both, TO).unwrap(), None);
+        assert_eq!(retired_alias(&both, FROM).unwrap(), None);
+        assert!(ensure_not_pending_target(&both, TO).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn arming_a_rename_onto_a_configured_alias_is_refused_and_records_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let both = fixture(&tmp, &[FROM, TO]);
+
+        let err = arm(&both, FROM, TO).await.unwrap_err();
+        assert!(
+            matches!(&err, RenameRecoveryError::InvalidAlias { alias, .. } if alias == TO),
+            "{err:?}"
+        );
+        assert!(
+            records(&both).is_empty(),
+            "a rename that cannot commit is never recorded"
+        );
+        assert_eq!(retired_alias(&both, FROM).unwrap(), None);
+        assert_eq!(pending_target(&both, TO).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_fresh_rename_is_void_until_its_commit_lands() {
+        let tmp = TempDir::new().unwrap();
+        let before = fixture(&tmp, &[FROM]);
+        let source = seed_workspace(&before, FROM);
+        let stores = SurfaceStores::none();
+
+        assert_eq!(
+            resolve(&before, FROM, TO, &stores).await.unwrap(),
+            Disposition::Fresh
+        );
+        let armed = arm(&before, FROM, TO).await.unwrap();
+        // Between the arm and the commit the old alias is configured and the
+        // new one is not, which proves the commit has not landed.
+        let prepared = records(&before).remove(0);
+        assert_eq!(prepared.phase, RecoveryPhase::Prepared);
+        assert!(!prepared.is_effective(&before));
+        assert_eq!(retired_alias(&before, FROM).unwrap(), None);
+        assert_eq!(pending_target(&before, TO).unwrap(), None);
+        assert!(ensure_alias_not_retired(&before, FROM).await.is_ok());
+        assert!(ensure_not_pending_target(&before, TO).await.is_ok());
+
+        let after = committed(&before);
+        assert!(prepared.is_effective(&after), "the commit landed");
+        acknowledge_commit(&after, armed).await;
+        assert_eq!(records(&after)[0].phase, RecoveryPhase::Committed);
+
+        let outcome = converge(&after, FROM, TO, &stores).await.unwrap();
+        assert!(outcome.is_converged(), "{:?}", outcome.warnings());
+        assert!(outcome.report().workspace_moved);
+        assert!(!source.exists());
+        assert!(
+            after
+                .default_agent_workspace_dir(TO)
+                .join("MEMORY.md")
+                .is_file()
+        );
+        assert!(records(&after).is_empty());
+        assert_eq!(retired_alias(&after, FROM).unwrap(), None);
     }
 
     #[tokio::test]
