@@ -35,11 +35,20 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from socketserver import TCPServer
 from typing import Any, Optional
 
 TURN_COMPLETE = "SMOKE_TURN_COMPLETE"
 TOOL_NOT_OFFERED = "SMOKE_TOOL_NOT_OFFERED"
 CALL_ID = "call_plugin_smoke"
+
+
+class _LiteralHTTPServer(ThreadingHTTPServer):
+    """Use the bound identity; this fixture never consumes a reverse name."""
+
+    def server_bind(self) -> None:
+        TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
 
 def offered_tool_names(body: dict[str, Any]) -> list[str]:
@@ -189,7 +198,7 @@ def serve(args: argparse.Namespace) -> int:
         started = startup_milestone("serve-entry", started)
         phase = "server-construction"
         started = startup_milestone("server-construction-start", started)
-        server = ThreadingHTTPServer((args.host, 0), make_handler(args.log, args.script))
+        server = _LiteralHTTPServer((args.host, 0), make_handler(args.log, args.script))
         started = startup_milestone("server-construction-done", started)
         phase = "log-touch"
         args.log.touch()

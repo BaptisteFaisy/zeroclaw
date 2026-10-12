@@ -396,6 +396,25 @@ jobs:
         with:
           name: plugin-smoke-packages
           path: plugin-smoke-packages
+      - name: Run scripted provider tests
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          provider_python=""
+          for candidate in python3 python; do
+            if command -v "$candidate" >/dev/null 2>&1 \
+              && "$candidate" -c 'import sys; sys.exit(sys.version_info < (3, 8))' 2>/dev/null; then
+              provider_python="$candidate"
+              break
+            fi
+          done
+          if [ -z "$provider_python" ]; then
+            echo "python 3.8 or newer is required" >&2
+            exit 1
+          fi
+          "$provider_python" scripts/ci/plugin_smoke_provider_test.py -v
+
       - name: Run the plugin smoke against the built binary
         shell: bash
         run: |
