@@ -46,6 +46,8 @@ mod tests {
     /// The names step scope is resolved against in production: the registry
     /// factory's tools, read through the turn loop's own name collector. The
     /// config gates and the SOP engine that group members depend on are on.
+    /// Both config arguments point at the temp dir, so the stores the registry
+    /// opens (session backend, plugin state) stay out of the real home directory.
     fn registered_tool_names() -> Vec<String> {
         let tmp = TempDir::new().expect("temp dir is created");
         let security = Arc::new(SecurityPolicy::default());
@@ -74,7 +76,7 @@ mod tests {
         let engine = Arc::new(Mutex::new(SopEngine::new(SopConfig::default())));
 
         let tools = crate::tools::all_tools_with_runtime(
-            Arc::new(Config::default()),
+            Arc::new(root_config.clone()),
             &security,
             &RiskProfileConfig::default(),
             "test-agent",
@@ -107,10 +109,11 @@ mod tests {
         let registered = registered_tool_names();
 
         for (aliases, tools) in GROUPS {
+            assert!(!tools.is_empty(), "scope group {aliases:?} has no members");
             for tool in *tools {
                 assert!(
                     registered.iter().any(|name| name == tool),
-                    "scope group {aliases:?} lists `{tool}`, which the tool registry never registers"
+                    "scope group {aliases:?} lists `{tool}`, which the test registry did not register: fix the name, or switch on its config gate in registered_tool_names()"
                 );
             }
         }
@@ -121,6 +124,7 @@ mod tests {
         let registered = registered_tool_names();
 
         for (aliases, tools) in GROUPS {
+            assert!(!tools.is_empty(), "scope group {aliases:?} has no members");
             let mut expected: Vec<String> = tools.iter().map(|tool| (*tool).to_string()).collect();
             expected.sort();
 
@@ -144,6 +148,7 @@ mod tests {
         let registered = registered_tool_names();
 
         for (aliases, tools) in GROUPS {
+            assert!(!tools.is_empty(), "scope group {aliases:?} has no members");
             let mut expected: Vec<&str> = tools.to_vec();
             expected.sort_unstable();
 
