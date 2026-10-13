@@ -129,6 +129,594 @@ fn yaml_block<'a>(document: &'a str, header: &str) -> &'a str {
     &remainder[..end]
 }
 
+
+// Immutable test-only reference from public 8b04361c24b99d5a700ac97f517308c2ed456650.
+// The production workflows must never consume this fixture. Its complete bytes,
+// rather than the edited caller or shallow Git history, pin the before recipe.
+const OLD_RELEASE_RECIPE_SHA256: &str =
+    "40bccde145213f19c264fdef9a64fcfd1959acf124925bb2cc5beaf91efbabd9";
+const OLD_RELEASE_RECIPE: &str = r###"if [ -n "${{ matrix.linker_env || '' }}" ] && [ -n "${{ matrix.linker || '' }}" ]; then
+  export "${{ matrix.linker_env }}=${{ matrix.linker }}"
+fi
+# Force ARMv6 codegen for arm-unknown-linux-gnueabihf (#4556)
+# Ubuntu 22.04's gcc-arm-linux-gnueabihf defaults to ARMv7+NEON,
+# which segfaults on ARMv6 devices (e.g. Raspberry Pi Zero W).
+if [ "${{ matrix.target }}" = "arm-unknown-linux-gnueabihf" ]; then
+  export CFLAGS_arm_unknown_linux_gnueabihf="-march=armv6 -mfpu=vfp -mfloat-abi=hard"
+  export CXXFLAGS_arm_unknown_linux_gnueabihf="-march=armv6 -mfpu=vfp -mfloat-abi=hard"
+  export CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS="-C target-feature=-neon"
+fi
+# Resolve the feature set from the canonical registry
+# (`cargo generate features`), the single source of truth that
+# install.sh and packaging surfaces also consume. `dist` is the lean
+# standard distribution set and carries the default leaves, so every
+# target builds with --no-default-features against the explicit list,
+# with no implicit feature drift.
+FEATURES="$(cargo run --quiet -p xtask --bin generate -- features --selection dist --target "${{ matrix.target }}")"
+echo "Resolved features: $FEATURES"
+# MUSL targets build via cross-rs (cross-compiled in a container);
+# all other targets use the host cargo toolchain directly.
+if [ "${{ matrix.use_cross || 'false' }}" = "true" ]; then
+  BUILD_CMD="cross build"
+else
+  BUILD_CMD="cargo build"
+fi
+# Always build --no-default-features against the generator's explicit
+# per-target list: FEATURES already carries the default leaves for the
+# target, so this applies the canonical per-target exclusions with no
+# implicit feature drift. Unioning the root crate's defaults back in
+# (by omitting --no-default-features) would silently re-enable a
+# feature the generator excludes for this target (e.g. the Prometheus
+# exporter on ARM).
+$BUILD_CMD --release --locked --no-default-features --features "${FEATURES}" --target ${{ matrix.target }}
+# Build the zerocode TUI and the zerorelay nominated relay alongside the
+# main binary so they ship in the release archive. Skipped on Android,
+# which lacks the terminal deps.
+if [ "${{ matrix.target }}" != "aarch64-linux-android" ]; then
+  $BUILD_CMD --release --locked -p zerocode --target ${{ matrix.target }}
+  $BUILD_CMD --release --locked -p zerorelay --target ${{ matrix.target }}
+fi
+"###;
+
+#[derive(Clone, Copy)]
+struct ReleaseRecipeContext {
+    target: &'static str,
+    linker_env: &'static str,
+    linker: &'static str,
+    use_cross: bool,
+}
+
+// Test contexts, not a production target registry. Each is bound below to the
+// corresponding existing Stable matrix row; no feature list is copied here.
+const RELEASE_RECIPE_CONTEXTS: [ReleaseRecipeContext; 10] = [
+    ReleaseRecipeContext {
+        target: "x86_64-unknown-linux-gnu",
+        linker_env: "",
+        linker: "",
+        use_cross: false,
+    },
+    ReleaseRecipeContext {
+        target: "x86_64-unknown-linux-musl",
+        linker_env: "",
+        linker: "",
+        use_cross: true,
+    },
+    ReleaseRecipeContext {
+        target: "aarch64-unknown-linux-gnu",
+        linker_env: "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER",
+        linker: "aarch64-linux-gnu-gcc",
+        use_cross: false,
+    },
+    ReleaseRecipeContext {
+        target: "aarch64-unknown-linux-musl",
+        linker_env: "",
+        linker: "",
+        use_cross: true,
+    },
+    ReleaseRecipeContext {
+        target: "armv7-unknown-linux-gnueabihf",
+        linker_env: "CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER",
+        linker: "arm-linux-gnueabihf-gcc",
+        use_cross: false,
+    },
+    ReleaseRecipeContext {
+        target: "arm-unknown-linux-gnueabihf",
+        linker_env: "CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_LINKER",
+        linker: "arm-linux-gnueabihf-gcc",
+        use_cross: false,
+    },
+    ReleaseRecipeContext {
+        target: "aarch64-apple-darwin",
+        linker_env: "",
+        linker: "",
+        use_cross: false,
+    },
+    ReleaseRecipeContext {
+        target: "x86_64-apple-darwin",
+        linker_env: "",
+        linker: "",
+        use_cross: false,
+    },
+    ReleaseRecipeContext {
+        target: "aarch64-linux-android",
+        linker_env: "",
+        linker: "",
+        use_cross: false,
+    },
+    ReleaseRecipeContext {
+        target: "x86_64-pc-windows-msvc",
+        linker_env: "",
+        linker: "",
+        use_cross: false,
+    },
+];
+
+fn explicit_bash_body(step: &str, indentation: &str) -> String {
+    let (_, body) = step
+        .split_once("run: |\n")
+        .expect("the recipe has one literal Bash body");
+    // The literal block's default clip retains one final LF; inter-step blank
+    // spacing belongs to the caller, not to its Bash recipe.
+    body.trim_end_matches('\n')
+        .lines()
+        .map(|line| {
+            let line = if line.is_empty() {
+                ""
+            } else {
+                line.strip_prefix(indentation)
+                    .expect("recipe line must retain its literal indentation")
+            };
+            format!("{line}\n")
+        })
+        .collect()
+}
+
+fn shared_release_recipe() -> String {
+    let action_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(".github/actions/build-release-payloads/action.yml");
+    let action = fs::read_to_string(action_path).expect("read shared release recipe");
+    let step = yaml_block(&action, "    - id: build\n");
+    assert!(step.contains("      shell: bash\n"));
+    assert!(step.contains(
+        "        RELEASE_FEATURES_EVIDENCE: ${{ inputs.emit_features }}\n"
+    ));
+    explicit_bash_body(step, "        ")
+}
+
+fn render_release_recipe(
+    body: &str,
+    namespace: &str,
+    context: ReleaseRecipeContext,
+) -> String {
+    let mut body = body.to_string();
+    for (field, value) in [
+        ("target", context.target),
+        ("linker_env", context.linker_env),
+        ("linker", context.linker),
+        ("use_cross", if context.use_cross { "true" } else { "false" }),
+    ] {
+        for expression in [
+            format!("${{{{ {namespace}.{field} }}}}"),
+            format!("${{{{ {namespace}.{field} || '' }}}}"),
+            format!("${{{{ {namespace}.{field} || 'false' }}}}"),
+        ] {
+            body = body.replace(&expression, value);
+        }
+    }
+    assert!(!body.contains("${{"), "unbound recipe expression: {body}");
+    body
+}
+
+struct RecipeObservation {
+    status: Option<i32>,
+    trace: Vec<String>,
+    evidence: Option<String>,
+    diagnostics: String,
+}
+
+fn run_release_recipe(
+    body: &str,
+    context: ReleaseRecipeContext,
+    failure: &str,
+    emit_features: &str,
+    features: &str,
+) -> RecipeObservation {
+    let temp = tempfile::tempdir().expect("recipe scratch");
+    let script = temp.path().join("recipe.sh");
+    let trace = temp.path().join("trace.txt");
+    let evidence = temp.path().join("output.txt");
+    // Only controlled Bash functions run. The actual extracted recipe selects
+    // cargo/cross, expands arguments, exports environment and propagates status.
+    // No compiler, package manager, container or payload binary is invoked.
+    let harness = r#"
+record_command() {
+  local linker=""
+  if [ -n "$RECIPE_LINKER_ENV" ]; then
+    linker="${!RECIPE_LINKER_ENV}"
+  fi
+  printf '%s' "$1" >> "$RECIPE_TRACE"
+  shift
+  for arg in "$@"; do printf '|%s' "$arg" >> "$RECIPE_TRACE"; done
+  printf '|linker=%s|cflags=%s|cxxflags=%s|rustflags=%s|jobs=%s\n' \
+    "$linker" "$CFLAGS_arm_unknown_linux_gnueabihf" \
+    "$CXXFLAGS_arm_unknown_linux_gnueabihf" \
+    "$CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS" \
+    "$CARGO_BUILD_JOBS" >> "$RECIPE_TRACE"
+}
+controlled_command() {
+  local program="$1" stage="main" previous=""
+  shift
+  record_command "$program" "$@"
+  if [ "$1" = run ]; then
+    stage="generator"
+  else
+    for arg in "$@"; do
+      if [ "$previous" = -p ]; then stage="$arg"; fi
+      previous="$arg"
+    done
+  fi
+  if [ "$RECIPE_FAIL" = "$stage" ]; then return 83; fi
+  if [ "$stage" = generator ]; then printf '%s\n' "$RECIPE_FEATURES"; fi
+}
+cargo() { controlled_command cargo "$@"; }
+cross() { controlled_command cross "$@"; }
+"#;
+    fs::write(&script, format!("{harness}\n{body}")).expect("write recipe fixture");
+    let mut command = bash_command();
+    command
+        .args(["--noprofile", "--norc", "-e", "-o", "pipefail"])
+        .arg(bash_path(&script))
+        .current_dir(temp.path())
+        .env_clear()
+        .env("RECIPE_TRACE", bash_path(&trace))
+        .env("RECIPE_LINKER_ENV", context.linker_env)
+        .env("RECIPE_FAIL", failure)
+        .env("RECIPE_FEATURES", features)
+        .env("RELEASE_FEATURES_EVIDENCE", emit_features);
+    // Retain interpreter startup inputs, including Windows' system directory,
+    // while excluding inherited Cargo/compiler flags from the recipe oracle.
+    for key in ["PATH", "SystemRoot", "WINDIR", "TEMP", "TMP"] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    // With evidence disabled, leave GITHUB_OUTPUT absent: a new Stable write
+    // would fail or create an unexpected file rather than escape this oracle.
+    if emit_features != "false" {
+        command.env("GITHUB_OUTPUT", bash_path(&evidence));
+    }
+    let output = command.output().expect("execute controlled recipe fixture");
+    RecipeObservation {
+        status: output.status.code(),
+        trace: fs::read_to_string(&trace)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect(),
+        evidence: fs::read_to_string(&evidence).ok(),
+        diagnostics: command_diagnostics(&output),
+    }
+}
+
+fn expected_release_trace(
+    context: ReleaseRecipeContext,
+    failure: &str,
+    features: &str,
+) -> Vec<String> {
+    let armv6 = context.target == "arm-unknown-linux-gnueabihf";
+    let flags = if armv6 {
+        "-march=armv6 -mfpu=vfp -mfloat-abi=hard"
+    } else {
+        ""
+    };
+    let rustflags = if armv6 { "-C target-feature=-neon" } else { "" };
+    let environment = format!(
+        "|linker={}|cflags={flags}|cxxflags={flags}|rustflags={rustflags}|jobs=",
+        context.linker
+    );
+    let program = if context.use_cross { "cross" } else { "cargo" };
+    let mut trace = vec![format!(
+        "cargo|run|--quiet|-p|xtask|--bin|generate|--|features|--selection|dist|--target|{}{environment}",
+        context.target
+    )];
+    if failure == "generator" {
+        return trace;
+    }
+    trace.push(format!(
+        "{program}|build|--release|--locked|--no-default-features|--features|{features}|--target|{}{environment}",
+        context.target
+    ));
+    if failure == "main" || context.target == "aarch64-linux-android" {
+        return trace;
+    }
+    for package in ["zerocode", "zerorelay"] {
+        trace.push(format!(
+            "{program}|build|--release|--locked|-p|{package}|--target|{}{environment}",
+            context.target
+        ));
+        if failure == package {
+            break;
+        }
+    }
+    trace
+}
+
+fn assert_release_trace(
+    observed: &RecipeObservation,
+    context: ReleaseRecipeContext,
+    failure: &str,
+    features: &str,
+) {
+    let fails = !failure.is_empty()
+        && !(context.target == "aarch64-linux-android"
+            && matches!(failure, "zerocode" | "zerorelay"));
+    assert_eq!(
+        observed.status,
+        Some(if fails { 83 } else { 0 }),
+        "{} {failure}: {}",
+        context.target,
+        observed.diagnostics
+    );
+    assert_eq!(
+        observed.trace,
+        expected_release_trace(context, failure, features),
+        "{} {failure}: {}",
+        context.target,
+        observed.diagnostics
+    );
+}
+
+#[test]
+fn immutable_stable_release_recipe_has_real_command_and_failure_baselines() {
+    use sha2::{Digest, Sha256};
+
+    assert_eq!(
+        format!("{:x}", Sha256::digest(OLD_RELEASE_RECIPE.as_bytes())),
+        OLD_RELEASE_RECIPE_SHA256
+    );
+    let release = workflow("release-stable-manual.yml");
+    let build = yaml_block(&release, "  build:\n");
+    let old_step = yaml_block(build, "      - name: Build release\n");
+    // Phase-1 gate: the active producer is still byte-identical. A later,
+    // separately reviewed caller migration must replace only this assertion.
+    assert_eq!(explicit_bash_body(old_step, "          "), OLD_RELEASE_RECIPE);
+    let matrix = yaml_block(build, "      matrix:\n");
+    for context in RELEASE_RECIPE_CONTEXTS {
+        let target_line = format!("            target: {}\n", context.target);
+        let (_, row) = matrix
+            .split_once(&target_line)
+            .expect("the baseline context must name an existing Stable target");
+        let row = row.split("          - os:").next().unwrap();
+        assert_eq!(row.contains("linker_env:"), !context.linker_env.is_empty());
+        assert_eq!(row.contains("linker:"), !context.linker.is_empty());
+        for binding in [
+            format!("linker_env: {}", context.linker_env),
+            format!("linker: {}", context.linker),
+        ] {
+            if !context.linker.is_empty() {
+                assert!(row.contains(&binding), "{}: {binding}", context.target);
+            }
+        }
+        assert_eq!(row.contains("use_cross: true"), context.use_cross);
+        let recipe = render_release_recipe(OLD_RELEASE_RECIPE, "matrix", context);
+        for failure in ["", "generator", "main", "zerocode", "zerorelay"] {
+            let observed =
+                run_release_recipe(&recipe, context, failure, "false", "fixture-a,fixture-b");
+            assert_release_trace(&observed, context, failure, "fixture-a,fixture-b");
+            assert!(observed.evidence.is_none());
+        }
+    }
+}
+
+#[test]
+fn shared_release_recipe_preserves_all_ten_command_failure_contexts() {
+    let body = shared_release_recipe();
+    let mut inverted = body.clone();
+    for (start, end) in [
+        (
+            "# BEGIN release input/evidence adapter\n",
+            "# END release input/evidence adapter\n",
+        ),
+        (
+            "# BEGIN qualification-only FEATURES output adapter\n",
+            "# END qualification-only FEATURES output adapter\n",
+        ),
+    ] {
+        let from = inverted.find(start).expect("identified adapter starts");
+        let through = inverted[from..]
+            .find(end)
+            .map(|offset| from + offset + end.len())
+            .expect("identified adapter ends");
+        inverted.replace_range(from..through, "");
+    }
+    for field in ["target", "linker_env", "linker", "use_cross"] {
+        inverted = inverted.replace(&format!("inputs.{field}"), &format!("matrix.{field}"));
+    }
+    assert_eq!(
+        inverted, OLD_RELEASE_RECIPE,
+        "only the four input bindings and identified adapter may differ"
+    );
+    for context in RELEASE_RECIPE_CONTEXTS {
+        let recipe = render_release_recipe(&body, "inputs", context);
+        for failure in ["", "generator", "main", "zerocode", "zerorelay"] {
+            let observed =
+                run_release_recipe(&recipe, context, failure, "false", "fixture-a,fixture-b");
+            assert_release_trace(&observed, context, failure, "fixture-a,fixture-b");
+            assert!(observed.evidence.is_none(), "Stable must not write evidence");
+        }
+        let observed =
+            run_release_recipe(&recipe, context, "", "true", "fixture-a,fixture-b");
+        assert_release_trace(&observed, context, "", "fixture-a,fixture-b");
+        assert_eq!(
+            observed.evidence.as_deref(),
+            Some("features=fixture-a,fixture-b\n")
+        );
+    }
+}
+
+#[test]
+fn shared_release_recipe_evidence_refuses_empty_features_and_invalid_switch() {
+    let context = RELEASE_RECIPE_CONTEXTS[0];
+    let recipe = render_release_recipe(&shared_release_recipe(), "inputs", context);
+    let stable_empty = run_release_recipe(&recipe, context, "", "false", "");
+    assert_release_trace(&stable_empty, context, "", "");
+    assert!(stable_empty.evidence.is_none());
+    for (switch, features) in [("true", ""), ("", "fixture-a"), ("maybe", "fixture-a")] {
+        let refused = run_release_recipe(&recipe, context, "", switch, features);
+        assert_eq!(refused.status, Some(2), "{}", refused.diagnostics);
+        assert!(refused.evidence.is_none());
+        assert!(
+            refused.trace.len() <= 1,
+            "no payload build after adapter refusal"
+        );
+    }
+    let missing = ReleaseRecipeContext {
+        target: "",
+        ..context
+    };
+    let recipe = render_release_recipe(&shared_release_recipe(), "inputs", missing);
+    let refused = run_release_recipe(&recipe, missing, "", "false", "fixture-a");
+    assert_eq!(refused.status, Some(2), "{}", refused.diagnostics);
+    assert!(
+        refused.trace.is_empty(),
+        "missing target must precede resolution"
+    );
+    assert!(refused.evidence.is_none());
+}
+
+#[test]
+fn shared_release_recipe_behavior_oracle_rejects_actual_recipe_mutations() {
+    let body = shared_release_recipe();
+    for (context, from, to) in [
+        (
+            0,
+            "--release --locked --no-default-features",
+            "--release --no-default-features",
+        ),
+        (0, "--no-default-features --features", "--features"),
+        (0, "--release --locked", "--profile dev --locked"),
+        (
+            0,
+            "BUILD_CMD=\"cargo build\"",
+            "BUILD_CMD=\"cargo build --jobs 2\"",
+        ),
+        (1, "BUILD_CMD=\"cross build\"", "BUILD_CMD=\"cargo build\""),
+        (2, "${{ inputs.linker }}", "ignored-linker"),
+        (5, "-C target-feature=-neon", "-C target-feature=+neon"),
+        (
+            2,
+            "--target \"${{ inputs.target }}\"",
+            "--target \"x86_64-unknown-linux-gnu\"",
+        ),
+        (8, "!= \"aarch64-linux-android\"", "= \"aarch64-linux-android\""),
+        (0, "-p zerocode", "-p zerorelay"),
+    ] {
+        let changed = body.replacen(from, to, 1);
+        assert_ne!(changed, body, "mutation must reach real recipe text: {from}");
+        let context = RELEASE_RECIPE_CONTEXTS[context];
+        let recipe = render_release_recipe(&changed, "inputs", context);
+        let observed =
+            run_release_recipe(&recipe, context, "", "false", "fixture-a,fixture-b");
+        assert!(
+            observed.status != Some(0)
+                || observed.trace != expected_release_trace(context, "", "fixture-a,fixture-b"),
+            "behavior oracle missed mutation {from:?} -> {to:?}: {}",
+            observed.diagnostics
+        );
+    }
+    // Masking each real failure must violate status/early-termination evidence,
+    // not merely a string-presence assertion.
+    for (stage, needle) in [
+        (
+            "generator",
+            "FEATURES=\"$(cargo run --quiet -p xtask --bin generate -- features --selection dist --target \"${{ inputs.target }}\")\"",
+        ),
+        (
+            "main",
+            "$BUILD_CMD --release --locked --no-default-features --features \"${FEATURES}\" --target ${{ inputs.target }}",
+        ),
+        (
+            "zerocode",
+            "$BUILD_CMD --release --locked -p zerocode --target ${{ inputs.target }}",
+        ),
+        (
+            "zerorelay",
+            "$BUILD_CMD --release --locked -p zerorelay --target ${{ inputs.target }}",
+        ),
+    ] {
+        let changed = body.replacen(needle, &format!("{needle} || true"), 1);
+        assert_ne!(changed, body, "failure mutation must reach {stage}");
+        let context = RELEASE_RECIPE_CONTEXTS[0];
+        let recipe = render_release_recipe(&changed, "inputs", context);
+        let observed =
+            run_release_recipe(&recipe, context, stage, "false", "fixture-a,fixture-b");
+        assert!(
+            observed.status != Some(83)
+                || observed.trace != expected_release_trace(context, stage, "fixture-a,fixture-b"),
+            "behavior oracle missed {stage} failure suppression: {}",
+            observed.diagnostics
+        );
+    }
+}
+
+#[test]
+fn shared_release_recipe_adapter_guards_have_failure_controls() {
+    let body = shared_release_recipe();
+    for (from, to, target, switch, features) in [
+        (
+            "if [ -z \"${{ inputs.target }}\" ]; then",
+            "if false; then",
+            "",
+            "false",
+            "fixture-a",
+        ),
+        (
+            "true|false) ;;",
+            "true|false|maybe) ;;",
+            "x86_64-unknown-linux-gnu",
+            "maybe",
+            "fixture-a",
+        ),
+        (
+            "if [ -z \"$FEATURES\" ]; then",
+            "if false; then",
+            "x86_64-unknown-linux-gnu",
+            "true",
+            "",
+        ),
+    ] {
+        let changed = body.replacen(from, to, 1);
+        assert_ne!(changed, body, "guard mutation must reach {from}");
+        let context = ReleaseRecipeContext {
+            target,
+            ..RELEASE_RECIPE_CONTEXTS[0]
+        };
+        let recipe = render_release_recipe(&changed, "inputs", context);
+        let observed = run_release_recipe(&recipe, context, "", switch, features);
+        assert_ne!(
+            observed.status,
+            Some(2),
+            "disabled guard must falsify its refusal: {from}: {}",
+            observed.diagnostics
+        );
+    }
+    let changed = body.replacen(
+        "if [ \"$RELEASE_FEATURES_EVIDENCE\" = \"true\" ]; then",
+        "if true; then",
+        1,
+    );
+    assert_ne!(changed, body, "emission guard mutation reaches the recipe");
+    let context = RELEASE_RECIPE_CONTEXTS[0];
+    let recipe = render_release_recipe(&changed, "inputs", context);
+    let observed = run_release_recipe(&recipe, context, "", "false", "fixture-a");
+    assert_ne!(
+        observed.status,
+        Some(0),
+        "Stable's absent output file must expose an unguarded write: {}",
+        observed.diagnostics
+    );
+}
+
 #[test]
 fn macos_desktop_release_notarizes_published_dmg() {
     let workflow_path =
