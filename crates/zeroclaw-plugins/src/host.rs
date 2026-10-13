@@ -130,6 +130,11 @@ pub struct ReplacedPackage {
 }
 
 /// What [`PluginHost::recover_interrupted_update`] found for one package.
+///
+/// Every outcome but `Nothing` carries `kept`: the generations marked for
+/// deletion that recovery found and could not delete, each with where it was
+/// left and why. [`UpdateRecovery::kept`] returns them whatever else recovery
+/// did.
 #[derive(Debug, PartialEq, Eq)]
 pub enum UpdateRecovery {
     /// There was nothing to put back or delete. Abandoned stages and empty
@@ -148,21 +153,44 @@ pub enum UpdateRecovery {
     /// claimed was put back and discovery ran again. The configured policy
     /// decides whether it is admitted; [`PluginHost::get_plugin`] says whether
     /// it was.
-    Restored,
+    Restored { kept: Vec<(PathBuf, String)> },
     /// The package is missing and more than one interrupted update claimed a
     /// generation of it, so which was installed last is not known. Nothing
     /// was moved.
-    Ambiguous { displaced: Vec<PathBuf> },
+    Ambiguous {
+        displaced: Vec<PathBuf>,
+        kept: Vec<(PathBuf, String)>,
+    },
     /// The package is not loaded, but something already occupies its name, so
     /// the claimed generation was not moved onto it.
     Occupied {
         displaced: PathBuf,
         occupant: PathBuf,
+        kept: Vec<(PathBuf, String)>,
     },
     /// [`PluginHost::sweep_interrupted_update`] found the package missing and
     /// a generation of it that an interrupted update claimed, and left the
     /// claim where it is: only recovering the package by name puts it back.
-    Displaced { displaced: Vec<PathBuf> },
+    Displaced {
+        displaced: Vec<PathBuf>,
+        kept: Vec<(PathBuf, String)>,
+    },
+}
+
+impl UpdateRecovery {
+    /// The generations marked for deletion that recovery found and could not
+    /// delete, whatever else it did: each with where it was left and why.
+    #[must_use]
+    pub fn kept(&self) -> &[(PathBuf, String)] {
+        match self {
+            Self::Nothing => &[],
+            Self::Swept { kept, .. }
+            | Self::Restored { kept }
+            | Self::Ambiguous { kept, .. }
+            | Self::Occupied { kept, .. }
+            | Self::Displaced { kept, .. } => kept,
+        }
+    }
 }
 
 impl PluginHost {
@@ -1337,20 +1365,18 @@ impl PluginHost {
                 Some(left) => kept.push(left),
             }
         }
-        let swept = if removed == 0 && kept.is_empty() {
-            UpdateRecovery::Nothing
-        } else {
-            UpdateRecovery::Swept { removed, kept }
-        };
-
+        // Whatever recovery does next, the generations it could not delete
+        // are reported with it.
         let held = match restorable.len() {
-            0 => return Ok(swept),
+            0 if removed == 0 && kept.is_empty() => return Ok(UpdateRecovery::Nothing),
+            0 => return Ok(UpdateRecovery::Swept { removed, kept }),
             _ if !restore => {
                 return Ok(UpdateRecovery::Displaced {
                     displaced: restorable
                         .iter()
                         .map(|tx| PathBuf::from(root.retained_path(tx)))
                         .collect(),
+                    kept,
                 });
             }
             1 => restorable.remove(0),
@@ -1360,6 +1386,7 @@ impl PluginHost {
                         .iter()
                         .map(|tx| PathBuf::from(root.retained_path(tx)))
                         .collect(),
+                    kept,
                 });
             }
         };
@@ -1368,6 +1395,7 @@ impl PluginHost {
                 return Ok(UpdateRecovery::Occupied {
                     displaced: PathBuf::from(root.retained_path(&held)),
                     occupant: self.plugins_dir.join(name),
+                    kept,
                 });
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1377,7 +1405,7 @@ impl PluginHost {
         let _ = held.finish(root);
         let current = self.rediscovered(name)?;
         set_loaded(&mut self.loaded, name, current);
-        Ok(UpdateRecovery::Restored)
+        Ok(UpdateRecovery::Restored { kept })
     }
 
     /// Packages an interrupted update left claimed: sorted names that are not
@@ -6233,7 +6261,7 @@ capabilities = ["tool"]
         assert_eq!(host.displaced_packages().unwrap(), ["weather"]);
         assert_eq!(
             host.recover_interrupted_update("weather").unwrap(),
-            UpdateRecovery::Restored
+            UpdateRecovery::Restored { kept: Vec::new() }
         );
         assert_eq!(package_bytes(&plugins.path().join("weather")), v1);
         assert_eq!(host.get_plugin("weather").unwrap().version, "1.0.0");
@@ -6288,7 +6316,7 @@ capabilities = ["tool"]
         assert_eq!(host.displaced_packages().unwrap(), ["weather"]);
         assert_eq!(
             host.recover_interrupted_update("weather").unwrap(),
-            UpdateRecovery::Restored
+            UpdateRecovery::Restored { kept: Vec::new() }
         );
         assert_eq!(package_bytes(&plugins.path().join("weather")), v1);
         assert_eq!(host.get_plugin("weather").unwrap().version, "1.0.0");
@@ -6312,7 +6340,8 @@ capabilities = ["tool"]
         assert_eq!(
             host.sweep_interrupted_update("weather").unwrap(),
             UpdateRecovery::Displaced {
-                displaced: vec![plugins.path().join(&entry).join(recovery::PACKAGE)]
+                displaced: vec![plugins.path().join(&entry).join(recovery::PACKAGE)],
+                kept: Vec::new(),
             }
         );
         assert!(!plugins.path().join("weather").exists());
@@ -6321,7 +6350,7 @@ capabilities = ["tool"]
 
         assert_eq!(
             host.recover_interrupted_update("weather").unwrap(),
-            UpdateRecovery::Restored
+            UpdateRecovery::Restored { kept: Vec::new() }
         );
         assert_eq!(package_bytes(&plugins.path().join("weather")), v1);
         assert!(hidden_entries(plugins.path()).is_empty());
@@ -6422,7 +6451,8 @@ capabilities = ["tool"]
         assert_eq!(
             host.recover_interrupted_update("weather").unwrap(),
             UpdateRecovery::Ambiguous {
-                displaced: expected.to_vec()
+                displaced: expected.to_vec(),
+                kept: Vec::new(),
             }
         );
         assert!(
@@ -6457,6 +6487,7 @@ capabilities = ["tool"]
                         .to_string()
                 ),
                 occupant: plugins.path().join("weather"),
+                kept: Vec::new(),
             }
         );
         assert_eq!(
@@ -6492,7 +6523,7 @@ capabilities = ["tool"]
 
         assert_eq!(
             host.recover_interrupted_update("weather").unwrap(),
-            UpdateRecovery::Restored
+            UpdateRecovery::Restored { kept: Vec::new() }
         );
         assert_eq!(package_bytes(&plugins.path().join("weather")), v1);
         assert!(hidden_entries(plugins.path()).is_empty());
@@ -6878,6 +6909,38 @@ capabilities = ["tool"]
             "{recovered:?}"
         );
         assert!(!plugins.path().join("weather").exists());
+        unlock(&left);
+    }
+
+    /// Recovery that puts a package back still reports a generation marked for
+    /// deletion that it could not delete, so the operator learns which hidden
+    /// copy is left.
+    #[cfg(unix)]
+    #[test]
+    fn recovery_that_restores_a_package_reports_a_generation_it_cannot_delete() {
+        if !permissions_can_block_a_delete() {
+            return;
+        }
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        install_tool_version(&mut host, "weather", "1.0.0", b"\0asm v1");
+        let old = abandon_claim(&host, "weather", true);
+        let left = plugins.path().join(&old).join(recovery::PACKAGE);
+        lock_a_file_inside(&left);
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        install_tool_version(&mut host, "weather", "2.0.0", b"\0asm v2");
+        let v2 = package_bytes(&plugins.path().join("weather"));
+        abandon_claim(&host, "weather", false);
+
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        let recovered = host.recover_interrupted_update("weather").unwrap();
+        assert!(
+            matches!(&recovered, UpdateRecovery::Restored { kept } if kept.len() == 1 && kept[0].0 == left),
+            "{recovered:?}"
+        );
+        assert_eq!(recovered.kept().len(), 1);
+        assert_eq!(package_bytes(&plugins.path().join("weather")), v2);
+        assert_eq!(host.get_plugin("weather").unwrap().version, "2.0.0");
         unlock(&left);
     }
 

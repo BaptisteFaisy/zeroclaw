@@ -743,7 +743,7 @@ fn an_update_stopped_after_its_claim_is_put_back_by_another_process() {
     let mut host = PluginHost::from_plugins_dir(root.path()).unwrap();
     assert_eq!(
         host.recover_interrupted_update("race").unwrap(),
-        UpdateRecovery::Restored
+        UpdateRecovery::Restored { kept: Vec::new() }
     );
     assert_eq!(tests::package_bytes(&root.path().join("race")), previous);
     assert!(
@@ -795,7 +795,7 @@ fn recovery_by_a_host_built_before_the_claim_puts_the_package_back() {
 
     assert_eq!(
         host.recover_interrupted_update("race").unwrap(),
-        UpdateRecovery::Restored
+        UpdateRecovery::Restored { kept: Vec::new() }
     );
     assert_eq!(tests::package_bytes(&root.path().join("race")), previous);
     assert!(
@@ -890,7 +890,10 @@ fn recovery_judges_installation_after_taking_the_lock() {
     updating.crash();
 
     let output = recovering.resume();
-    assert!(output.contains("RESULT:Ok(Restored)"), "{output}");
+    assert!(
+        output.contains("RESULT:Ok(Restored { kept: [] })"),
+        "{output}"
+    );
     assert_eq!(tests::package_bytes(&root.path().join("race")), previous);
     assert!(
         leftovers(root.path()).is_empty(),
