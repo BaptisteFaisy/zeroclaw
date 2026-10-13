@@ -129,7 +129,6 @@ fn yaml_block<'a>(document: &'a str, header: &str) -> &'a str {
     &remainder[..end]
 }
 
-
 // Immutable test-only reference from public 8b04361c24b99d5a700ac97f517308c2ed456650.
 // The production workflows must never consume this fixture. Its complete bytes,
 // rather than the edited caller or shallow Git history, pin the before recipe.
@@ -277,23 +276,20 @@ fn shared_release_recipe() -> String {
     let action = fs::read_to_string(action_path).expect("read shared release recipe");
     let step = yaml_block(&action, "    - id: build\n");
     assert!(step.contains("      shell: bash\n"));
-    assert!(step.contains(
-        "        RELEASE_FEATURES_EVIDENCE: ${{ inputs.emit_features }}\n"
-    ));
+    assert!(step.contains("        RELEASE_FEATURES_EVIDENCE: ${{ inputs.emit_features }}\n"));
     explicit_bash_body(step, "        ")
 }
 
-fn render_release_recipe(
-    body: &str,
-    namespace: &str,
-    context: ReleaseRecipeContext,
-) -> String {
+fn render_release_recipe(body: &str, namespace: &str, context: ReleaseRecipeContext) -> String {
     let mut body = body.to_string();
     for (field, value) in [
         ("target", context.target),
         ("linker_env", context.linker_env),
         ("linker", context.linker),
-        ("use_cross", if context.use_cross { "true" } else { "false" }),
+        (
+            "use_cross",
+            if context.use_cross { "true" } else { "false" },
+        ),
     ] {
         for expression in [
             format!("${{{{ {namespace}.{field} }}}}"),
@@ -479,7 +475,10 @@ fn immutable_stable_release_recipe_has_real_command_and_failure_baselines() {
     let old_step = yaml_block(build, "      - name: Build release\n");
     // Phase-1 gate: the active producer is still byte-identical. A later,
     // separately reviewed caller migration must replace only this assertion.
-    assert_eq!(explicit_bash_body(old_step, "          "), OLD_RELEASE_RECIPE);
+    assert_eq!(
+        explicit_bash_body(old_step, "          "),
+        OLD_RELEASE_RECIPE
+    );
     let matrix = yaml_block(build, "      matrix:\n");
     for context in RELEASE_RECIPE_CONTEXTS {
         let target_line = format!("            target: {}\n", context.target);
@@ -542,10 +541,12 @@ fn shared_release_recipe_preserves_all_ten_command_failure_contexts() {
             let observed =
                 run_release_recipe(&recipe, context, failure, "false", "fixture-a,fixture-b");
             assert_release_trace(&observed, context, failure, "fixture-a,fixture-b");
-            assert!(observed.evidence.is_none(), "Stable must not write evidence");
+            assert!(
+                observed.evidence.is_none(),
+                "Stable must not write evidence"
+            );
         }
-        let observed =
-            run_release_recipe(&recipe, context, "", "true", "fixture-a,fixture-b");
+        let observed = run_release_recipe(&recipe, context, "", "true", "fixture-a,fixture-b");
         assert_release_trace(&observed, context, "", "fixture-a,fixture-b");
         assert_eq!(
             observed.evidence.as_deref(),
@@ -608,15 +609,21 @@ fn shared_release_recipe_behavior_oracle_rejects_actual_recipe_mutations() {
             "--target \"${{ inputs.target }}\"",
             "--target \"x86_64-unknown-linux-gnu\"",
         ),
-        (8, "!= \"aarch64-linux-android\"", "= \"aarch64-linux-android\""),
+        (
+            8,
+            "!= \"aarch64-linux-android\"",
+            "= \"aarch64-linux-android\"",
+        ),
         (0, "-p zerocode", "-p zerorelay"),
     ] {
         let changed = body.replacen(from, to, 1);
-        assert_ne!(changed, body, "mutation must reach real recipe text: {from}");
+        assert_ne!(
+            changed, body,
+            "mutation must reach real recipe text: {from}"
+        );
         let context = RELEASE_RECIPE_CONTEXTS[context];
         let recipe = render_release_recipe(&changed, "inputs", context);
-        let observed =
-            run_release_recipe(&recipe, context, "", "false", "fixture-a,fixture-b");
+        let observed = run_release_recipe(&recipe, context, "", "false", "fixture-a,fixture-b");
         assert!(
             observed.status != Some(0)
                 || observed.trace != expected_release_trace(context, "", "fixture-a,fixture-b"),
@@ -648,8 +655,7 @@ fn shared_release_recipe_behavior_oracle_rejects_actual_recipe_mutations() {
         assert_ne!(changed, body, "failure mutation must reach {stage}");
         let context = RELEASE_RECIPE_CONTEXTS[0];
         let recipe = render_release_recipe(&changed, "inputs", context);
-        let observed =
-            run_release_recipe(&recipe, context, stage, "false", "fixture-a,fixture-b");
+        let observed = run_release_recipe(&recipe, context, stage, "false", "fixture-a,fixture-b");
         assert!(
             observed.status != Some(83)
                 || observed.trace != expected_release_trace(context, stage, "fixture-a,fixture-b"),
