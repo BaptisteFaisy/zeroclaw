@@ -495,8 +495,18 @@ pub(crate) fn field_descriptor(field: &ConfigField, hint: Option<&str>) -> Field
 /// secret, which `config set` reads through a masked prompt and trims, so a
 /// pasted token's stray space or line break never becomes part of it. Any
 /// other string keeps it.
+///
+/// A value picked from the closed list the schema declares is stored as
+/// listed, so an empty string listed there is a value, not a skipped answer:
+/// the list prompt offers nothing else, and the resolver accepts it. Only a
+/// typed answer that is empty, or a JSON or secret one that is blank, leaves
+/// the property unset. A secret is typed into a masked prompt even when the
+/// schema lists its values, so it follows the typed rule.
 #[must_use]
 pub(crate) fn encode_value(field: &ConfigField, raw: &str) -> Option<String> {
+    if field.choices.is_some() && !field.secret {
+        return Some(raw.to_string());
+    }
     let value = match field.kind {
         ValueKind::String if field.secret => raw.trim(),
         ValueKind::String => raw,
@@ -1337,6 +1347,56 @@ mod tests {
         );
         assert_eq!(encode_value(field("zone"), ""), None);
         assert_eq!(encode_value(field("retries"), "   "), None);
+    }
+
+    /// A value picked from a schema's closed list is stored as listed, so an
+    /// empty string the list declares is a value, unlike an empty typed answer.
+    #[test]
+    fn an_empty_string_picked_from_a_choice_list_is_a_value() {
+        let mut listed = schema();
+        listed["required"] = json!(["mode"]);
+        listed["properties"]["mode"] = json!({ "type": "string", "enum": ["", "auto"] });
+        listed["properties"]["masked"] =
+            json!({ "type": "string", "x-secret": true, "enum": ["", "x"] });
+        let fields = config_fields(&listed);
+        let field = |key: &str| {
+            fields
+                .fields
+                .iter()
+                .find(|field| field.key == key)
+                .expect("field is mapped")
+        };
+        assert_eq!(
+            field("mode").choices.as_deref(),
+            Some(&["".to_string(), "auto".to_string()][..]),
+            "the empty value is offered like any other listed one"
+        );
+        assert_eq!(encode_value(field("mode"), ""), Some(String::new()));
+        assert_eq!(
+            encode_value(field("mode"), "auto"),
+            Some("auto".to_string())
+        );
+        assert_eq!(
+            encode_value(field("level"), "high"),
+            Some("high".to_string()),
+            "a listed value is stored as listed"
+        );
+        assert_eq!(
+            encode_value(field("verbose"), "true"),
+            Some("true".to_string()),
+            "a boolean choice too"
+        );
+        assert_eq!(
+            encode_value(field("masked"), " \n "),
+            None,
+            "a secret is typed into a masked prompt even when its values are listed, so \
+             a blank answer still leaves it unset"
+        );
+        assert_eq!(
+            encode_value(field("zone"), ""),
+            None,
+            "an empty typed answer is a skip"
+        );
     }
 
     fn inputs<'a>(

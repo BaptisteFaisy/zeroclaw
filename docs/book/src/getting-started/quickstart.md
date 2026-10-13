@@ -170,7 +170,10 @@ at a time, through the pipeline `zeroclaw plugin install` uses:
    the settings it describes: required properties first, optional ones only if
    you ask for them. Properties marked `x-secret` are masked as you type them,
    and spaces or line breaks around a secret value are dropped, as
-   `zeroclaw config set` drops them. The values are checked against the schema
+   `zeroclaw config set` drops them. A value picked from a list is stored
+   exactly as the schema lists it, an empty string included, while an empty
+   typed answer leaves an optional setting unset. The values are checked
+   against the schema
    before anything is written; after a failed check you get one more try, then
    Quickstart asks whether to install the plugin without them. Pressing Esc at
    a required setting that is secret or picked from a list skips the plugin.

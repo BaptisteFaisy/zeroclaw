@@ -5990,6 +5990,64 @@ type = "string"
         }
     }
 
+    const LISTED_EMPTY_MANIFEST: &str = r#"name = "listed-tool"
+version = "0.1.0"
+wasm_path = "tool-fixture.wasm"
+capabilities = ["tool"]
+permissions = ["config_read"]
+
+[config_schema]
+"$schema" = "https://json-schema.org/draft/2020-12/schema"
+type = "object"
+additionalProperties = false
+required = ["mode"]
+
+[config_schema.properties.mode]
+type = "string"
+enum = ["", "auto"]
+"#;
+
+    /// An empty string a schema lists among a setting's values is picked from
+    /// the list like any other value and stored as listed. The resolver
+    /// accepts the row, so the package is configured instead of being reported
+    /// as missing its required setting and offered without settings.
+    #[test]
+    fn an_empty_value_picked_from_a_list_configures_the_setting() {
+        let manifest: PluginManifest =
+            toml::from_str(LISTED_EMPTY_MANIFEST).expect("the manifest parses");
+        let mut prompter = ScriptedPrompter::new([Answer::Field(Some(String::new()))]);
+
+        let settings = collect_settings(&manifest, &mut prompter)
+            .expect("no prompt fails")
+            .expect("the package is configured, not offered without settings");
+
+        prompter.assert_done();
+        assert_eq!(prompter.fields.len(), 1, "one setting is asked");
+        assert_eq!(
+            prompter.fields[0].enum_variants.as_deref(),
+            Some(&[String::new(), "auto".to_string()][..]),
+            "the empty value is offered from the list like any other"
+        );
+        assert_eq!(
+            settings.values,
+            BTreeMap::from([("mode".to_string(), String::new())]),
+            "the empty value is stored as listed"
+        );
+        assert!(
+            prompter.confirm_prompts.is_empty(),
+            "no install-without-settings question: {:?}",
+            prompter.confirm_prompts
+        );
+        assert_eq!(
+            prompter.said,
+            vec![indented(&qta(
+                "cli-quickstart-plugins-config-heading",
+                &[("name", "listed-tool")]
+            ))],
+            "nothing beyond the settings heading was printed: no validation failure"
+        );
+    }
+
     /// A skill package `notes`, unsigned, installed long before this run and
     /// never activated.
     fn install_dormant_skill(workspace: &Workspace) {
