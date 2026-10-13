@@ -137,10 +137,10 @@ failure.
 
 `zeroclaw plugin install` builds a package in a unique hidden transaction
 inside the plugins directory and holds an operating-system lease through
-publication. It moves the package into place without replacing an occupant
-that holds files, only after the manifest, component, and any `skills/` tree
-are written. On a filesystem without a no-replace rename, an empty directory at
-the name can be replaced. A failed or interrupted write leaves no partial package under the
+publication. It moves the package into place without replacing any occupant,
+only after the manifest, component, and any `skills/` tree are written. If the
+platform or filesystem cannot provide an atomic no-replace move, installation
+refuses and reports the retained hidden package. A failed or interrupted write leaves no partial package under the
 final name. Discovery ignores hidden transactions, and a later install uses
 fresh staging instead of replacing another process's stage.
 
@@ -193,8 +193,9 @@ that its signature no longer verifies, is refused for its signature even
 though its component is missing.
 
 A refused claimed package is restored without replacing any concurrent
-occupant that holds files. On a filesystem without a no-replace rename, an
-empty directory at the name can be replaced. If restoration cannot finish, its bytes remain at the reported
+occupant, including an empty directory. Recovery refuses a claim or restoration
+when the platform or filesystem cannot provide an atomic no-replace move.
+If restoration cannot finish, its bytes remain at the reported
 hidden location; the original name is not necessarily untouched. Retrying
 `plugin remove` restores a retained recovery transaction before checking
 admission again. A delete that `plugin remove` had begun is finished instead:

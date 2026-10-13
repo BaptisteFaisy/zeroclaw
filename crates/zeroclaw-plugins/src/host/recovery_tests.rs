@@ -9,6 +9,22 @@ fn recovery_process_child() {
         return;
     };
     let mut host = PluginHost::from_plugins_dir(Path::new(&root)).unwrap();
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    if matches!(
+        std::env::var("ZC_RECOVERY_ACTION").as_deref(),
+        Ok("rename-claim" | "unsupported-claim")
+    ) {
+        let root = host.root().unwrap();
+        let tx = root.transaction("race", "recovering").unwrap();
+        println!("TRANSACTION:{}", tx.entry);
+        std::io::stdout().flush().unwrap();
+        if std::env::var("ZC_RECOVERY_ACTION").as_deref() == Ok("unsupported-claim") {
+            recovery::FORCE_RENAME_ERROR.with(|error| error.set(Some(rustix::io::Errno::NOSYS)));
+        }
+        let result = tx.claim(root, "race");
+        println!("RESULT:{result:?}");
+        return;
+    }
     if std::env::var("ZC_RECOVERY_ACTION").as_deref() == Ok("stage") {
         let tx = host
             .root()
@@ -161,6 +177,100 @@ fn broken(root: &Path) {
 fn healthy(root: &Path) -> Vec<(String, Vec<u8>)> {
     tests::write_tool_source(&root.join("race"), "race", b"\0asm healthy replacement");
     tests::package_bytes(&root.join("race"))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+#[test]
+fn unsupported_claim_preserves_source_substitution_and_destination_file() {
+    let root = tempfile::tempdir().unwrap();
+    broken(root.path());
+    let original = same_file::Handle::from_path(root.path().join("race")).unwrap();
+    let paused = Paused::start(root.path(), "rename-before-move", "unsupported-claim");
+    let transaction = paused
+        .lines
+        .lines()
+        .find_map(|line| line.strip_prefix("TRANSACTION:"))
+        .unwrap();
+    let destination = root.path().join(transaction).join(recovery::PACKAGE);
+    std::fs::rename(root.path().join("race"), root.path().join("original")).unwrap();
+    std::fs::write(root.path().join("race"), b"substituted source").unwrap();
+    std::fs::write(&destination, b"destination sentinel").unwrap();
+    let source_id = same_file::Handle::from_path(root.path().join("race")).unwrap();
+    let destination_id = same_file::Handle::from_path(&destination).unwrap();
+
+    let output = paused.resume();
+    assert_eq!(
+        std::fs::read(&destination).unwrap(),
+        b"destination sentinel"
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("race")).unwrap(),
+        b"substituted source"
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("original/manifest.toml")).unwrap(),
+        b"name ="
+    );
+    assert_eq!(
+        same_file::Handle::from_path(root.path().join("original")).unwrap(),
+        original
+    );
+    assert_eq!(
+        same_file::Handle::from_path(root.path().join("race")).unwrap(),
+        source_id
+    );
+    assert_eq!(
+        same_file::Handle::from_path(&destination).unwrap(),
+        destination_id
+    );
+    assert!(output.contains("Unsupported"), "{output}");
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+#[test]
+fn atomic_claim_preserves_source_substitution_and_destination_file() {
+    let root = tempfile::tempdir().unwrap();
+    broken(root.path());
+    let original = same_file::Handle::from_path(root.path().join("race")).unwrap();
+    let paused = Paused::start(root.path(), "rename-before-move", "rename-claim");
+    let transaction = paused
+        .lines
+        .lines()
+        .find_map(|line| line.strip_prefix("TRANSACTION:"))
+        .unwrap();
+    let destination = root.path().join(transaction).join(recovery::PACKAGE);
+    std::fs::rename(root.path().join("race"), root.path().join("original")).unwrap();
+    std::fs::write(root.path().join("race"), b"substituted source").unwrap();
+    std::fs::write(&destination, b"destination sentinel").unwrap();
+    let source_id = same_file::Handle::from_path(root.path().join("race")).unwrap();
+    let destination_id = same_file::Handle::from_path(&destination).unwrap();
+
+    let output = paused.resume();
+    assert_eq!(
+        std::fs::read(&destination).unwrap(),
+        b"destination sentinel"
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("race")).unwrap(),
+        b"substituted source"
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("original/manifest.toml")).unwrap(),
+        b"name ="
+    );
+    assert_eq!(
+        same_file::Handle::from_path(root.path().join("original")).unwrap(),
+        original
+    );
+    assert_eq!(
+        same_file::Handle::from_path(root.path().join("race")).unwrap(),
+        source_id
+    );
+    assert_eq!(
+        same_file::Handle::from_path(&destination).unwrap(),
+        destination_id
+    );
+    assert!(output.contains("RESULT:Err(Io"), "{output}");
 }
 
 #[test]
