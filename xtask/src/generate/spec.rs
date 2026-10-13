@@ -1848,7 +1848,8 @@ mod tests {
     /// The `target:` entries of one job's matrix, whether an entry starts
     /// with the target or lists it after another field.
     fn matrix_targets(job: &str) -> Vec<String> {
-        job.lines()
+        job_block(job_block(job, "    strategy:\n"), "      matrix:\n")
+            .lines()
             .map(|line| line.trim())
             .map(|line| line.strip_prefix("- ").unwrap_or(line))
             .filter_map(|line| line.strip_prefix("target: "))
@@ -1892,6 +1893,16 @@ mod tests {
             matrix_targets(job_block(&manual, "  stable-gnu-plugin-smoke:\n")),
             ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
         );
+        let release_build = job_block(&release, "  build:\n");
+        for outside in ["outside-matrix", "x86_64-unknown-linux-gnu"] {
+            let contaminated = release_build.replacen(
+                "target: ${{ matrix.target }}",
+                &format!("target: {outside}"),
+                1,
+            );
+            assert_ne!(contaminated, release_build);
+            assert_eq!(matrix_targets(&contaminated), build_targets);
+        }
         for target in &smoke_targets {
             assert!(
                 build_targets.contains(target),

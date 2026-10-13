@@ -846,7 +846,13 @@ fn manual_qualification_admission_refuses_incompatible_and_malformed_inputs() {
         assert!(observed.trace.is_empty());
     }
     for (before, after, profile, distribution, tools) in [
-        ("normal|stable-gnu-ubuntu22)", "*)", "unknown", "dist", "false"),
+        (
+            "normal|stable-gnu-ubuntu22)",
+            "*)",
+            "unknown",
+            "dist",
+            "false",
+        ),
         ("dist|dist-broad)", "*)", "normal", "unknown", "false"),
         ("true|false)", "*)", "normal", "dist", "False"),
         (
@@ -865,7 +871,12 @@ fn manual_qualification_admission_refuses_incompatible_and_malformed_inputs() {
         ),
     ] {
         assert!(guard.contains(before));
-        let observed = check(&guard.replacen(before, after, 1), profile, distribution, tools);
+        let observed = check(
+            &guard.replacen(before, after, 1),
+            profile,
+            distribution,
+            tools,
+        );
         assert_eq!(
             observed.status,
             Some(0),
@@ -878,9 +889,11 @@ fn manual_qualification_admission_refuses_incompatible_and_malformed_inputs() {
 fn manual_qualification_completeness_requires_every_actual_role_success() {
     let manual = workflow("cross-platform-build-manual.yml");
     let job = yaml_block(&manual, "  stable-gnu-complete:\n");
-    assert!(job.contains(
-        "if: ${{ always() && inputs.qualification_profile == 'stable-gnu-ubuntu22' }}"
-    ));
+    assert!(
+        job.contains(
+            "if: ${{ always() && inputs.qualification_profile == 'stable-gnu-ubuntu22' }}"
+        )
+    );
     assert!(job.contains(
         "needs: [release-tool-smoke, stable-gnu-web, stable-gnu-plugin-smoke-packages, stable-gnu-build, stable-gnu-plugin-smoke]"
     ));
@@ -903,9 +916,11 @@ fn manual_qualification_completeness_requires_every_actual_role_success() {
                 "TOOLS_RESULT='{}'\nWEB_RESULT='{}'\nFIXTURES_RESULT='{}'\nBUILD_RESULT='{}'\nNATIVE_RESULT='{}'\n{}",
                 results[0], results[1], results[2], results[3], results[4], guard
             );
-            let observed =
-                run_release_recipe(&script, RELEASE_RECIPE_CONTEXTS[0], "", "false", "");
-            assert_eq!(observed.status, Some(if result == "success" { 0 } else { 2 }));
+            let observed = run_release_recipe(&script, RELEASE_RECIPE_CONTEXTS[0], "", "false", "");
+            assert_eq!(
+                observed.status,
+                Some(if result == "success" { 0 } else { 2 })
+            );
         }
     }
     let mutant = guard.replacen("success/success/success/success/success)", "*)", 1);
@@ -930,9 +945,7 @@ fn assert_manual_qualification_wiring(manual: &str) {
         let job = yaml_block(manual, &format!("  {job_id}:\n"));
         assert!(job.contains("needs: [release-tool-smoke"));
         assert!(job.contains("if: ${{ inputs.qualification_profile == 'stable-gnu-ubuntu22' }}"));
-        assert!(job.contains(
-            "dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537"
-        ));
+        assert!(job.contains("dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537"));
         assert!(job.contains("toolchain: 1.98.0"));
         assert!(!job.contains("CARGO_INCREMENTAL:"));
         let receipt_header = match role {
@@ -965,32 +978,54 @@ fn assert_manual_qualification_wiring(manual: &str) {
     assert!(!build.contains("--jobs") && !build.contains("dist_runner_memory"));
     assert!(!build.contains("cache-targets:"));
     assert_release_caller(yaml_block(build, "      - name: Build release\n"), "true");
-    let inputs = yaml_block(build, "      - name: Record input manifest and ABI observations\n");
+    let inputs = yaml_block(
+        build,
+        "      - name: Record input manifest and ABI observations\n",
+    );
     assert!(inputs.contains("FEATURES: ${{ steps.payloads.outputs.features }}"));
     let body = explicit_bash_body(inputs, "          ");
     assert!(body.contains("test -n \"$FEATURES\"\n"));
-    assert!(body.contains("--features \"$FEATURES\" --output archive-evidence/input-manifest.json"));
+    assert!(
+        body.contains("--features \"$FEATURES\" --output archive-evidence/input-manifest.json")
+    );
     assert_eq!(body.matches("--companion ").count(), 2);
     assert!(body.contains("for name in zeroclaw zerocode zerorelay; do"));
     assert!(body.contains("readelf --file-header --program-headers --dynamic --version-info"));
     assert!(body.contains("\"$compiler\" -print-sysroot"));
     assert!(build.contains("BINARY_SIZE_HARD_LIMIT: \"83886080\""));
-    let size = build.find("- name: Check standard main binary size").unwrap();
-    let manifest = build.find("- name: Record input manifest and ABI observations").unwrap();
-    let package = build.find("- name: Package and verify standard release archive").unwrap();
-    let receipt = build.find("- name: Bind archive qualification receipts").unwrap();
+    let size = build
+        .find("- name: Check standard main binary size")
+        .unwrap();
+    let manifest = build
+        .find("- name: Record input manifest and ABI observations")
+        .unwrap();
+    let package = build
+        .find("- name: Package and verify standard release archive")
+        .unwrap();
+    let receipt = build
+        .find("- name: Bind archive qualification receipts")
+        .unwrap();
     assert!(size < manifest && manifest < package && package < receipt);
     let native = yaml_block(manual, "  stable-gnu-plugin-smoke:\n");
-    assert!(native.contains("needs: [release-tool-smoke, stable-gnu-build, stable-gnu-plugin-smoke-packages]"));
+    assert!(native.contains(
+        "needs: [release-tool-smoke, stable-gnu-build, stable-gnu-plugin-smoke-packages]"
+    ));
     assert!(native.contains("timeout-minutes: 30"));
     assert!(native.contains("- os: ubuntu-22.04\n            target: x86_64-unknown-linux-gnu"));
-    assert!(native.contains("- os: ubuntu-24.04-arm\n            target: aarch64-unknown-linux-gnu"));
+    assert!(
+        native.contains("- os: ubuntu-24.04-arm\n            target: aarch64-unknown-linux-gnu")
+    );
     assert_eq!(matrix_targets(native).len(), 2);
     let provider = yaml_block(native, "      - name: Run scripted provider tests\n");
     assert!(provider.contains("timeout-minutes: 5"));
-    assert!(provider.contains("scripts/ci/plugin_smoke_provider_test.py -v 2>&1 | tee native/provider-tests.log"));
+    assert!(provider.contains(
+        "scripts/ci/plugin_smoke_provider_test.py -v 2>&1 | tee native/provider-tests.log"
+    ));
     assert!(provider.contains("set -euo pipefail"));
-    let smoke = yaml_block(native, "      - name: Run the plugin smoke against the built binary\n");
+    let smoke = yaml_block(
+        native,
+        "      - name: Run the plugin smoke against the built binary\n",
+    );
     assert!(!smoke.contains("if:") && !smoke.contains("continue-on-error"));
     assert!(smoke.contains("--archive \"${{ steps.archive.outputs.archive }}\""));
     assert!(!native.contains("inputs.distribution") && !native.contains("path: binary"));
@@ -1002,7 +1037,11 @@ fn assert_manual_qualification_wiring(manual: &str) {
     );
     let complete = yaml_block(manual, "  stable-gnu-complete:\n");
     assert!(complete.contains("needs: [release-tool-smoke, stable-gnu-web, stable-gnu-plugin-smoke-packages, stable-gnu-build, stable-gnu-plugin-smoke]"));
-    assert!(complete.contains("if: ${{ always() && inputs.qualification_profile == 'stable-gnu-ubuntu22' }}"));
+    assert!(
+        complete.contains(
+            "if: ${{ always() && inputs.qualification_profile == 'stable-gnu-ubuntu22' }}"
+        )
+    );
     assert!(complete.contains("assert inputs == 12"));
     assert!(complete.contains(r#"assert receipt["cache"]["cargo_incremental"] == "0""#));
     assert!(!complete.contains(".removeprefix("));
@@ -1069,7 +1108,10 @@ fn manual_qualification_wiring_rejects_actual_cache_output_and_dependency_mutant
     assert!(exposed.diagnostics.contains("controlled manifest boundary"));
     for (job, step) in [
         ("stable-gnu-web", "Record same-run web inputs"),
-        ("stable-gnu-plugin-smoke-packages", "Record same-run fixture inputs"),
+        (
+            "stable-gnu-plugin-smoke-packages",
+            "Record same-run fixture inputs",
+        ),
         ("stable-gnu-build", "Bind archive qualification receipts"),
     ] {
         let body = explicit_bash_body(
@@ -1257,7 +1299,12 @@ test -n "$python_program"
         "bad-provider-log-digest",
     ] {
         let refused = check(inventory, mutation);
-        assert_eq!(refused.status, Some(1), "{mutation}: {}", refused.diagnostics);
+        assert_eq!(
+            refused.status,
+            Some(1),
+            "{mutation}: {}",
+            refused.diagnostics
+        );
     }
     for (before, after, mutation) in [
         (
