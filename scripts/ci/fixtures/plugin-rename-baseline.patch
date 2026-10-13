@@ -1,0 +1,99 @@
+--- a/crates/zeroclaw-plugins/src/host/recovery.rs
++++ b/crates/zeroclaw-plugins/src/host/recovery.rs
+@@ -319,16 +319,21 @@
+     }
+ }
+ 
+-/// Move a package without replacing any existing destination. Refuse when the
+-/// platform or filesystem cannot enforce that atomically: checking an entry's
+-/// type before a replacing rename does not pin the entry against substitution.
+-/// Only single entry names reach this helper.
++/// Move a directory without replacing an existing destination where the
++/// filesystem can, and with [`rename_directory`] where it cannot. Only single
++/// entry names reach this helper.
+ #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+ fn rename_new(from: &Dir, name: &str, to: &Dir, dest: &str) -> std::io::Result<()> {
+     use rustix::io::Errno;
+ 
+     #[cfg(test)]
+-    pause("rename-before-move");
++    if FORCE_PLAIN_RENAME.with(std::cell::Cell::get) {
++        return rename_directory(from, name, to, dest);
++    }
++    #[cfg(test)]
++    if FORCE_RENAME_ERROR.with(std::cell::Cell::get).is_none() {
++        pause("rename-before-move");
++    }
+     let rename =
+         || rustix::fs::renameat_with(from, name, to, dest, rustix::fs::RenameFlags::NOREPLACE);
+     #[cfg(test)]
+@@ -338,28 +343,47 @@
+     #[cfg(not(test))]
+     let result = rename();
+     match result {
++        // The filesystem or kernel has no no-replace rename: an NFS client
++        // refuses any rename flag with EINVAL, and Linux before 3.15 or a FUSE
++        // server without rename2 answers ENOSYS or EOPNOTSUPP.
+         Err(errno)
+             if [Errno::INVAL, Errno::NOSYS, Errno::NOTSUP, Errno::OPNOTSUPP].contains(&errno) =>
+         {
+-            Err(std::io::Error::new(
+-                std::io::ErrorKind::Unsupported,
+-                format!("atomic no-replace package move unavailable ({errno})"),
+-            ))
++            rename_directory(from, name, to, dest)
+         }
+         result => result.map_err(std::io::Error::from),
+     }
+ }
+ 
+-/// No atomic no-replace primitive is wired for other Unix platforms.
++/// Other Unix platforms have no no-replace rename.
+ #[cfg(all(
+     unix,
+     not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
+ ))]
+-fn rename_new(_: &Dir, _: &str, _: &Dir, _: &str) -> std::io::Result<()> {
+-    Err(std::io::Error::new(
+-        std::io::ErrorKind::Unsupported,
+-        "atomic no-replace package move unavailable",
+-    ))
++fn rename_new(from: &Dir, name: &str, to: &Dir, dest: &str) -> std::io::Result<()> {
++    rename_directory(from, name, to, dest)
++}
++
++/// Move a directory with a plain rename where no no-replace rename exists.
++/// Renamed over an existing entry, a directory replaces at most an empty
++/// directory, because rename refuses a non-empty one and a non-directory, so no
++/// bytes are lost. Nothing but a directory moves this way: a renamed file would
++/// replace a file at the destination.
++#[cfg(unix)]
++fn rename_directory(from: &Dir, name: &str, to: &Dir, dest: &str) -> std::io::Result<()> {
++    use rustix::fs::{AtFlags, FileType};
++
++    let source = rustix::fs::statat(from, name, AtFlags::SYMLINK_NOFOLLOW)?;
++    if FileType::from_raw_mode(source.st_mode) != FileType::Directory {
++        return Err(std::io::Error::new(
++            std::io::ErrorKind::Unsupported,
++            "only a directory moves without a no-replace rename",
++        ));
++    }
++    #[cfg(test)]
++    pause("rename-before-move");
++    rustix::fs::renameat(from, name, to, dest)?;
++    Ok(())
+ }
+ 
+ #[cfg(all(
+@@ -367,7 +391,10 @@
+     any(target_os = "linux", target_os = "android", target_vendor = "apple")
+ ))]
+ thread_local! {
+-    /// Override the atomic primitive's result without changing its error path.
++    /// Set by a test to move packages the way a platform without a no-replace
++    /// rename does.
++    pub(super) static FORCE_PLAIN_RENAME: std::cell::Cell<bool> =
++        const { std::cell::Cell::new(false) };
+     pub(super) static FORCE_RENAME_ERROR: std::cell::Cell<Option<rustix::io::Errno>> =
+         const { std::cell::Cell::new(None) };
+ }

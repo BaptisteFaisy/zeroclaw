@@ -1,0 +1,11 @@
+--- a/crates/zeroclaw-plugins/src/host/recovery.rs
++++ b/crates/zeroclaw-plugins/src/host/recovery.rs
+@@ -330,7 +330,7 @@
+     #[cfg(test)]
+     pause("rename-before-move");
+     let rename =
+-        || rustix::fs::renameat_with(from, name, to, dest, rustix::fs::RenameFlags::NOREPLACE);
++        || rustix::fs::renameat_with(from, name, to, dest, rustix::fs::RenameFlags::empty());
+     #[cfg(test)]
+     let result = FORCE_RENAME_ERROR
+         .with(std::cell::Cell::get)

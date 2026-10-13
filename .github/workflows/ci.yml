@@ -822,6 +822,9 @@ jobs:
       - name: Run plugins lib unit tests
         if: steps.changed.outputs.run == 'true' && matrix.suite == 'components'
         run: cargo test --locked -p zeroclaw-plugins --no-default-features --features plugins-wasm-cranelift --lib
+      - name: Qualify plugin no-replace guards
+        if: github.event.pull_request.number == 11236 && steps.changed.outputs.run == 'true' && matrix.suite == 'components'
+        run: bash scripts/ci/plugin_rename_guard_qualification.sh
       - name: Run runtime live-config plugin regressions
         if: steps.changed.outputs.run == 'true' && matrix.suite == 'runtime'
         # Module filter, not a single test name: agent::plugin_live_config holds
