@@ -24395,42 +24395,48 @@ mod tests {
     }
 
     /// A `rolling` log writer persisting under a temporary directory, so
-    /// `logs/query` and `logs/get` read a real log. Dropping it installs a
-    /// disabled writer, so neither a later test nor a failed assertion here
-    /// leaves a writer on the removed directory. Hold the writer test lock
-    /// for its whole life.
-    struct PersistedLog(tempfile::TempDir);
+    /// `logs/query` and `logs/get` read a real log. It holds the writer test
+    /// lock for its whole life. Its `Drop` runs before its fields drop, so the
+    /// disabled writer it installs goes in while the lock is still held, and
+    /// neither a later test nor a failed assertion here leaves a writer on the
+    /// removed directory.
+    struct PersistedLog<G> {
+        dir: tempfile::TempDir,
+        _writer_guard: G,
+    }
 
-    impl PersistedLog {
-        fn install() -> Self {
-            // The capture layer carries `record!`, and with it the gate's
-            // denial records, to the writer.
-            zeroclaw_log::try_install_capture_subscriber();
-            let dir = tempfile::TempDir::new().expect("a temporary log directory");
-            zeroclaw_log::init_from_config(&Self::config("rolling"), dir.path());
-            Self(dir)
-        }
-
-        fn config(log_persistence: &str) -> zeroclaw_log::LogConfig {
-            zeroclaw_log::LogConfig {
-                log_persistence: log_persistence.into(),
-                log_persistence_path: "state/runtime-trace.jsonl".into(),
-                ..Default::default()
-            }
+    fn persisted_log() -> PersistedLog<impl Drop> {
+        let writer_guard = zeroclaw_log::__private_test_writer_lock();
+        // The capture layer carries `record!`, and with it the RPC denial
+        // records, to the writer.
+        zeroclaw_log::try_install_capture_subscriber();
+        let dir = tempfile::TempDir::new().expect("a temporary log directory");
+        zeroclaw_log::init_from_config(&persisted_log_config("rolling"), dir.path());
+        PersistedLog {
+            dir,
+            _writer_guard: writer_guard,
         }
     }
 
-    impl Drop for PersistedLog {
+    fn persisted_log_config(log_persistence: &str) -> zeroclaw_log::LogConfig {
+        zeroclaw_log::LogConfig {
+            log_persistence: log_persistence.into(),
+            log_persistence_path: "state/runtime-trace.jsonl".into(),
+            ..Default::default()
+        }
+    }
+
+    impl<G> Drop for PersistedLog<G> {
         fn drop(&mut self) {
-            zeroclaw_log::init_from_config(&Self::config("none"), self.0.path());
+            zeroclaw_log::init_from_config(&persisted_log_config("none"), self.dir.path());
         }
     }
 
     /// [`cron_roster_config_in`] plus readers of the persisted log: `alice`,
-    /// scoped to `alpha`, also holds `Logs:Read`; `erin` (uid 4747) holds
-    /// `Logs:Read` with every agent (`*`); `dave` (uid 4545) is an
-    /// administrator that also holds `Logs:Read` explicitly, so demoting it
-    /// leaves the grant in place.
+    /// scoped to `alpha`, also holds `Logs:Read`; `zeroclaw_user` (uid 4747)
+    /// holds `Logs:Read` with every agent (`*`); `zeroclaw_maintainer` (uid
+    /// 4545) is an administrator that also holds `Logs:Read` explicitly, so
+    /// demoting it leaves the grant in place.
     fn log_reader_roster_in(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
         use zeroclaw_api::grants::{Resource, Verb, WILDCARD};
         use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
@@ -24444,7 +24450,7 @@ mod tests {
         let log_reads = || std::collections::HashMap::from([(Resource::Logs, vec![Verb::Read])]);
         for (name, uid, profile) in [
             (
-                "erin",
+                "zeroclaw_user",
                 4747,
                 PermissionProfileConfig {
                     allowed_agents: vec![WILDCARD.into()],
@@ -24453,7 +24459,7 @@ mod tests {
                 },
             ),
             (
-                "dave",
+                "zeroclaw_maintainer",
                 4545,
                 PermissionProfileConfig {
                     admin: true,
@@ -24477,10 +24483,10 @@ mod tests {
 
     /// Persist the audit record of a refusal its client never sees as one:
     /// `alice` asks `cron/get` for `job_id`, a `beta` job, and is told it was
-    /// not found, the answer a missing job gets, while the gate records the
-    /// owning agent and the job. Returns the record as the administrator
-    /// (`dave`) reads it through `logs/query`, so a refusal asserted
-    /// afterwards cannot pass on an empty log.
+    /// not found, the answer a missing job gets, while its cron entitlement
+    /// guard records the owning agent and the job. Returns the record as the
+    /// administrator (`zeroclaw_maintainer`) reads it through `logs/query`, so
+    /// a refusal asserted afterwards cannot pass on an empty log.
     async fn persisted_cron_denial(ctx: &Arc<RpcContext>, job_id: &str) -> Value {
         let (mut alice, mut rx) = roster_peer(ctx, 4242).await;
         let masked = rpc(&mut alice, &mut rx, 1, "cron/get", json!({"id": job_id})).await;
@@ -24505,11 +24511,10 @@ mod tests {
     /// and `logs/get` follow the global streams' rule. A principal scoped to
     /// one agent or to every agent (`*`) is refused even with `Logs:Read`,
     /// and cannot learn from the log that the job it was told does not exist
-    /// is `beta`'s.
+    /// is `beta`'s. Each refusal is audited like the streams' refusals.
     #[tokio::test]
     async fn persisted_log_reads_refuse_a_scoped_principal() {
-        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
-        let _log = PersistedLog::install();
+        let _log = persisted_log();
         let tmp = tempfile::TempDir::new().unwrap();
         let config = log_reader_roster_in(&tmp);
         let beta = seed_cron_job(&config, "beta", "beta-job");
@@ -24534,6 +24539,32 @@ mod tests {
                 );
             }
         }
+
+        zeroclaw_log::flush_for_test().expect("the log writer flushes");
+        let (mut admin, mut rx) = roster_peer(&ctx, 4545).await;
+        let page = rpc(
+            &mut admin,
+            &mut rx,
+            1,
+            "logs/query",
+            json!({"action": "reject", "q": "logs/", "limit": 100}),
+        )
+        .await;
+        let denials = page["result"]["events"]
+            .as_array()
+            .unwrap_or_else(|| panic!("an administrator reads the denials: {page}"));
+        for principal in ["user:alice", "user:zeroclaw_user"] {
+            for method in ["logs/query", "logs/get"] {
+                assert!(
+                    denials.iter().any(|event| {
+                        event["attributes"]["principal_id"] == json!(principal)
+                            && event["attributes"]["method"] == json!(method)
+                            && event["attributes"]["code"] == json!(FORBIDDEN)
+                    }),
+                    "{principal}'s refused {method} must leave a denial record: {page}"
+                );
+            }
+        }
     }
 
     /// An administrator and the shared operator read the persisted log
@@ -24543,8 +24574,7 @@ mod tests {
     /// bound under.
     #[tokio::test]
     async fn persisted_log_reads_serve_unscoped_principals_until_demoted() {
-        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
-        let _log = PersistedLog::install();
+        let _log = persisted_log();
         let tmp = tempfile::TempDir::new().unwrap();
         let config = log_reader_roster_in(&tmp);
         let beta = seed_cron_job(&config, "beta", "beta-job");
@@ -24576,12 +24606,12 @@ mod tests {
         }
 
         let mut demoted = config;
-        let dave = demoted
+        let maintainer = demoted
             .permission_profiles
-            .get_mut("dave")
+            .get_mut("zeroclaw_maintainer")
             .expect("the administrator profile exists");
-        dave.admin = false;
-        dave.allowed_agents = vec![zeroclaw_api::grants::WILDCARD.into()];
+        maintainer.admin = false;
+        maintainer.allowed_agents = vec![zeroclaw_api::grants::WILDCARD.into()];
         ctx.auth
             .refresh_from_config(&demoted)
             .expect("the demoted policy compiles");
