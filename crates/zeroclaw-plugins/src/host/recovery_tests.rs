@@ -185,7 +185,10 @@ fn unsupported_claim_preserves_source_substitution_and_destination_file() {
     let destination_id = same_file::Handle::from_path(&destination).unwrap();
 
     let output = paused.resume();
-    assert_eq!(std::fs::read(&destination).unwrap(), b"destination sentinel");
+    assert_eq!(
+        std::fs::read(&destination).unwrap(),
+        b"destination sentinel"
+    );
     assert_eq!(
         std::fs::read(root.path().join("race")).unwrap(),
         b"substituted source"
@@ -229,7 +232,10 @@ fn atomic_claim_preserves_source_substitution_and_destination_file() {
     let destination_id = same_file::Handle::from_path(&destination).unwrap();
 
     let output = paused.resume();
-    assert_eq!(std::fs::read(&destination).unwrap(), b"destination sentinel");
+    assert_eq!(
+        std::fs::read(&destination).unwrap(),
+        b"destination sentinel"
+    );
     assert_eq!(
         std::fs::read(root.path().join("race")).unwrap(),
         b"substituted source"

@@ -576,8 +576,7 @@ mod rename_tests {
                 let dir = &root.dir;
                 dir.create_dir("source").unwrap();
                 dir.write("source/keep", b"source bytes").unwrap();
-                let source_id =
-                    same_file::Handle::from_path(temp.path().join("source")).unwrap();
+                let source_id = same_file::Handle::from_path(temp.path().join("source")).unwrap();
                 match destination {
                     "free" => {}
                     "file" => dir.write(destination, b"destination bytes").unwrap(),
@@ -588,7 +587,8 @@ mod rename_tests {
                         }
                     }
                     "link" => {
-                        std::os::unix::fs::symlink("source", temp.path().join(destination)).unwrap();
+                        std::os::unix::fs::symlink("source", temp.path().join(destination))
+                            .unwrap();
                     }
                     _ => unreachable!(),
                 }
@@ -636,7 +636,7 @@ mod rename_tests {
     #[test]
     fn ordinary_atomic_move_errors_keep_errno_and_bytes() {
         use rustix::io::Errno;
-        for errno in [Errno::ACCES, Errno::XDEV, Errno::NOENT] {
+        for errno in [Errno::ACCESS, Errno::XDEV, Errno::NOENT] {
             let _forced = ForcedError::set(errno);
             let temp = tempfile::tempdir().unwrap();
             let root = Root::open(temp.path()).unwrap();

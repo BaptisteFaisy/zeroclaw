@@ -8,9 +8,9 @@ cd -- "$repo_root"
 source_path=crates/zeroclaw-plugins/src/host/recovery.rs
 host_path=crates/zeroclaw-plugins/src/host.rs
 tests_path=crates/zeroclaw-plugins/src/host/recovery_tests.rs
-fixed_sha=0fabf7bbbe9dc278ab1e10bfa59ffea7ec947768ee132a0a458e52bb1328d762
+fixed_sha=75c94d02d136028480898256be34b7bd580ed3f8c6f7e1aa6d49d7f1df196916
 host_sha=ebe72c13ace5a5d3fd3f882ac043471e20d5489dff9841202cb7f8981ed28a76
-tests_sha=bcb025477bd03307e70032af3d6a20fae2ae6a866ee580d4a5604907a271b0f9
+tests_sha=0495e519f8b7bc74ed06ec4ce75e16de2eccd8590f78594110ffefbfb0dff840
 
 verify_hash() {
     local path=$1 expected=$2 actual
@@ -136,7 +136,9 @@ def validate(text, cargo_status):
         index = names.index(name)
         if index in (0, 1):
             path = processes
-            line = assertion_line(path, name, 'assert_eq!(std::fs::read(&destination).unwrap(),')
+            line = assertion_line(path, name, 'std::fs::read(&destination).unwrap(),') - 1
+            require(Path(path).read_text().splitlines()[line - 1].strip() == 'assert_eq!(',
+                    f"{name}: formatted data assertion opening not found")
             require('assertion `left == right` failed' in block, f"{name}: not a data assertion")
             for label, data in (("left", b"substituted source"), ("right", b"destination sentinel")):
                 vector = re.escape(str(list(data)))
@@ -237,12 +239,12 @@ run_stage() {
     restore_source
 }
 
-run_stage baseline 740377e5335f82f47b3cafc09f7c939da9c2974b5d029dced87a6cce3f38781f \
+run_stage baseline 446c2e8604d09d946eeed09222079a092b6cede83f745c2eea00bc6d7803e171 \
     scripts/ci/fixtures/plugin-rename-baseline.patch f9fe07237e5fe8515d27e53282f030878aa1a26c1f2a03aa254b1cf20d13244d
 run_stage fixed "$fixed_sha"
-run_stage unavailable 04436aec924f872011339dcd00de1df03fc869e871da326a89d40f47427dbace \
+run_stage unavailable 62b9e4565cb916ba7f6308b39079651d1a6c3c533eb46b3037a3b728aaa0fcb7 \
     scripts/ci/fixtures/plugin-rename-unavailable.patch 51380e55f337a84976398a4c55a6b2deacbb98148afd72be2912bd5a0eb14cd2
-run_stage atomic 285ba74bd6ea11d4e44f36189b5c2bf0e6f3ca76a91366921e0d39367ac66403 \
+run_stage atomic ae5f9d21faeba5ed35f42d3d5b8955f96c9e0ff34571b1271ebdca14c71fc999 \
     scripts/ci/fixtures/plugin-rename-atomic.patch d2cb141b2b402d33e143a2d156959d0bf51bdb5cc373baf71cd0d7898b943abc
 run_stage restored-fixed "$fixed_sha"
 printf 'QUALIFICATION:PASS stages=5 actual_named_observations=35 counterfactual_failures=10\n'
