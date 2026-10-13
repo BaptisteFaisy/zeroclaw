@@ -1368,7 +1368,7 @@ mod tests {
         };
         assert_eq!(
             field("mode").choices.as_deref(),
-            Some(&["".to_string(), "auto".to_string()][..]),
+            Some(&[String::new(), "auto".to_string()][..]),
             "the empty value is offered like any other listed one"
         );
         assert_eq!(encode_value(field("mode"), ""), Some(String::new()));
