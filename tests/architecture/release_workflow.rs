@@ -1094,7 +1094,7 @@ fn manual_qualification_wiring_rejects_actual_cache_output_and_dependency_mutant
     assert!(!inputs.contains("${{"));
     let observe = |body: &str| {
         let script = format!(
-            "FEATURES=''\npython3() {{ echo 'controlled manifest boundary'; return 91; }}\n{body}"
+            "FEATURES=''\nGITHUB_SHA=fixture-source\nGITHUB_RUN_ID=17\nGITHUB_RUN_ATTEMPT=2\npython3() {{ echo 'controlled manifest boundary'; return 91; }}\n{body}"
         );
         run_release_recipe(&script, RELEASE_RECIPE_CONTEXTS[0], "", "false", "")
     };
