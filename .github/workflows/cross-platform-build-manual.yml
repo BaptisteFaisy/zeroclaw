@@ -107,6 +107,67 @@ jobs:
             echo "- cargo tauri --version: \`$cargo_version\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Qualify optional probe receiving features
+        if: >-
+          inputs.release_tools_only && matrix.tool == 'cross' &&
+          github.repository == 'zeroclaw-labs/zeroclaw' &&
+          github.ref == 'refs/heads/test/11715-probe-feature-qualification-20261013'
+        timeout-minutes: 12
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REPOSITORY" = zeroclaw-labs/zeroclaw
+          test "$GITHUB_REF" = refs/heads/test/11715-probe-feature-qualification-20261013
+          test "$RUNNER_OS/$RUNNER_ARCH" = Linux/X64
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          probe_git_status="$(git status --porcelain=v1 --untracked-files=all)"
+          test -z "$probe_git_status"
+          probe_parent=9af44a08f918666c167a6b85d77a1c0f6b6bf08e
+          probe_parents="$(git cat-file -p HEAD | sed '/^$/q' | sed -n 's/^parent //p')"
+          test "$probe_parents" = "$probe_parent"
+          timeout --signal=TERM --kill-after=5s 30s git fetch --no-tags --depth=1 origin "$probe_parent"
+          test "$(git diff --name-only "$probe_parent" HEAD)" = .github/workflows/cross-platform-build-manual.yml
+          printf '%s\n' \
+            '5465b0bdf2d5e6382183b15897f9bf759b034fbfcfcffd91db3db1a137eca728  Cargo.lock' \
+            '145d5d51d81350f66de8838e330a4881154b0244ad71d9d6ad31e61ddddda93c  crates/zeroclaw-tools/Cargo.toml' \
+            '2a82f2923c413238c2c8da8e933b80798d8b3f8c6f02c8e720af460ca69063da  crates/zeroclaw-hardware/Cargo.toml' | sha256sum --check --strict
+          probe_tree="$(git rev-parse 'HEAD^{tree}')"
+          printf 'PROBE:SOURCE head=%s tree=%s parent=%s run=%s attempt=%s\n' \
+            "$GITHUB_SHA" "$probe_tree" "$probe_parent" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+          rustc --version
+          cargo --version
+
+          probe_lock_clean() {
+            printf 'PROBE:LOCK phase=%s ' "$1"
+            sha256sum Cargo.lock
+            test "$(sha256sum Cargo.lock | cut -d ' ' -f 1)" = 5465b0bdf2d5e6382183b15897f9bf759b034fbfcfcffd91db3db1a137eca728
+            probe_git_status="$(git status --porcelain=v1 --untracked-files=all)"
+            test -z "$probe_git_status"
+            printf 'PROBE:CLEAN phase=%s\n' "$1"
+          }
+          probe_run() {
+            local probe_phase="$1" probe_status
+            shift
+            printf 'PROBE:COMMAND phase=%s ' "$probe_phase"
+            printf '%q ' "$@"
+            printf '\n'
+            set +e
+            "$@"
+            probe_status=$?
+            set -e
+            printf 'PROBE:STATUS phase=%s exit=%s\n' "$probe_phase" "$probe_status"
+            probe_lock_clean "$probe_phase"
+            return "$probe_status"
+          }
+
+          probe_lock_clean before
+          probe_run tools-check cargo check --locked -p zeroclaw-tools --features probe
+          probe_run hardware-check cargo check --locked -p zeroclaw-hardware --features hardware,probe
+          probe_run tools-tests cargo test --locked -p zeroclaw-tools --features probe --lib hardware_
+          probe_lock_clean after
+          printf 'PROBE:COMPLETE all-three-command-exits=0\n'
+
   web:
     name: Build Web Dashboard
     if: ${{ !inputs.release_tools_only }}
