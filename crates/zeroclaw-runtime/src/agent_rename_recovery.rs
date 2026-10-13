@@ -15,7 +15,9 @@
 //! 4. [`converge`] moves every follower, re-checks all of them, and clears the
 //!    record only once nothing is left under the old alias. Each move is
 //!    durable before the record clears: the SQLite stores commit it with full
-//!    sync, and a workspace move syncs the directories it changes.
+//!    sync, and each converge syncs every directory a workspace move or
+//!    cleanup changes before it can clear the record, keeping the record
+//!    open while any of them fails to sync.
 //!
 //! The record keeps the recovery durable across the window after the commit
 //! and across processes. While it is open the old alias cannot be reused, and
@@ -63,7 +65,6 @@ const KEY_REFUSED: &str = "agents.rename_recovery.refused";
 const KEY_UNREADABLE: &str = "agents.rename_recovery.unreadable";
 const KEY_RECORD_FAILED: &str = "agents.rename_recovery.record_failed";
 const KEY_ABANDONED: &str = "agents.rename_recovery.abandoned";
-const KEY_UNSYNCED: &str = "agents.rename_recovery.unsynced";
 
 /// Store handles a rename surface already holds. `None` means the surface
 /// holds no handle for that store, not that the store is unconfigured: the
@@ -1174,13 +1175,14 @@ enum WorkspaceFollower {
     /// at the old default location is removed; anything else there is the
     /// operator's to move.
     Leftover(PathBuf),
-    /// The new alias's custom workspace is the old default location itself.
+    /// The new alias's custom workspace overlaps the old default location: it
+    /// is that location, lies beneath it, or contains it.
     TargetUsesOld,
     /// The recorded workspace is not the old default location under this
     /// config: the install moved, or the journal was edited.
     RecordMismatch(PathBuf),
-    /// Whether the new alias's custom workspace is the old default location
-    /// could not be established. Carries why.
+    /// Whether the new alias's custom workspace overlaps the old default
+    /// location could not be established. Carries why.
     Uninspectable(String),
 }
 
@@ -1227,7 +1229,7 @@ impl WorkspaceFollower {
                 old.display()
             ),
             Self::TargetUsesOld => format!(
-                "agent `{to}` uses the old default workspace of `{from}` as its workspace.path"
+                "the workspace.path of agent `{to}` is or overlaps the old default workspace of `{from}`"
             ),
             Self::RecordMismatch(recorded) => format!(
                 "the recorded workspace {} is not the default workspace of `{from}` under this config",
@@ -1393,7 +1395,7 @@ impl FollowerPlan {
                 WorkspaceFollower::TargetUsesOld => Some(FollowerIssue::conflict(
                     follower,
                     format!(
-                        "agent `{to}` uses the old default workspace of `{from}` as its workspace.path; point workspace.path elsewhere, then re-run the rename"
+                        "the workspace.path of agent `{to}` is or overlaps the old default workspace of `{from}`; point workspace.path elsewhere, then re-run the rename"
                     ),
                 )),
                 WorkspaceFollower::RecordMismatch(_) => Some(FollowerIssue::conflict(
@@ -1472,7 +1474,11 @@ impl FollowerPlan {
     /// Re-probe every follower. The re-probe is authoritative: a follower
     /// holding nothing under `from` has converged whatever its move reported,
     /// one still holding state reports why its move did not take it, or that
-    /// it still lags, and one that cannot be read stays unreadable.
+    /// it still lags, and one that cannot be read stays unreadable. A
+    /// workspace holding nothing under `from` has converged only once
+    /// [`sync_workspace_directories`] has synced the directories its moves
+    /// and cleanups change, which it does on every run, whether or not this
+    /// one moved anything.
     async fn verify(
         &self,
         config: &Config,
@@ -1483,6 +1489,9 @@ impl FollowerPlan {
         let mut outstanding = Vec::new();
         for (follower, issue) in attempted {
             match self.probe(follower, config, from).await {
+                Ok(0) if follower == FollowerKind::Workspace => {
+                    outstanding.extend(sync_workspace_directories(config, from, to).await);
+                }
                 Ok(0) => {}
                 Ok(_) => outstanding.push(issue.unwrap_or_else(|| {
                     FollowerIssue::lagging(follower, self.residue_detail(follower, from, to))
@@ -1526,9 +1535,10 @@ impl FollowerPlan {
 /// long as the record kept that location for the move. A record that kept
 /// none (the old alias had a `workspace.path`) moves nothing, and neither
 /// does one naming another path. A `to` with a custom path takes nothing,
-/// and that path must not be the old default location itself. Whether or not
-/// anything moves, the old default location has to be empty or gone before
-/// the record clears.
+/// and that path must not overlap the old default location: an agent
+/// re-created under `from` would share it. Whether or not anything moves,
+/// the old default location has to be empty or gone before the record
+/// clears.
 async fn workspace_follower(
     config: &Config,
     from: &str,
@@ -1539,11 +1549,11 @@ async fn workspace_follower(
     let destination = config.default_agent_workspace_dir(to);
     let current = config.agent_workspace_dir(to);
     if lexically_normalized(&current) != lexically_normalized(&destination) {
-        return match same_place(&current, &old).await {
+        return match workspaces_overlap(&current, &old).await {
             Ok(true) => WorkspaceFollower::TargetUsesOld,
             Ok(false) => WorkspaceFollower::Leftover(old),
             Err(e) => WorkspaceFollower::Uninspectable(format!(
-                "cannot tell whether {} is {}: {e}",
+                "cannot tell whether {} overlaps {}: {e}",
                 current.display(),
                 old.display()
             )),
@@ -1606,6 +1616,54 @@ async fn same_place(a: &Path, b: &Path) -> std::io::Result<bool> {
     }
 }
 
+/// Whether the workspaces at `a` and `b` overlap: one is the other, or lies
+/// beneath it. Paths compare component by component once `.` and `..` are
+/// folded, so nothing needs to exist yet, and `workspace2` does not lie
+/// beneath `workspace`. When both exist, one directory reached both ways,
+/// or one beneath the other once symlinks are resolved, overlaps as well.
+async fn workspaces_overlap(a: &Path, b: &Path) -> std::io::Result<bool> {
+    let (lexical_a, lexical_b) = (lexically_normalized(a), lexically_normalized(b));
+    if lexical_a.starts_with(&lexical_b) || lexical_b.starts_with(&lexical_a) {
+        return Ok(true);
+    }
+    let (a, b) = (a.to_path_buf(), b.to_path_buf());
+    match tokio::task::spawn_blocking(move || existing_paths_overlap(&a, &b)).await {
+        Ok(overlap) => overlap,
+        Err(e) => Err(std::io::Error::other(e)),
+    }
+}
+
+/// Whether `a` and `b` both exist and are one file or directory, or one lies
+/// beneath the other once both are canonicalized. Either missing is no
+/// overlap; a path that cannot be inspected for any other reason is an
+/// error.
+fn existing_paths_overlap(a: &Path, b: &Path) -> std::io::Result<bool> {
+    if same_existing_file(a, b)? {
+        return Ok(true);
+    }
+    let (Some(a), Some(b)) = (existing_canonical(a)?, existing_canonical(b)?) else {
+        return Ok(false);
+    };
+    Ok(a.starts_with(&b) || b.starts_with(&a))
+}
+
+/// `path` with every symlink resolved, or `None` when nothing exists there:
+/// the path is missing, or one of its ancestors is not a directory.
+fn existing_canonical(path: &Path) -> std::io::Result<Option<PathBuf>> {
+    match std::fs::canonicalize(path) {
+        Ok(canonical) => Ok(Some(canonical)),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// `path` with the symlinks in its existing part resolved. A path that no
 /// longer exists (a workspace an earlier run already moved) resolves its
 /// nearest existing ancestor and keeps the rest, so rows recorded under the
@@ -1625,7 +1683,9 @@ async fn canonical_spelling(path: &Path) -> Option<PathBuf> {
 
 /// Move the old workspace to the new alias-derived location. An absent
 /// destination is created, and an empty directory there is replaced; anything
-/// else there is left for the operator.
+/// else there is left for the operator. The move is visible once this
+/// returns; [`sync_workspace_directories`] makes it durable before the record
+/// can clear.
 async fn move_workspace(workspace: &WorkspaceMove) -> Result<(), FollowerIssue> {
     let WorkspaceMove {
         source,
@@ -1677,35 +1737,57 @@ async fn move_workspace(workspace: &WorkspaceMove) -> Result<(), FollowerIssue> 
     }
     tokio::fs::rename(source, destination)
         .await
-        .map_err(|e| move_failed(&e))?;
-    // The move is visible now. Make it durable before anything can clear the
-    // record: the entry it added, then the entry it removed.
-    if let Some(parent) = destination.parent() {
-        sync_changed_directory(parent).await;
-    }
-    if let Some(parent) = source.parent() {
-        sync_changed_directory(parent).await;
-    }
-    Ok(())
+        .map_err(|e| move_failed(&e))
 }
 
-/// Sync `dir`, a directory a workspace move or cleanup changed, so the change
-/// survives a power loss. A failure cannot undo a change that has already
-/// happened, so it is logged.
-async fn sync_changed_directory(dir: &Path) {
-    if let Err(e) = sync_directory(dir).await {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({
-                    "error_key": KEY_UNSYNCED,
-                    "dir": dir.display().to_string(),
-                    "error": e.to_string(),
-                })),
-            "a directory an agent rename changed could not be synced; a power loss could still undo that change"
-        );
+/// Sync every directory whose entries a workspace move or cleanup of this
+/// rename changes, so the change survives a power loss before the record
+/// clears. In order: `<install>/agents/<to>`, which gains the moved
+/// workspace; `<install>/agents`, which gains `<to>` when the move creates
+/// it and loses `<from>` when the emptied alias directory is removed; and
+/// `<install>/agents/<from>`, which loses the workspace.
+///
+/// Every converge that finds the old default workspace gone syncs them, not
+/// only one that moved it: a run that stopped between a move and its sync
+/// leaves nothing to move when it resumes. A directory that does not exist
+/// has nothing to sync. Each directory that cannot be inspected or synced is
+/// an unreadable workspace issue, which keeps the record open so the next
+/// converge retries it.
+async fn sync_workspace_directories(config: &Config, from: &str, to: &str) -> Vec<FollowerIssue> {
+    let new_workspace = config.default_agent_workspace_dir(to);
+    let old_workspace = config.default_agent_workspace_dir(from);
+    let new_alias_dir = new_workspace.parent();
+    let candidates = [
+        new_alias_dir,
+        new_alias_dir.and_then(Path::parent),
+        old_workspace.parent(),
+    ];
+    let mut dirs: Vec<&Path> = Vec::with_capacity(candidates.len());
+    for dir in candidates.into_iter().flatten() {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
     }
+
+    let follower = FollowerKind::Workspace;
+    let mut issues = Vec::new();
+    for dir in dirs {
+        match inspect_lifecycle_path(dir).await {
+            PathPresence::Absent => {}
+            PathPresence::Uninspectable(reason) => {
+                issues.push(FollowerIssue::unreadable(follower, reason));
+            }
+            PathPresence::Present => {
+                if let Err(e) = sync_directory(dir).await {
+                    issues.push(FollowerIssue::unreadable(
+                        follower,
+                        format!("could not sync {}: {e}", dir.display()),
+                    ));
+                }
+            }
+        }
+    }
+    issues
 }
 
 /// Whether `path` is a real directory with nothing in it. A symlink or a file
@@ -1722,16 +1804,12 @@ async fn is_empty_directory(path: &Path) -> std::io::Result<bool> {
 }
 
 /// Best effort: remove `<install>/agents/<from>` once the old default
-/// workspace below it is gone, then sync `<install>/agents` so the removal is
-/// durable. It stays when anything else was kept beside the workspace.
+/// workspace below it is gone. It stays when anything else was kept beside
+/// the workspace. [`sync_workspace_directories`] makes the removal durable
+/// before the record can clear.
 async fn remove_alias_dir(old_workspace: &Path) {
-    let Some(alias_dir) = old_workspace.parent() else {
-        return;
-    };
-    if tokio::fs::remove_dir(alias_dir).await.is_ok()
-        && let Some(agents_dir) = alias_dir.parent()
-    {
-        sync_changed_directory(agents_dir).await;
+    if let Some(alias_dir) = old_workspace.parent() {
+        let _ = tokio::fs::remove_dir(alias_dir).await;
     }
 }
 
@@ -1907,6 +1985,7 @@ fn log_record_failed(from: &str, to: &str, detail: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lifecycle_path::with_failing_sync;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
@@ -2782,7 +2861,7 @@ mod tests {
         assert_eq!(
             issues[0].to_string(),
             format!(
-                "agent `{TO}` uses the old default workspace of `{FROM}` as its workspace.path; point workspace.path elsewhere, then re-run the rename"
+                "the workspace.path of agent `{TO}` is or overlaps the old default workspace of `{FROM}`; point workspace.path elsewhere, then re-run the rename"
             )
         );
         assert!(old.join("MEMORY.md").is_file(), "nothing moved or deleted");
@@ -2865,6 +2944,109 @@ mod tests {
             "theirs"
         );
         assert!(records(&after).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_custom_workspace_overlapping_the_old_default_keeps_the_record() {
+        let tmp = TempDir::new().unwrap();
+        let before = fixture(&tmp, &[FROM]);
+        let mut after = arm_and_commit(&before).await;
+        let old = after.default_agent_workspace_dir(FROM);
+        let old_alias_dir = old.parent().unwrap().to_path_buf();
+        let stores = SurfaceStores::none();
+        let overlapping = format!(
+            "the workspace.path of agent `{TO}` is or overlaps the old default workspace of `{FROM}`; point workspace.path elsewhere, then re-run the rename"
+        );
+        let assert_overlap = |outcome: &ConvergeOutcome, custom: &Path| {
+            let issues = outstanding(outcome);
+            assert_eq!(
+                issues.len(),
+                1,
+                "{}: {:?}",
+                custom.display(),
+                outcome.warnings()
+            );
+            assert_eq!(issues[0].follower, FollowerKind::Workspace);
+            assert_eq!(issues[0].kind, FollowerIssueKind::Conflict);
+            assert_eq!(issues[0].to_string(), overlapping, "{}", custom.display());
+            assert!(!outcome.report().workspace_moved);
+            // `before` reads the same journal as `after`, which changes below.
+            assert_eq!(records(&before).len(), 1, "{}", custom.display());
+        };
+
+        // Beneath the old default workspace, or containing it as the old
+        // alias directory or the install itself does, whether or not either
+        // exists yet.
+        let beneath = old.join("proj");
+        assert!(!old.exists());
+        for custom in [
+            beneath.clone(),
+            old_alias_dir.clone(),
+            tmp.path().to_path_buf(),
+        ] {
+            let mut config = after.clone();
+            config.agents.get_mut(TO).unwrap().workspace.path = Some(custom.clone());
+            let outcome = converge(&config, FROM, TO, &stores).await.unwrap();
+            assert_overlap(&outcome, &custom);
+        }
+        assert!(!old_alias_dir.exists(), "nothing was created");
+
+        // With files in the old default workspace the overlap is still what
+        // is reported, not the leftover.
+        seed_workspace(&before, FROM);
+        after.agents.get_mut(TO).unwrap().workspace.path = Some(beneath.clone());
+        let outcome = converge(&after, FROM, TO, &stores).await.unwrap();
+        assert_overlap(&outcome, &beneath);
+        assert!(!beneath.exists());
+
+        // Spelled through a symlink, the same directories still overlap.
+        #[cfg(unix)]
+        {
+            std::fs::create_dir(&beneath).unwrap();
+            let links = [
+                (tmp.path().join("alias-link"), old_alias_dir.clone()),
+                (tmp.path().join("old-link"), old.clone()),
+                (tmp.path().join("proj-link"), beneath.clone()),
+            ];
+            for (link, target) in links {
+                std::os::unix::fs::symlink(&target, &link).unwrap();
+                let mut config = after.clone();
+                config.agents.get_mut(TO).unwrap().workspace.path = Some(link.clone());
+                let outcome = converge(&config, FROM, TO, &stores).await.unwrap();
+                assert_overlap(&outcome, &link);
+            }
+            std::fs::remove_dir(&beneath).unwrap();
+        }
+
+        // A sibling whose name merely starts the same way does not overlap:
+        // the old directory is reported as a leftover instead.
+        let sibling = old_alias_dir.join("workspace2");
+        std::fs::create_dir(&sibling).unwrap();
+        after.agents.get_mut(TO).unwrap().workspace.path = Some(sibling);
+        let outcome = converge(&after, FROM, TO, &stores).await.unwrap();
+        let issues = outstanding(&outcome);
+        assert_eq!(issues.len(), 1, "{:?}", outcome.warnings());
+        assert_eq!(
+            issues[0].to_string(),
+            format!(
+                "the old default workspace of `{FROM}` still exists at {}; move its contents by hand, then re-run the rename",
+                old.display()
+            )
+        );
+        assert_eq!(records(&after).len(), 1);
+
+        // Pointed elsewhere, with the old files moved by hand, the rename
+        // finishes.
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::rename(old.join("MEMORY.md"), elsewhere.join("MEMORY.md")).unwrap();
+        after.agents.get_mut(TO).unwrap().workspace.path = Some(elsewhere.clone());
+        let outcome = converge(&after, FROM, TO, &stores).await.unwrap();
+        assert!(outcome.is_converged(), "{:?}", outcome.warnings());
+        assert!(!old.exists());
+        assert!(elsewhere.join("MEMORY.md").is_file());
+        assert!(records(&after).is_empty());
+        assert_eq!(retired_alias(&after, FROM).unwrap(), None);
     }
 
     #[tokio::test]
@@ -3705,6 +3887,133 @@ mod tests {
         assert_eq!(acp_row(&after, "acp-1"), (TO.to_string(), destination));
         assert_eq!(session_owner(&after, "chat-1").as_deref(), Some(TO));
         assert!(records(&after).is_empty());
+    }
+
+    /// The directories a workspace move or cleanup of the fixture rename
+    /// changes: `<install>/agents/<TO>`, `<install>/agents`, and
+    /// `<install>/agents/<FROM>`.
+    fn workspace_parent_dirs(config: &Config) -> (PathBuf, PathBuf, PathBuf) {
+        let new_alias_dir = config
+            .default_agent_workspace_dir(TO)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let agents_dir = new_alias_dir.parent().unwrap().to_path_buf();
+        let old_alias_dir = config
+            .default_agent_workspace_dir(FROM)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        (new_alias_dir, agents_dir, old_alias_dir)
+    }
+
+    fn assert_unsynced(outcome: &ConvergeOutcome, dir: &Path) {
+        let issues = outstanding(outcome);
+        assert_eq!(
+            issues.len(),
+            1,
+            "{}: {:?}",
+            dir.display(),
+            outcome.warnings()
+        );
+        assert_eq!(issues[0].follower, FollowerKind::Workspace);
+        assert_eq!(issues[0].kind, FollowerIssueKind::Unreadable);
+        assert!(
+            issues[0]
+                .detail
+                .starts_with(&format!("could not sync {}: ", dir.display())),
+            "{}",
+            issues[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_directory_sync_keeps_the_record_until_a_rerun_syncs_it() {
+        let tmp = TempDir::new().unwrap();
+        let before = fixture(&tmp, &[FROM]);
+        let source = seed_workspace(&before, FROM);
+        let after = arm_and_commit(&before).await;
+        let (_, agents_dir, old_alias_dir) = workspace_parent_dirs(&after);
+        let destination = after.default_agent_workspace_dir(TO);
+        let stores = SurfaceStores::none();
+
+        // The move lands, but the directory that gained the new alias and
+        // lost the old one cannot be synced, so a power loss could still
+        // undo it.
+        let first = with_failing_sync(agents_dir.clone(), converge(&after, FROM, TO, &stores))
+            .await
+            .unwrap();
+        assert_unsynced(&first, &agents_dir);
+        assert!(first.report().workspace_moved);
+        assert!(destination.join("MEMORY.md").is_file());
+        assert!(!source.exists());
+        assert!(!old_alias_dir.exists());
+        assert_eq!(records(&after).len(), 1, "the record stays open");
+        assert!(retired_alias(&after, FROM).unwrap().is_some());
+
+        // A re-run has nothing left to move, syncs again, and clears it.
+        let second = converge(&after, FROM, TO, &stores).await.unwrap();
+        assert!(second.is_converged(), "{:?}", second.warnings());
+        assert!(!second.report().workspace_moved);
+        assert!(destination.join("MEMORY.md").is_file());
+        assert!(records(&after).is_empty());
+        assert_eq!(retired_alias(&after, FROM).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_rename_resumed_after_an_unsynced_move_syncs_before_clearing() {
+        let tmp = TempDir::new().unwrap();
+        let before = fixture(&tmp, &[FROM]);
+        let source = seed_workspace(&before, FROM);
+        let after = arm_and_commit(&before).await;
+        let (new_alias_dir, agents_dir, old_alias_dir) = workspace_parent_dirs(&after);
+        let destination = after.default_agent_workspace_dir(TO);
+        // A run moved the workspace and stopped before syncing anything or
+        // removing the old alias directory; its record is still committed.
+        std::fs::create_dir_all(&new_alias_dir).unwrap();
+        std::fs::rename(&source, &destination).unwrap();
+        assert_eq!(records(&after)[0].phase, RecoveryPhase::Committed);
+        let stores = SurfaceStores::none();
+
+        // Resuming moves nothing, yet syncs every directory the move changed.
+        for dir in [&new_alias_dir, &agents_dir, &old_alias_dir] {
+            let resumed = with_failing_sync(dir.clone(), converge(&after, FROM, TO, &stores))
+                .await
+                .unwrap();
+            assert_unsynced(&resumed, dir);
+            assert!(!resumed.report().workspace_moved);
+            assert_eq!(records(&after).len(), 1, "{}", dir.display());
+        }
+
+        let finished = converge(&after, FROM, TO, &stores).await.unwrap();
+        assert!(finished.is_converged(), "{:?}", finished.warnings());
+        assert!(!finished.report().workspace_moved);
+        assert!(destination.join("MEMORY.md").is_file());
+        assert!(records(&after).is_empty());
+        assert_eq!(retired_alias(&after, FROM).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_directory_that_does_not_exist_is_not_synced() {
+        let tmp = TempDir::new().unwrap();
+        let before = fixture(&tmp, &[FROM]);
+        // Only cron state follows, so nothing under `<install>/agents` was
+        // ever created.
+        seed_cron(&before, FROM);
+        let after = arm_and_commit(&before).await;
+        let (new_alias_dir, agents_dir, old_alias_dir) = workspace_parent_dirs(&after);
+        assert!(!agents_dir.exists());
+        let stores = SurfaceStores::none();
+
+        let outcome = with_failing_sync(agents_dir.clone(), converge(&after, FROM, TO, &stores))
+            .await
+            .unwrap();
+        assert!(outcome.is_converged(), "{:?}", outcome.warnings());
+        assert_eq!(outcome.report().cron_jobs, 1);
+        assert!(records(&after).is_empty());
+        for dir in [new_alias_dir, agents_dir, old_alias_dir] {
+            assert!(!dir.exists(), "{} was created", dir.display());
+        }
     }
 
     #[tokio::test]

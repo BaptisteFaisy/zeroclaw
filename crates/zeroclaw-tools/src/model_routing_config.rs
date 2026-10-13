@@ -1102,14 +1102,14 @@ impl ModelRoutingConfigTool {
         };
         match record {
             Ok(None) => Ok(()),
-            Ok(Some(record)) => anyhow::bail!(
-                "agent '{name}' is part of an unfinished rename; run `zeroclaw agents rename {} {}` to finish it before removing this agent",
-                record.from,
-                record.to
-            ),
-            Err(error) => anyhow::bail!(
-                "cannot remove agent '{name}': the agent lifecycle recovery journal could not be read: {error}"
-            ),
+            Ok(Some(record)) => anyhow::bail!(crate::i18n::get_required_tool_string_with_args(
+                "tool-model-routing-config-error-agent-rename-unfinished",
+                &[("name", name), ("from", &record.from), ("to", &record.to)],
+            )),
+            Err(error) => anyhow::bail!(crate::i18n::get_required_tool_string_with_args(
+                "tool-model-routing-config-error-agent-recovery-unreadable",
+                &[("name", name), ("error", &error.to_string())],
+            )),
         }
     }
 

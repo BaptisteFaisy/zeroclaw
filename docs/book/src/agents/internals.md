@@ -57,7 +57,7 @@ The owned state that follows a rename is:
 
 The record lives at `<data_dir>/agent-lifecycle-recovery.json` with a sidecar `.lock` file, and agent file tools cannot modify it. Because it is cleared only in the last step, an interrupted or partial rename leaves it open. A store that exists but cannot be read counts as unfinished work, not as empty: the rename reports it and keeps the record. Removing leftover state by hand outside the rename does not clear the record; re-running the same rename does, once it verifies that nothing is left.
 
-Every move is made durable before the record is cleared: the SQLite memory, ACP, and session stores commit their moves with full sync, and a workspace move syncs the directories it changes. A power loss after a rename converges therefore cannot leave state under the old alias with nothing retiring it.
+Every move is made durable before the record is cleared: the SQLite memory, ACP, and session stores commit their moves with full sync, and once the old default workspace is gone, every run of the rename, including a re-run with nothing left to move, syncs the directories a workspace move or cleanup changes (`<install>/agents/<new>/`, `<install>/agents/`, and `<install>/agents/<old>/` while it exists). The rename stays open until every changed directory is synced, and a re-run retries the syncs. A power loss after a rename converges therefore cannot leave state under the old alias with nothing retiring it.
 
 A recovery journal that cannot be read, because the file is corrupt or declares a `schema_version` this build does not support, may hold an unfinished rename, so every agent creation, rename, and delete is refused until it is repaired. To repair it:
 
@@ -71,7 +71,7 @@ To finish a rename that reported unfinished work, re-run it with the same aliase
 
 Two conflicts need an operator and keep the record open: the destination workspace already exists and is not empty, or the destination alias already owns memory rows. Resolve them by moving or merging that state by hand, then re-run the same rename.
 
-A rename never finishes while `<install>/agents/<old>/workspace/` still exists, whatever `<new>`'s workspace configuration is, because an agent re-created as `<old>` would adopt that directory. When `<new>` has a custom `workspace.path`, the rename removes the old directory if it is empty and otherwise reports it until its contents are moved by hand. If `<new>`'s `workspace.path` points at the old directory itself, point it elsewhere first, then re-run the rename.
+A rename never finishes while `<install>/agents/<old>/workspace/` still exists, whatever `<new>`'s workspace configuration is, because an agent re-created as `<old>` would adopt that directory. When `<new>` has a custom `workspace.path`, the rename removes the old directory if it is empty and otherwise reports it until its contents are moved by hand. If `<new>`'s `workspace.path` is the old default workspace, lies inside it, or contains it (such as `<install>/agents/<old>/`), point it elsewhere first, then re-run the rename; this holds whether or not either directory exists yet.
 
 If `[agents.<old>]` is back in the config while the record is open (a hand edit, say), re-running the rename is refused and moves nothing, since that entry would take over the state the rename still owes `<new>`. Remove `[agents.<old>]` by hand and re-run the rename, or abandon it.
 

@@ -102,7 +102,7 @@ Custom workspace paths do not move because they are not derived from the alias; 
 
 Re-run the exact same rename: `zeroclaw agents rename researcher analyst`, or the same gateway API or daemon RPC request. The CLI resumes a pending rename even when `researcher` is no longer in the config, and exits non-zero until the rename has fully converged. The gateway API and daemon RPC keep returning `renamed: true` with a `warnings` list until then; an empty `warnings` list means the rename is complete.
 
-The pending rename is recorded in `<data_dir>/agent-lifecycle-recovery.json`, with a sidecar `.lock` file. Re-running the rename clears the record once it confirms that nothing is left under `researcher`. Removing leftover state by hand does not clear it, and a store that exists but cannot be read counts as unfinished work, not as empty.
+The pending rename is recorded in `<data_dir>/agent-lifecycle-recovery.json`, with a sidecar `.lock` file. Re-running the rename clears the record once it confirms that nothing is left under `researcher`. Removing leftover state by hand does not clear it, and a store that exists but cannot be read counts as unfinished work, not as empty. The rename also stays open until every directory the workspace move changed is synced to disk, and a re-run retries the syncs.
 
 While the record is open, `researcher` cannot be reused. Creating an agent with that name is refused by the CLI (including `zeroclaw config set agents.researcher.<field>` and `zeroclaw config patch`), the gateway and dashboard, the daemon RPC, `zeroclaw quickstart`, and the agent-facing config tool, and so is renaming another agent to `researcher`. An agent added through an environment override or a hand edit of `config.toml` is not refused; config load logs a warning for it instead. Renaming or deleting `analyst` is also refused until the pending rename converges. Creating any other agent still works.
 
@@ -111,7 +111,7 @@ Some conflicts need an operator, and the rename keeps reporting them until they 
 - `<install>/agents/analyst/workspace/` already exists and is not empty.
 - `analyst` already owns memory rows.
 - `<install>/agents/researcher/workspace/` still holds files while `analyst` has a custom `workspace.path`. The rename never finishes while that directory exists, because an agent created as `researcher` later would adopt it; an empty one is removed for you.
-- `analyst`'s `workspace.path` points at `<install>/agents/researcher/workspace/` itself. Point it elsewhere first.
+- `analyst`'s `workspace.path` is `<install>/agents/researcher/workspace/`, lies inside it, or contains it (for example `<install>/agents/researcher/`), whether or not that directory exists. Point it elsewhere first.
 
 Move or merge that state by hand, then re-run the same rename.
 

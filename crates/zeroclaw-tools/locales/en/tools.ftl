@@ -177,6 +177,8 @@ tool-memory-store = Store a fact, preference, or note in long-term memory. Use c
 tool-microsoft365 = Microsoft 365 integration: manage Outlook mail, Teams messages, Calendar events, OneDrive files, and SharePoint search via Microsoft Graph API
 
 tool-model-routing-config = Manage default model settings, scenario-based provider/model routes, classification rules, and aliased agent profiles
+tool-model-routing-config-error-agent-rename-unfinished = agent '{ $name }' is part of an unfinished rename; run `zeroclaw agents rename { $from } { $to }` to finish it before removing this agent
+tool-model-routing-config-error-agent-recovery-unreadable = cannot remove agent '{ $name }': the agent lifecycle recovery journal could not be read: { $error }
 
 tool-notion = Interact with Notion: query databases, read/create/update pages, and search the workspace.
 

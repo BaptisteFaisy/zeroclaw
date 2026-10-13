@@ -116,6 +116,25 @@ pub fn same_existing_file(a: &Path, b: &Path) -> std::io::Result<bool> {
     }
 }
 
+// The one directory whose sync fails, so a test can drive the path that
+// handles a failed sync. Task-local rather than process-global: tests run
+// concurrently, and each one that opts in scopes its own. A plain comment
+// because doc comments do not attach to a macro invocation.
+#[cfg(test)]
+tokio::task_local! {
+    static FAILING_SYNC: std::path::PathBuf;
+}
+
+/// Run `future` with every [`sync_directory`] of `dir` failing, on every
+/// platform.
+#[cfg(test)]
+pub(crate) async fn with_failing_sync<F: std::future::Future>(
+    dir: std::path::PathBuf,
+    future: F,
+) -> F::Output {
+    FAILING_SYNC.scope(dir, future).await
+}
+
 /// Make the entries of the directory `dir` durable, so a rename into or out
 /// of it, or a removal from it, survives a power loss once this returns.
 ///
@@ -123,6 +142,16 @@ pub fn same_existing_file(a: &Path, b: &Path) -> std::io::Result<bool> {
 /// portable directory sync, so there this does nothing, as the agent
 /// lifecycle recovery journal does for its own directory.
 pub async fn sync_directory(dir: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAILING_SYNC
+        .try_with(|failing| failing.as_path() == dir)
+        .unwrap_or(false)
+    {
+        return Err(std::io::Error::other(format!(
+            "sync of {} failed on purpose",
+            dir.display()
+        )));
+    }
     #[cfg(unix)]
     {
         tokio::fs::File::open(dir).await?.sync_all().await
@@ -232,6 +261,29 @@ mod tests {
             sync_directory(&tmp.path().join("missing")).await.is_err(),
             "a directory that does not exist cannot be synced"
         );
+    }
+
+    #[tokio::test]
+    async fn a_forced_sync_failure_hits_only_its_own_directory() {
+        let tmp = TempDir::new().unwrap();
+        let failing = tmp.path().join("agents");
+        let other = tmp.path().join("other");
+        std::fs::create_dir(&failing).unwrap();
+        std::fs::create_dir(&other).unwrap();
+
+        let (failed, synced) = with_failing_sync(failing.clone(), async {
+            (sync_directory(&failing).await, sync_directory(&other).await)
+        })
+        .await;
+        let error = failed.unwrap_err();
+        assert!(
+            error.to_string().contains(&failing.display().to_string()),
+            "{error}"
+        );
+        synced.unwrap();
+        sync_directory(&failing)
+            .await
+            .expect("outside the scope the directory syncs again");
     }
 
     #[test]
