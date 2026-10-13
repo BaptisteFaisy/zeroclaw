@@ -808,7 +808,9 @@ fits the new version. A package whose config row still uses the pre-1.0 key
 refusal prints the same guidance as `plugin install`.
 
 **Results.** Each plugin gets a result: updated, up to date, skipped (with
-`--all`, a package the registry does not list), needs approval, or not updated
+`--all`, a package the registry does not list, or one an interrupted update
+displaced while the command ran, which it notes as displaced), needs approval,
+or not updated
 with the reason and the version that stays installed. One plugin failing does
 not stop the others. The command exits non-zero when any plugin was not updated
 or needs approval, so a script can branch on it.
@@ -833,7 +835,8 @@ back before doing anything else, including before it reaches the registry, so
 recovery works offline. The update then goes on as usual, so for a package you
 installed from a directory, add `--from` with that directory, or the
 registry's package of that name may replace it. `--all` only points at that
-command, so a displaced package is never put back unless you name it. A
+command, so a displaced package is never put back unless you name it, even one
+an update displaced while the batch was running. A
 replaced version is marked for deletion inside its transaction before it is
 deleted, so one that cannot be deleted is never put back: the warning names
 where it is, and the next update of the plugin deletes it. If even the marking

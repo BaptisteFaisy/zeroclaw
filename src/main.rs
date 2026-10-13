@@ -6018,6 +6018,10 @@ enum PluginUpdateOutcome {
     UpToDate { version: String },
     /// `--all` only: the registry does not list the package.
     NotListed,
+    /// `--all` only: an interrupted update displaced the package after the
+    /// command listed it, so it was left where it is, with the note that names
+    /// the command that puts it back.
+    Displaced,
     /// The replacement requests authority the installed version lacks and the
     /// operator has not accepted. Nothing was changed.
     NeedsApproval {
@@ -6094,16 +6098,21 @@ async fn run_plugin_update(
     let targets: Vec<(String, Option<String>)> = if all {
         // A package an interrupted update displaced is not put back by
         // `--all`: only naming it does, so a copy is never restored unasked.
-        // Point at that command, as `plugin list` does.
-        for name in host.displaced_packages()? {
+        // Point at that command, as `plugin list` does. The list is judged
+        // under the lock, so it can name a package this host's discovery still
+        // lists, which the batch leaves out; one displaced later is left in
+        // place by the batch's recovery.
+        let displaced = host.displaced_packages()?;
+        for name in &displaced {
             eprintln!(
                 "{}",
-                plugin_displaced_note(config, &name, registry.as_deref())
+                plugin_displaced_note(config, name, registry.as_deref())
             );
             noted_displaced = true;
         }
         host.list_plugins()
             .into_iter()
+            .filter(|info| !displaced.contains(&info.name))
             .map(|info| (info.name, None))
             .collect()
     } else {
@@ -6132,7 +6141,13 @@ async fn run_plugin_update(
     let mut tally = PluginUpdateTally::default();
     let mut pending = Vec::with_capacity(targets.len());
     for (name, pin) in &targets {
-        if let Some(outcome) = recover_before_update(&mut host, name) {
+        if let Some(outcome) = recover_before_update(&mut host, name, all) {
+            if matches!(outcome, PluginUpdateOutcome::Displaced) {
+                eprintln!(
+                    "{}",
+                    plugin_displaced_note(config, name, registry.as_deref())
+                );
+            }
             tally.report(name, &outcome);
         } else if host.manifest(name).is_none() {
             // Point at installing it from the source the update named, never
@@ -6254,7 +6269,7 @@ impl PluginUpdateTally {
         match outcome {
             PluginUpdateOutcome::Updated { .. } => self.updated += 1,
             PluginUpdateOutcome::UpToDate { .. } => self.current += 1,
-            PluginUpdateOutcome::NotListed => self.skipped += 1,
+            PluginUpdateOutcome::NotListed | PluginUpdateOutcome::Displaced => self.skipped += 1,
             PluginUpdateOutcome::NeedsApproval { .. }
             | PluginUpdateOutcome::NotInstalled { .. }
             | PluginUpdateOutcome::Failed { .. }
@@ -6268,15 +6283,26 @@ impl PluginUpdateTally {
 /// about its update is decided and without the registry, so the recovery the
 /// operator is pointed at works offline. Returns the outcome to report when
 /// the plugin cannot be updated at all, or `None` to go on.
+///
+/// A `batch` (`--all`) did not name the package, so it only sweeps: a package
+/// an interrupted update displaced is left where it is and reported as
+/// [`PluginUpdateOutcome::Displaced`], since only naming it puts it back.
 #[cfg(feature = "plugins-wasm")]
 fn recover_before_update(
     host: &mut zeroclaw::plugins::host::PluginHost,
     name: &str,
+    batch: bool,
 ) -> Option<PluginUpdateOutcome> {
     use zeroclaw::plugins::host::UpdateRecovery;
 
     let failed = |error: String| Some(PluginUpdateOutcome::Failed { error, kept: None });
-    match host.recover_interrupted_update(name) {
+    let recovered = if batch {
+        host.sweep_interrupted_update(name)
+    } else {
+        host.recover_interrupted_update(name)
+    };
+    match recovered {
+        Ok(UpdateRecovery::Displaced { .. }) => Some(PluginUpdateOutcome::Displaced),
         Ok(UpdateRecovery::Nothing) => None,
         Ok(UpdateRecovery::Swept { kept, .. }) => {
             for (path, error) in &kept {
@@ -6574,7 +6600,11 @@ async fn update_one_plugin(
     };
 
     if let Some(rows) = &rows {
-        report_updated_plugin_config_entries(config, name, rows, &declared);
+        let channel_rows = updated_channel_rows(config, name, &candidate);
+        for line in updated_plugin_config_entry_lines(config, name, rows, &declared, &channel_rows)
+        {
+            print_update_line(&line);
+        }
     }
     for (key, reason) in &rejected {
         print_update_line(&ta(
@@ -6600,37 +6630,91 @@ async fn update_one_plugin(
     }
 }
 
-/// What `plugin update` prints about the replaced package's config rows after
-/// the replacement: each row it created, then for every row the difference
-/// between the new version's egress declaration and the row's grant, the same
-/// report install prints for a row that already exists. Nothing is granted:
-/// an update never extends an allowlist, not even in a row it created.
+/// A channel instance bound to an updated package whose config row exists,
+/// with the new version's declaration for it.
 #[cfg(feature = "plugins-wasm")]
-fn report_updated_plugin_config_entries(
+struct UpdatedChannelRow {
+    /// The instance as messages name it: the package and its alias.
+    shown: String,
+    key: String,
+    declared: Vec<String>,
+}
+
+/// The rows of the channel instances bound to `package` that already exist,
+/// each with `manifest`'s declaration under that row's own transport rule. A
+/// bound alias without a row is left out: `plugin bind` creates its row, and
+/// `plugin info` says so.
+#[cfg(feature = "plugins-wasm")]
+fn updated_channel_rows(
+    config: &crate::config::schema::Config,
+    package: &str,
+    manifest: &zeroclaw::plugins::PluginManifest,
+) -> Vec<UpdatedChannelRow> {
+    use crate::plugins::channel_instance::{bound_channel_rows, declared_hosts_for_row};
+
+    bound_channel_rows(config, manifest)
+        .into_iter()
+        .filter(|row| {
+            config
+                .plugins
+                .entries
+                .iter()
+                .any(|entry| entry.name == row.key)
+        })
+        .map(|row| UpdatedChannelRow {
+            shown: row.display_name(package),
+            declared: declared_hosts_for_row(manifest, &row),
+            key: row.key,
+        })
+        .collect()
+}
+
+/// What `plugin update` prints about the replaced package's config rows after
+/// the replacement: each row it created, then for every row of an instance the
+/// difference between the new version's egress declaration and the row's
+/// grant, the same report install prints for a row that already exists. The
+/// rows are the default tool binding's and, from `channel_rows`, those of the
+/// channel instances bound to the package. Nothing is granted: an update never
+/// extends an allowlist, not even in a row it created.
+#[cfg(feature = "plugins-wasm")]
+fn updated_plugin_config_entry_lines(
     config: &crate::config::schema::Config,
     package: &str,
     rows: &PluginConfigRows<'_>,
     declared_egress: &[String],
-) {
+    channel_rows: &[UpdatedChannelRow],
+) -> Vec<String> {
+    let mut lines = Vec::new();
     for instance_key in &rows.created {
-        print_update_line(&ta(
+        lines.push(ta(
             "cli-plugin-config-entry-seeded",
             &[("name", instance_key)],
             "Seeded config entry. Set plugin config values with \
              `zeroclaw config set plugins.entries.<instance-key>.config.<key>`.",
         ));
     }
-    let reported: Vec<&String> = rows.created.iter().chain(&rows.existing).copied().collect();
+    let reported: Vec<(&str, &str, &[String])> = rows
+        .created
+        .iter()
+        .chain(&rows.existing)
+        .map(|key| (package, key.as_str(), declared_egress))
+        .chain(channel_rows.iter().map(|row| {
+            (
+                row.shown.as_str(),
+                row.key.as_str(),
+                row.declared.as_slice(),
+            )
+        }))
+        .collect();
     if !reported.is_empty()
         && let Some(line) = egress_deployment_gap_line(config)
     {
-        print_update_line(&line);
+        lines.push(line);
     }
-    for instance_key in reported {
-        for line in existing_egress_grant_lines(config, package, instance_key, declared_egress) {
-            print_update_line(&line);
-        }
+    for (shown, key, declared) in reported {
+        lines.extend(existing_egress_grant_lines(config, shown, key, declared));
     }
+    lines
 }
 
 /// The instances whose preserved configuration `manifest` rejects, as
@@ -6742,6 +6826,8 @@ fn plugin_update_outcome_text(name: &str, outcome: &PluginUpdateOutcome) -> Vec<
             &[("name", name)],
             format!("Skipped '{name}': the registry does not list it."),
         )],
+        // The displaced-package note was printed when the batch reached it.
+        PluginUpdateOutcome::Displaced => Vec::new(),
         PluginUpdateOutcome::NeedsApproval {
             version,
             items,
@@ -26196,6 +26282,91 @@ hosts = ["api.example.com", "api2.example.com"]
         claim.join("package")
     }
 
+    /// `--all` leaves a package where an interrupted update displaced it, even
+    /// one displaced after the command's discovery listed it: the batch's
+    /// recovery reports it as displaced and moves nothing, and naming the
+    /// package then puts it back.
+    #[test]
+    #[cfg(feature = "plugins-wasm")]
+    fn a_batch_leaves_a_package_displaced_after_discovery_where_it_is() {
+        let plugins = tempfile::tempdir().expect("plugins dir");
+        let mut host = host_with_installed_tool(plugins.path(), "weather");
+        let claimed = abandoned_claim(plugins.path(), "weather");
+        std::fs::rename(plugins.path().join("weather"), &claimed)
+            .expect("claim the package the way a stopped update leaves it");
+        assert!(
+            host.get_plugin("weather").is_some(),
+            "premise: the batch's discovery still lists it"
+        );
+
+        assert!(matches!(
+            recover_before_update(&mut host, "weather", true),
+            Some(PluginUpdateOutcome::Displaced)
+        ));
+        assert!(claimed.join("manifest.toml").is_file());
+        assert!(!plugins.path().join("weather").exists());
+
+        assert!(recover_before_update(&mut host, "weather", false).is_none());
+        assert!(plugins.path().join("weather/manifest.toml").is_file());
+        assert!(host.get_plugin("weather").is_some());
+    }
+
+    /// After an update, the new version's declaration is reported against the
+    /// grant of each channel instance bound to the package whose row exists, as
+    /// it is for the tool row, and the lines name the instance. A bound alias
+    /// without a row is left to `plugin bind`.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn an_update_reports_the_grant_of_each_bound_channel_row() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let manifest = manifest_with(
+            "chat-bridge",
+            &["channel"],
+            &["api.example.com"],
+            &["http_client"],
+            false,
+        );
+        bind_channel_alias(&mut config, "operations", "chat-bridge", true);
+        bind_channel_alias(&mut config, "support", "chat-bridge", true);
+        let key = expected_channel_instance_key(&manifest, "operations");
+        config.plugins.entries = vec![crate::config::schema::PluginEntryConfig {
+            name: key.clone(),
+            config: std::collections::HashMap::new(),
+            egress_hosts: Vec::new(),
+            egress_allow_private: Vec::new(),
+            tls_profiles: Vec::new(),
+        }];
+
+        let channel_rows = updated_channel_rows(&config, "chat-bridge", &manifest);
+        assert_eq!(
+            channel_rows
+                .iter()
+                .map(|row| row.key.as_str())
+                .collect::<Vec<_>>(),
+            [key.as_str()]
+        );
+        let tool_rows = PluginConfigRows {
+            created: Vec::new(),
+            existing: Vec::new(),
+        };
+        let lines = updated_plugin_config_entry_lines(
+            &config,
+            "chat-bridge",
+            &tool_rows,
+            &[],
+            &channel_rows,
+        );
+        let text = lines.join("\n");
+        assert!(text.contains("chat-bridge (plugin.operations)"), "{text}");
+        assert!(text.contains("+ api.example.com"), "{text}");
+        assert!(
+            text.contains(&key),
+            "the grant command names the row: {text}"
+        );
+        assert!(!text.contains("support"), "{text}");
+    }
+
     /// A package an interrupted update left displaced is put back before the
     /// update is decided, so the operator's retry recovers it and the update
     /// then proceeds against the restored version.
@@ -26212,7 +26383,7 @@ hosts = ["api.example.com", "api2.example.com"]
         assert!(host.get_plugin("weather").is_none());
 
         assert!(
-            recover_before_update(&mut host, "weather").is_none(),
+            recover_before_update(&mut host, "weather", false).is_none(),
             "a restored package goes on to its update"
         );
         assert!(plugins.path().join("weather/manifest.toml").is_file());
@@ -26262,7 +26433,7 @@ hosts = ["api.example.com", "api2.example.com"]
         )
         .expect("host");
 
-        let outcome = recover_before_update(&mut host, "weather");
+        let outcome = recover_before_update(&mut host, "weather", false);
 
         let Some(PluginUpdateOutcome::Failed { error, kept }) = outcome else {
             panic!("expected Failed, got {outcome:?}");
