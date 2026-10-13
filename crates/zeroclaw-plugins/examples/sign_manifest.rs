@@ -4,14 +4,23 @@
 //! pipeline. This example wraps the crate's own signing functions, so the
 //! bytes it signs are the bytes the host verifies. Run it from a ZeroClaw
 //! checkout with paths into the plugin's directory, and keep the private key
-//! outside both trees:
+//! outside both trees. Use a new, separate package directory and a new archive
+//! path for each release:
 //!
 //! ```text
 //! cargo run -p zeroclaw-plugins --example sign_manifest -- keygen ~/.keys/my-plugin.pk8
 //! cargo run -p zeroclaw-plugins --example sign_manifest -- \
-//!     sign path/to/my-plugin/manifest.toml path/to/my-plugin/signed/manifest.toml \
+//!     sign path/to/my-plugin/manifest.toml path/to/my-plugin-package/manifest.toml \
 //!     --key ~/.keys/my-plugin.pk8 --payload path/to/my-plugin/my-plugin.wasm
+//! cp path/to/my-plugin/my-plugin.wasm path/to/my-plugin-package/my-plugin.wasm
+//! (cd path/to/my-plugin-package && zip -r ../my-plugin.zip .)
 //! ```
+//!
+//! This recipe assumes `wasm_path = "my-plugin.wasm"`. `--payload` hashes
+//! the component but does not copy it. Copy those exact bytes and any required
+//! assets to their declared package-relative paths before making the zip.
+//! Archive only the package directory with its signed `manifest.toml`, without
+//! the unsigned source manifest or any post-signing manifest edits.
 //!
 //! `keygen` writes a new PKCS#8 Ed25519 private key and prints its hex public
 //! key, the value operators add to `plugins.security.trusted_publisher_keys`.
