@@ -159,6 +159,10 @@ pub enum UpdateRecovery {
         displaced: PathBuf,
         occupant: PathBuf,
     },
+    /// [`PluginHost::sweep_interrupted_update`] found the package missing and
+    /// a generation of it that an interrupted update claimed, and left the
+    /// claim where it is: only recovering the package by name puts it back.
+    Displaced { displaced: Vec<PathBuf> },
 }
 
 impl PluginHost {
@@ -1267,10 +1271,28 @@ impl PluginHost {
     /// name, are reported and left as found; a generation marked for deletion
     /// is never put back; and a claim that holds neither is finished. Stages that
     /// interrupted updates of `name` left are swept as `remove` sweeps them.
+    /// A batch that did not name the package calls
+    /// [`Self::sweep_interrupted_update`] instead, which never puts one back.
     pub fn recover_interrupted_update(
         &mut self,
         name: &str,
     ) -> Result<UpdateRecovery, PluginError> {
+        self.recover_update(name, true)
+    }
+
+    /// [`Self::recover_interrupted_update`] for a batch that did not name the
+    /// package. Generations finished updates left are deleted the same way,
+    /// but a package an interrupted update displaced is left where it is and
+    /// reported as [`UpdateRecovery::Displaced`], so only recovering it by
+    /// name puts it back. That is judged under the lock, so a package
+    /// displaced after the batch chose its names is left in place too.
+    pub fn sweep_interrupted_update(&mut self, name: &str) -> Result<UpdateRecovery, PluginError> {
+        self.recover_update(name, false)
+    }
+
+    /// [`Self::recover_interrupted_update`], which puts a displaced package
+    /// back only when `restore` is set.
+    fn recover_update(&mut self, name: &str, restore: bool) -> Result<UpdateRecovery, PluginError> {
         if crate::instance::validate_package_name(name).is_err() {
             return Ok(UpdateRecovery::Nothing);
         }
@@ -1323,6 +1345,14 @@ impl PluginHost {
 
         let held = match restorable.len() {
             0 => return Ok(swept),
+            _ if !restore => {
+                return Ok(UpdateRecovery::Displaced {
+                    displaced: restorable
+                        .iter()
+                        .map(|tx| PathBuf::from(root.retained_path(tx)))
+                        .collect(),
+                });
+            }
             1 => restorable.remove(0),
             _ => {
                 return Ok(UpdateRecovery::Ambiguous {
@@ -6263,6 +6293,59 @@ capabilities = ["tool"]
         assert_eq!(package_bytes(&plugins.path().join("weather")), v1);
         assert_eq!(host.get_plugin("weather").unwrap().version, "1.0.0");
         assert!(host.displaced_packages().unwrap().is_empty());
+        assert!(hidden_entries(plugins.path()).is_empty());
+    }
+
+    /// A batch's sweep never puts a displaced package back, even one this host
+    /// still lists because the update that displaced it stopped after this
+    /// host's discovery: it reports the claim and leaves it, and recovering
+    /// the package by name then restores it.
+    #[test]
+    fn a_sweep_leaves_a_package_displaced_after_discovery_where_it_is() {
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        install_tool_version(&mut host, "weather", "1.0.0", b"\0asm v1");
+        let v1 = package_bytes(&plugins.path().join("weather"));
+        let entry = abandon_claim(&host, "weather", false);
+        assert!(host.get_plugin("weather").is_some());
+
+        assert_eq!(
+            host.sweep_interrupted_update("weather").unwrap(),
+            UpdateRecovery::Displaced {
+                displaced: vec![plugins.path().join(&entry).join(recovery::PACKAGE)]
+            }
+        );
+        assert!(!plugins.path().join("weather").exists());
+        assert!(host.get_plugin("weather").is_none());
+        assert_eq!(host.displaced_packages().unwrap(), ["weather"]);
+
+        assert_eq!(
+            host.recover_interrupted_update("weather").unwrap(),
+            UpdateRecovery::Restored
+        );
+        assert_eq!(package_bytes(&plugins.path().join("weather")), v1);
+        assert!(hidden_entries(plugins.path()).is_empty());
+    }
+
+    /// A batch's sweep still deletes what finished updates left of a package
+    /// that is installed.
+    #[test]
+    fn a_sweep_deletes_claimed_generations_of_an_installed_package() {
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        install_tool_version(&mut host, "weather", "1.0.0", b"\0asm v1");
+        abandon_claim(&host, "weather", false);
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        install_tool_version(&mut host, "weather", "2.0.0", b"\0asm v2");
+
+        assert_eq!(
+            host.sweep_interrupted_update("weather").unwrap(),
+            UpdateRecovery::Swept {
+                removed: 1,
+                kept: Vec::new()
+            }
+        );
+        assert_eq!(host.get_plugin("weather").unwrap().version, "2.0.0");
         assert!(hidden_entries(plugins.path()).is_empty());
     }
 
