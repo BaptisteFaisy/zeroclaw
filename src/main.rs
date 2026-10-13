@@ -6301,16 +6301,17 @@ fn recover_before_update(
     } else {
         host.recover_interrupted_update(name)
     };
+    // What finished updates left that recovery could not delete is reported
+    // whatever else it found.
+    if let Ok(recovery) = &recovered {
+        for (path, error) in recovery.kept() {
+            print_update_line(&plugin_update_leftover_line(name, path, error));
+        }
+    }
     match recovered {
         Ok(UpdateRecovery::Displaced { .. }) => Some(PluginUpdateOutcome::Displaced),
-        Ok(UpdateRecovery::Nothing) => None,
-        Ok(UpdateRecovery::Swept { kept, .. }) => {
-            for (path, error) in &kept {
-                print_update_line(&plugin_update_leftover_line(name, path, error));
-            }
-            None
-        }
-        Ok(UpdateRecovery::Restored) => {
+        Ok(UpdateRecovery::Nothing | UpdateRecovery::Swept { .. }) => None,
+        Ok(UpdateRecovery::Restored { .. }) => {
             if let Some(info) = host.get_plugin(name) {
                 let version = &info.version;
                 print_update_line(&ta(
@@ -6333,7 +6334,7 @@ fn recover_before_update(
                 ),
             ))
         }
-        Ok(UpdateRecovery::Ambiguous { displaced }) => {
+        Ok(UpdateRecovery::Ambiguous { displaced, .. }) => {
             let paths = displaced
                 .iter()
                 .map(|path| path.display().to_string())
@@ -6350,6 +6351,7 @@ fn recover_before_update(
         Ok(UpdateRecovery::Occupied {
             displaced,
             occupant,
+            ..
         }) => {
             let displaced = displaced.display().to_string();
             let occupant = occupant.display().to_string();
