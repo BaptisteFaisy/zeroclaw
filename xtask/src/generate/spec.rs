@@ -1640,7 +1640,11 @@ mod tests {
         let release =
             std::fs::read_to_string(root().join(".github/workflows/release-stable-manual.yml"))
                 .unwrap();
-        assert!(release.contains("features --selection dist --target \"${{ matrix.target }}\""));
+        let shared = std::fs::read_to_string(
+            root().join(".github/actions/build-release-payloads/action.yml"),
+        )
+        .unwrap();
+        assert!(shared.contains("features --selection dist --target \"${{ inputs.target }}\""));
         assert!(!release.contains("excluded_features"));
         // The stable release build MUST pin --no-default-features against the
         // generator's explicit per-target list, exactly like the manual workflow.
@@ -1650,8 +1654,8 @@ mod tests {
         // string checks below do NOT catch that, since the leaked feature never
         // appears as a literal in the workflow.
         assert!(
-            release.contains(
-                "$BUILD_CMD --release --locked --no-default-features --features \"${FEATURES}\" --target ${{ matrix.target }}"
+            shared.contains(
+                "$BUILD_CMD --release --locked --no-default-features --features \"${FEATURES}\" --target ${{ inputs.target }}"
             ),
             "the stable release build must pin --no-default-features so target-excluded default features cannot leak back in"
         );
@@ -1681,62 +1685,83 @@ mod tests {
                 "default: dist\n        options:\n          - dist\n          - dist-broad"
             )
         );
-        assert!(job_block(&manual, "  build:\n").contains(
+        for (document, job, emit) in [
+            (&release, "  build:\n", "false"),
+            (&manual, "  stable-gnu-build:\n", "true"),
+        ] {
+            let caller = job_block(job_block(document, job), "      - name: Build release\n");
+            assert!(caller.contains("uses: ./.github/actions/build-release-payloads"));
+            for binding in [
+                "target: ${{ matrix.target }}",
+                "linker_env: ${{ matrix.linker_env || '' }}",
+                "linker: ${{ matrix.linker || '' }}",
+                "use_cross: ${{ matrix.use_cross || 'false' }}",
+            ] {
+                assert!(
+                    caller.contains(binding),
+                    "missing shared-recipe binding: {binding}"
+                );
+            }
+            assert!(caller.contains(&format!("emit_features: '{emit}'")));
+            assert!(!caller.contains("run:") && !caller.contains("shell:"));
+        }
+        let normal = job_block(&manual, "  build:\n");
+        assert!(normal.contains(
             "\n    timeout-minutes: ${{ (matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-apple-darwin') && 180 || 90 }}\n"
         ));
-        assert!(manual.contains("--selection \"${{ inputs.distribution }}\""));
-        assert!(manual.contains("echo \"- Binary bytes: $bytes\""));
-        assert!(manual.contains("echo \"- Resolved features: \\`$FEATURES\\`\""));
-        assert!(manual.contains("echo \"- SHA-256: $sha256\""));
+        assert!(normal.contains("--selection \"${{ inputs.distribution }}\""));
+        assert!(normal.contains("echo \"- Binary bytes: $bytes\""));
+        assert!(normal.contains("echo \"- Resolved features: \\`$FEATURES\\`\""));
+        assert!(normal.contains("echo \"- SHA-256: $sha256\""));
         for target in ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"] {
-            assert!(manual.contains(&format!(
+            assert!(normal.contains(&format!(
                 "- os: ubuntu-latest\n            target: {target}\n            use_cross: true"
             )));
         }
-        assert!(manual.contains(cross_install));
-        assert!(!manual.contains("cargo install cross"));
-        assert!(manual.contains(
+        assert!(normal.contains(cross_install));
+        assert!(!normal.contains("cargo install cross"));
+        assert!(normal.contains(
             "if [ \"${{ matrix.use_cross || 'false' }}\" = \"true\" ]; then\n              echo \"BUILD_CMD=cross build${dist_build_jobs}\""
         ));
-        assert!(manual.contains("echo \"BUILD_CMD=cargo build${dist_build_jobs}\""));
-        assert!(manual.contains(
+        assert!(normal.contains("echo \"BUILD_CMD=cargo build${dist_build_jobs}\""));
+        assert!(normal.contains(
             "prefix-key: ${{ matrix.os }}-${{ matrix.target }}\n          cache-targets: false\n          save-if: ${{ github.ref == 'refs/heads/master' }}"
         ));
-        assert!(manual.contains(
+        assert!(normal.contains(
             "$BUILD_CMD --release --locked --no-default-features --features \"${FEATURES}\" --target ${{ matrix.target }}"
         ));
-        assert!(manual.contains(
+        assert!(normal.contains(
             "run: $BUILD_CMD --release --locked -p zerocode --target ${{ matrix.target }}"
         ));
-        assert!(manual.contains(
+        assert!(normal.contains(
             "run: $BUILD_CMD --release --locked -p zerorelay --target ${{ matrix.target }}"
         ));
         assert_eq!(
-            manual
+            normal
                 .matches("if: matrix.target != 'aarch64-linux-android'")
                 .count(),
             4,
             "the ZeroCode and ZeroRelay builds and uploads must all skip Android"
         );
-        assert!(!manual.contains("excluded_features"));
+        assert!(!normal.contains("excluded_features"));
 
-        let target_env = manual.find("- name: Configure target environment").unwrap();
-        let release_step = manual.find("- name: Build release").unwrap();
-        let zeroclaw_upload = manual
+        let target_env = normal.find("- name: Configure target environment").unwrap();
+        let release_step = normal.find("- name: Build release").unwrap();
+        let zeroclaw_upload = normal
             .find("name: zeroclaw-manual-${{ inputs.distribution }}-${{ matrix.target }}")
             .unwrap();
-        let companion = manual.find("- name: Build ZeroCode companion").unwrap();
+        let companion = normal.find("- name: Build ZeroCode companion").unwrap();
         assert!(
             target_env < release_step
                 && release_step < zeroclaw_upload
                 && zeroclaw_upload < companion
         );
         assert!(
-            manual[target_env..release_step]
+            normal[target_env..release_step]
                 .contains("echo \"${{ matrix.linker_env }}=${{ matrix.linker }}\"")
         );
-        assert!(manual[target_env..release_step].contains(">> \"$GITHUB_ENV\""));
-        assert!(!manual[release_step..companion].contains("matrix.linker_env"));
+        assert!(normal[target_env..release_step].contains(">> \"$GITHUB_ENV\""));
+        assert!(!normal[release_step..companion].contains("matrix.linker_env"));
 
         let stable_build = job_block(&release, "  build:\n");
         assert_eq!(
@@ -1792,6 +1817,7 @@ mod tests {
         for feature in exclusions.values().flatten() {
             assert!(!release.contains(feature));
             assert!(!manual.contains(feature));
+            assert!(!shared.contains(feature));
         }
     }
 
@@ -1852,6 +1878,19 @@ mod tests {
             matrix_targets(job_block(&manual, "  plugin-smoke:\n")),
             smoke_targets,
             "the manual workflow must rehearse exactly the release smoke legs"
+        );
+        assert_eq!(
+            matrix_targets(job_block(&manual, "  stable-gnu-build:\n")),
+            [
+                "x86_64-unknown-linux-gnu",
+                "aarch64-unknown-linux-gnu",
+                "armv7-unknown-linux-gnueabihf",
+                "arm-unknown-linux-gnueabihf",
+            ]
+        );
+        assert_eq!(
+            matrix_targets(job_block(&manual, "  stable-gnu-plugin-smoke:\n")),
+            ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
         );
         for target in &smoke_targets {
             assert!(

@@ -280,6 +280,24 @@ fn shared_release_recipe() -> String {
     explicit_bash_body(step, "        ")
 }
 
+fn assert_release_caller(step: &str, emit_features: &str) {
+    assert!(step.contains("        uses: ./.github/actions/build-release-payloads\n"));
+    assert!(!step.contains("shell:") && !step.contains("run:"));
+    assert_eq!(
+        yaml_block(step, "        with:\n").trim_end(),
+        format!(
+            concat!(
+                "          target: ${{{{ matrix.target }}}}\n",
+                "          linker_env: ${{{{ matrix.linker_env || '' }}}}\n",
+                "          linker: ${{{{ matrix.linker || '' }}}}\n",
+                "          use_cross: ${{{{ matrix.use_cross || 'false' }}}}\n",
+                "          emit_features: '{}'"
+            ),
+            emit_features
+        )
+    );
+}
+
 fn render_release_recipe(body: &str, namespace: &str, context: ReleaseRecipeContext) -> String {
     let mut body = body.to_string();
     for (field, value) in [
@@ -472,12 +490,19 @@ fn immutable_stable_release_recipe_has_real_command_and_failure_baselines() {
     );
     let release = workflow("release-stable-manual.yml");
     let build = yaml_block(&release, "  build:\n");
-    let old_step = yaml_block(build, "      - name: Build release\n");
-    // Phase-1 gate: the active producer is still byte-identical. A later,
-    // separately reviewed caller migration must replace only this assertion.
+    let caller = yaml_block(build, "      - name: Build release\n");
+    assert_release_caller(caller, "false");
+    // Pin every byte outside the one reviewed step wrapper. The independent
+    // shared-body gate below inverts the input adapters to the immutable body.
+    let start = release.find("      - name: Build release\n").unwrap();
+    let end = release[start..]
+        .find("      - name: Check binary size\n")
+        .unwrap()
+        + start;
+    let outside = format!("{}{}", &release[..start], &release[end..]);
     assert_eq!(
-        explicit_bash_body(old_step, "          "),
-        OLD_RELEASE_RECIPE
+        format!("{:x}", Sha256::digest(outside.as_bytes())),
+        "b014f48559771f21ab5b8b117e0d4c1c5f9284b6258bc622d238db2bf7879d3a"
     );
     let matrix = yaml_block(build, "      matrix:\n");
     for context in RELEASE_RECIPE_CONTEXTS {
@@ -721,6 +746,566 @@ fn shared_release_recipe_adapter_guards_have_failure_controls() {
         "Stable's absent output file must expose an unguarded write: {}",
         observed.diagnostics
     );
+}
+
+#[test]
+fn release_payload_callers_bind_the_actual_recipe_and_reject_binding_mutants() {
+    let stable = workflow("release-stable-manual.yml");
+    let manual = workflow("cross-platform-build-manual.yml");
+    let body = shared_release_recipe();
+    for (document, job, emit) in [
+        (&stable, "  build:\n", "false"),
+        (&manual, "  stable-gnu-build:\n", "true"),
+    ] {
+        let caller = yaml_block(yaml_block(document, job), "      - name: Build release\n");
+        assert_release_caller(caller, emit);
+        for (before, after) in [
+            ("target: ${{ matrix.target }}", "target: ${{ matrix.os }}"),
+            ("linker: ${{ matrix.linker || '' }}", "linker: ''"),
+            (
+                "use_cross: ${{ matrix.use_cross || 'false' }}",
+                "use_cross: 'true'",
+            ),
+            (
+                &format!("emit_features: '{emit}'"),
+                &format!(
+                    "emit_features: '{}'",
+                    if emit == "true" { "false" } else { "true" }
+                ),
+            ),
+        ] {
+            assert!(caller.contains(before));
+            let mutant = caller.replacen(before, after, 1);
+            assert!(
+                std::panic::catch_unwind(|| assert_release_caller(&mutant, emit)).is_err(),
+                "the actual caller binding mutant must be refused: {before}"
+            );
+        }
+        for context in RELEASE_RECIPE_CONTEXTS {
+            if emit == "true"
+                && !matches!(
+                    context.target,
+                    "x86_64-unknown-linux-gnu"
+                        | "aarch64-unknown-linux-gnu"
+                        | "armv7-unknown-linux-gnueabihf"
+                        | "arm-unknown-linux-gnueabihf"
+                )
+            {
+                continue;
+            }
+            let recipe = render_release_recipe(&body, "inputs", context);
+            let observed = run_release_recipe(&recipe, context, "", emit, "caller-a,caller-b");
+            assert_release_trace(&observed, context, "", "caller-a,caller-b");
+            assert_eq!(
+                observed.evidence.as_deref(),
+                (emit == "true").then_some("features=caller-a,caller-b\n")
+            );
+        }
+    }
+}
+
+#[test]
+fn manual_qualification_admission_refuses_incompatible_and_malformed_inputs() {
+    let manual = workflow("cross-platform-build-manual.yml");
+    let guard = explicit_bash_body(
+        yaml_block(
+            yaml_block(&manual, "  release-tool-smoke:\n"),
+            "      - name: Validate manual qualification inputs\n",
+        ),
+        "          ",
+    );
+    let check = |body: &str, profile: &str, distribution: &str, tools: &str| {
+        let script = format!(
+            "QUALIFICATION_PROFILE='{profile}'\nDISTRIBUTION='{distribution}'\nRELEASE_TOOLS_ONLY='{tools}'\n{body}"
+        );
+        run_release_recipe(&script, RELEASE_RECIPE_CONTEXTS[0], "", "false", "")
+    };
+    for (profile, distribution, tools) in [
+        ("normal", "dist", "false"),
+        ("normal", "dist-broad", "false"),
+        ("normal", "dist", "true"),
+        ("normal", "dist-broad", "true"),
+        ("stable-gnu-ubuntu22", "dist", "false"),
+    ] {
+        let observed = check(&guard, profile, distribution, tools);
+        assert_eq!(observed.status, Some(0), "{}", observed.diagnostics);
+    }
+    for (profile, distribution, tools) in [
+        ("", "dist", "false"),
+        ("unknown", "dist", "false"),
+        (" normal", "dist", "false"),
+        ("normal", "", "false"),
+        ("normal", "dist ", "false"),
+        ("normal", "dist", ""),
+        ("normal", "dist", "False"),
+        ("stable-gnu-ubuntu22", "dist-broad", "false"),
+        ("stable-gnu-ubuntu22", "dist", "true"),
+    ] {
+        let observed = check(&guard, profile, distribution, tools);
+        assert_eq!(observed.status, Some(2), "{}", observed.diagnostics);
+        assert!(observed.trace.is_empty());
+    }
+    for (before, after, profile, distribution, tools) in [
+        ("normal|stable-gnu-ubuntu22)", "*)", "unknown", "dist", "false"),
+        ("dist|dist-broad)", "*)", "normal", "unknown", "false"),
+        ("true|false)", "*)", "normal", "dist", "False"),
+        (
+            r#"[ "$DISTRIBUTION" != dist ]"#,
+            r#"[ "$DISTRIBUTION" = dist ]"#,
+            "stable-gnu-ubuntu22",
+            "dist-broad",
+            "false",
+        ),
+        (
+            r#"[ "$RELEASE_TOOLS_ONLY" != false ]"#,
+            r#"[ "$RELEASE_TOOLS_ONLY" = false ]"#,
+            "stable-gnu-ubuntu22",
+            "dist",
+            "true",
+        ),
+    ] {
+        assert!(guard.contains(before));
+        let observed = check(&guard.replacen(before, after, 1), profile, distribution, tools);
+        assert_eq!(
+            observed.status,
+            Some(0),
+            "guard mutant must expose refusal loss"
+        );
+    }
+}
+
+#[test]
+fn manual_qualification_completeness_requires_every_actual_role_success() {
+    let manual = workflow("cross-platform-build-manual.yml");
+    let job = yaml_block(&manual, "  stable-gnu-complete:\n");
+    assert!(job.contains(
+        "if: ${{ always() && inputs.qualification_profile == 'stable-gnu-ubuntu22' }}"
+    ));
+    assert!(job.contains(
+        "needs: [release-tool-smoke, stable-gnu-web, stable-gnu-plugin-smoke-packages, stable-gnu-build, stable-gnu-plugin-smoke]"
+    ));
+    let step = yaml_block(job, "      - name: Require selected role success\n");
+    for (env, role) in [
+        ("TOOLS_RESULT", "release-tool-smoke"),
+        ("WEB_RESULT", "stable-gnu-web"),
+        ("FIXTURES_RESULT", "stable-gnu-plugin-smoke-packages"),
+        ("BUILD_RESULT", "stable-gnu-build"),
+        ("NATIVE_RESULT", "stable-gnu-plugin-smoke"),
+    ] {
+        assert!(step.contains(&format!("{env}: ${{{{ needs.{role}.result }}}}")));
+    }
+    let guard = explicit_bash_body(step, "          ");
+    for position in 0..5 {
+        for result in ["success", "", "skipped", "failure", "cancelled"] {
+            let mut results = ["success"; 5];
+            results[position] = result;
+            let script = format!(
+                "TOOLS_RESULT='{}'\nWEB_RESULT='{}'\nFIXTURES_RESULT='{}'\nBUILD_RESULT='{}'\nNATIVE_RESULT='{}'\n{}",
+                results[0], results[1], results[2], results[3], results[4], guard
+            );
+            let observed =
+                run_release_recipe(&script, RELEASE_RECIPE_CONTEXTS[0], "", "false", "");
+            assert_eq!(observed.status, Some(if result == "success" { 0 } else { 2 }));
+        }
+    }
+    let mutant = guard.replacen("success/success/success/success/success)", "*)", 1);
+    assert_ne!(guard, mutant);
+    let script = format!(
+        "TOOLS_RESULT=success\nWEB_RESULT=success\nFIXTURES_RESULT=success\nBUILD_RESULT=skipped\nNATIVE_RESULT=success\n{mutant}"
+    );
+    let observed = run_release_recipe(&script, RELEASE_RECIPE_CONTEXTS[0], "", "false", "");
+    assert_eq!(
+        observed.status,
+        Some(0),
+        "mutant must expose skipped-build acceptance"
+    );
+}
+
+fn assert_manual_qualification_wiring(manual: &str) {
+    for (job_id, role) in [
+        ("stable-gnu-web", "web"),
+        ("stable-gnu-plugin-smoke-packages", "plugin-smoke-packages"),
+        ("stable-gnu-build", "build"),
+    ] {
+        let job = yaml_block(manual, &format!("  {job_id}:\n"));
+        assert!(job.contains("needs: [release-tool-smoke"));
+        assert!(job.contains("if: ${{ inputs.qualification_profile == 'stable-gnu-ubuntu22' }}"));
+        assert!(job.contains(
+            "dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537"
+        ));
+        assert!(job.contains("toolchain: 1.98.0"));
+        assert!(!job.contains("CARGO_INCREMENTAL:"));
+        let receipt_header = match role {
+            "web" => "      - name: Record same-run web inputs\n",
+            "plugin-smoke-packages" => "      - name: Record same-run fixture inputs\n",
+            _ => "      - name: Bind archive qualification receipts\n",
+        };
+        let receipt = explicit_bash_body(yaml_block(job, receipt_header), "          ");
+        assert!(receipt.contains(r#"assert os.environ["CARGO_INCREMENTAL"] == "0""#));
+        assert!(receipt.contains(r#""cargo_incremental": os.environ["CARGO_INCREMENTAL"]"#));
+        assert!(!receipt.contains(".removeprefix("));
+        let cache = yaml_block(
+            job,
+            "      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2\n",
+        );
+        let prefix = match role {
+            "build" => "          prefix-key: ${{ matrix.os }}-${{ matrix.target }}\n",
+            "plugin-smoke-packages" => "          prefix-key: plugin-smoke-packages\n",
+            _ => "",
+        };
+        assert_eq!(
+            yaml_block(cache, "        with:\n").trim_end(),
+            format!("          shared-key: {role}\n{prefix}          save-if: false")
+        );
+    }
+    let build = yaml_block(manual, "  stable-gnu-build:\n");
+    assert!(build.contains("needs: [release-tool-smoke, stable-gnu-web]"));
+    assert!(build.contains("timeout-minutes: 90"));
+    assert_eq!(build.matches("- os: ubuntu-22.04").count(), 4);
+    assert!(!build.contains("--jobs") && !build.contains("dist_runner_memory"));
+    assert!(!build.contains("cache-targets:"));
+    assert_release_caller(yaml_block(build, "      - name: Build release\n"), "true");
+    let inputs = yaml_block(build, "      - name: Record input manifest and ABI observations\n");
+    assert!(inputs.contains("FEATURES: ${{ steps.payloads.outputs.features }}"));
+    let body = explicit_bash_body(inputs, "          ");
+    assert!(body.contains("test -n \"$FEATURES\"\n"));
+    assert!(body.contains("--features \"$FEATURES\" --output archive-evidence/input-manifest.json"));
+    assert_eq!(body.matches("--companion ").count(), 2);
+    assert!(body.contains("for name in zeroclaw zerocode zerorelay; do"));
+    assert!(body.contains("readelf --file-header --program-headers --dynamic --version-info"));
+    assert!(body.contains("\"$compiler\" -print-sysroot"));
+    assert!(build.contains("BINARY_SIZE_HARD_LIMIT: \"83886080\""));
+    let size = build.find("- name: Check standard main binary size").unwrap();
+    let manifest = build.find("- name: Record input manifest and ABI observations").unwrap();
+    let package = build.find("- name: Package and verify standard release archive").unwrap();
+    let receipt = build.find("- name: Bind archive qualification receipts").unwrap();
+    assert!(size < manifest && manifest < package && package < receipt);
+    let native = yaml_block(manual, "  stable-gnu-plugin-smoke:\n");
+    assert!(native.contains("needs: [release-tool-smoke, stable-gnu-build, stable-gnu-plugin-smoke-packages]"));
+    assert!(native.contains("timeout-minutes: 30"));
+    assert!(native.contains("- os: ubuntu-22.04\n            target: x86_64-unknown-linux-gnu"));
+    assert!(native.contains("- os: ubuntu-24.04-arm\n            target: aarch64-unknown-linux-gnu"));
+    assert_eq!(matrix_targets(native).len(), 2);
+    let provider = yaml_block(native, "      - name: Run scripted provider tests\n");
+    assert!(provider.contains("timeout-minutes: 5"));
+    assert!(provider.contains("scripts/ci/plugin_smoke_provider_test.py -v 2>&1 | tee native/provider-tests.log"));
+    assert!(provider.contains("set -euo pipefail"));
+    let smoke = yaml_block(native, "      - name: Run the plugin smoke against the built binary\n");
+    assert!(!smoke.contains("if:") && !smoke.contains("continue-on-error"));
+    assert!(smoke.contains("--archive \"${{ steps.archive.outputs.archive }}\""));
+    assert!(!native.contains("inputs.distribution") && !native.contains("path: binary"));
+    assert!(
+        native.find("- name: Run scripted provider tests").unwrap()
+            < native
+                .find("- name: Run the plugin smoke against the built binary")
+                .unwrap()
+    );
+    let complete = yaml_block(manual, "  stable-gnu-complete:\n");
+    assert!(complete.contains("needs: [release-tool-smoke, stable-gnu-web, stable-gnu-plugin-smoke-packages, stable-gnu-build, stable-gnu-plugin-smoke]"));
+    assert!(complete.contains("if: ${{ always() && inputs.qualification_profile == 'stable-gnu-ubuntu22' }}"));
+    assert!(complete.contains("assert inputs == 12"));
+    assert!(complete.contains(r#"assert receipt["cache"]["cargo_incremental"] == "0""#));
+    assert!(!complete.contains(".removeprefix("));
+    assert!(complete.contains("scripts/ci/verify_release_archive.py"));
+    assert!(!manual.contains("contents: write") && !manual.contains("secrets."));
+}
+
+#[test]
+fn manual_qualification_wiring_rejects_actual_cache_output_and_dependency_mutants() {
+    let manual = workflow("cross-platform-build-manual.yml");
+    assert_manual_qualification_wiring(&manual);
+    for (before, after) in [
+        ("shared-key: build", "shared-key: other"),
+        ("shared-key: web", "shared-key: other"),
+        ("shared-key: plugin-smoke-packages", "shared-key: other"),
+        (
+            "prefix-key: ${{ matrix.os }}-${{ matrix.target }}\n          save-if: false",
+            "prefix-key: wrong\n          save-if: false",
+        ),
+        (
+            "shared-key: build\n          prefix-key:",
+            "shared-key: build\n          cache-targets: false\n          prefix-key:",
+        ),
+        (
+            "FEATURES: ${{ steps.payloads.outputs.features }}",
+            "FEATURES: ${{ steps.payloads.outputs.other }}",
+        ),
+        ("test -n \"$FEATURES\"\n", "true\n"),
+        (
+            "needs: [release-tool-smoke, stable-gnu-web, stable-gnu-plugin-smoke-packages, stable-gnu-build, stable-gnu-plugin-smoke]",
+            "needs: [release-tool-smoke, stable-gnu-web, stable-gnu-plugin-smoke-packages, stable-gnu-plugin-smoke]",
+        ),
+    ] {
+        assert!(manual.contains(before));
+        let mutant = manual.replacen(before, after, 1);
+        assert!(
+            std::panic::catch_unwind(|| assert_manual_qualification_wiring(&mutant)).is_err(),
+            "actual qualifier wiring mutant must fail: {before}"
+        );
+    }
+    let inputs = explicit_bash_body(
+        yaml_block(
+            yaml_block(&manual, "  stable-gnu-build:\n"),
+            "      - name: Record input manifest and ABI observations\n",
+        ),
+        "          ",
+    )
+    .replace("${{ matrix.target }}", RELEASE_RECIPE_CONTEXTS[0].target)
+    .replace("${{ matrix.linker || 'gcc' }}", "gcc");
+    assert!(!inputs.contains("${{"));
+    let observe = |body: &str| {
+        let script = format!(
+            "FEATURES=''\npython3() {{ echo 'controlled manifest boundary'; return 91; }}\n{body}"
+        );
+        run_release_recipe(&script, RELEASE_RECIPE_CONTEXTS[0], "", "false", "")
+    };
+    let refused = observe(&inputs);
+    assert_eq!(refused.status, Some(1), "{}", refused.diagnostics);
+    assert!(!refused.diagnostics.contains("controlled manifest boundary"));
+    let mutant = inputs.replacen("test -n \"$FEATURES\"\n", "true\n", 1);
+    assert_ne!(mutant, inputs);
+    let exposed = observe(&mutant);
+    assert_eq!(exposed.status, Some(91), "{}", exposed.diagnostics);
+    assert!(exposed.diagnostics.contains("controlled manifest boundary"));
+    for (job, step) in [
+        ("stable-gnu-web", "Record same-run web inputs"),
+        ("stable-gnu-plugin-smoke-packages", "Record same-run fixture inputs"),
+        ("stable-gnu-build", "Bind archive qualification receipts"),
+    ] {
+        let body = explicit_bash_body(
+            yaml_block(
+                yaml_block(&manual, &format!("  {job}:\n")),
+                &format!("      - name: {step}\n"),
+            ),
+            "          ",
+        );
+        let producer = body
+            .strip_prefix("python3 - <<'PY'\n")
+            .and_then(|body| body.strip_suffix("PY\n"))
+            .expect("one finite producer receipt body");
+        let observe = |body: &str, incremental: Option<&str>| {
+            let state = match incremental {
+                Some(value) => format!("os.environ['CARGO_INCREMENTAL'] = {value:?}"),
+                None => "os.environ.pop('CARGO_INCREMENTAL', None)".to_owned(),
+            };
+            let script = format!(
+                "python_program=''\nfor candidate in python3 python; do\n  if command -v \"$candidate\" >/dev/null 2>&1 && \"$candidate\" -c 'import sys; sys.exit(sys.version_info < (3, 8))' 2>/dev/null; then python_program=\"$candidate\"; break; fi\ndone\ntest -n \"$python_program\"\n\"$python_program\" - <<'PY'\nimport os, subprocess\n{state}\ndef revision_boundary(*args, **kwargs):\n    raise SystemExit(91)\nsubprocess.check_output = revision_boundary\n{body}\nPY\n"
+            );
+            run_release_recipe(&script, RELEASE_RECIPE_CONTEXTS[0], "", "false", "")
+        };
+        let accepted = observe(producer, Some("0"));
+        assert_eq!(accepted.status, Some(91), "{job}: {}", accepted.diagnostics);
+        for state in [None, Some(""), Some("1")] {
+            let refused = observe(producer, state);
+            assert_eq!(refused.status, Some(1), "{job}: {}", refused.diagnostics);
+        }
+        let mutant = producer.replacen(
+            r#"assert os.environ["CARGO_INCREMENTAL"] == "0""#,
+            "pass",
+            1,
+        );
+        assert_ne!(mutant, producer);
+        let exposed = observe(&mutant, Some("1"));
+        assert_eq!(exposed.status, Some(91), "{job}: {}", exposed.diagnostics);
+    }
+}
+
+#[test]
+fn manual_qualification_inventory_refuses_missing_or_rebound_actual_receipts() {
+    let manual = workflow("cross-platform-build-manual.yml");
+    let body = explicit_bash_body(
+        yaml_block(
+            yaml_block(&manual, "  stable-gnu-complete:\n"),
+            "      - name: Verify finite same-run qualification inventory\n",
+        ),
+        "          ",
+    );
+    let inventory = body
+        .strip_prefix("python3 - <<'PY'\n")
+        .and_then(|body| body.strip_suffix("PY\n"))
+        .expect("the finite inventory has one inline Python body");
+    let verifier = bash_path(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/ci/verify_release_archive.py"),
+    );
+    // Opaque synthetic payloads exercise receipt and archive verification only.
+    // No provider, payload, compiler, or resource helper runs in this fixture.
+    let preparation = r###"
+import hashlib, io, json, os, pathlib, shutil, subprocess, sys, tarfile
+os.environ.update(GITHUB_SHA="fixture-source", GITHUB_RUN_ID="17", GITHUB_RUN_ATTEMPT="2")
+binding = {"source": "fixture-source", "tree": "fixture-tree", "run": 17, "attempt": 2, "profile": "stable-gnu-ubuntu22"}
+targets = ("x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "armv7-unknown-linux-gnueabihf", "arm-unknown-linux-gnueabihf")
+def write(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, sort_keys=True, indent=2) + "\n")
+def hashed(data):
+    return {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+def hashed_file(path):
+    return hashed(path.read_bytes())
+def replace_record(path, change):
+    value = json.loads(path.read_text())
+    change(value)
+    write(path, value)
+pathlib.Path("scripts/ci").mkdir(parents=True)
+shutil.copyfile(VERIFIER_PATH, "scripts/ci/verify_release_archive.py")
+web = pathlib.Path("producers/web/qualification-web.json")
+fixtures = pathlib.Path("producers/fixtures/qualification-fixtures.json")
+web_files = {"index.html": hashed(b"fixture web")}
+for path, role, files in (
+    (web, "web", web_files),
+    (fixtures, "plugin-smoke-packages", {"fixture.wasm": hashed(b"fixture package")}),
+):
+    write(path, {"binding": binding, "role": role, "files": files, "cache": {"shared_key": role, "save_if": False, "cargo_incremental": "0"}})
+for target in targets:
+    root = pathlib.Path("archives") / ("stable-gnu-ubuntu22-archive-" + target)
+    evidence = root / "archive-evidence"
+    payloads = {name: ("fixture " + name).encode() for name in ("zeroclaw", "zerocode", "zerorelay")}
+    payloads["web/dist/index.html"] = b"fixture web"
+    files = {name: hashed(data) for name, data in payloads.items()}
+    manifest = evidence / "input-manifest.json"
+    write(manifest, {"format": "zeroclaw-release-archive-evidence-v1", "source": binding["source"], "target": target, "run": binding["run"], "attempt": binding["attempt"], "features": "fixture-a", "main": "zeroclaw", "files": files, "directories": ["web", "web/dist"]})
+    archive = root / ("zeroclaw-" + target + ".tar.gz")
+    with tarfile.open(archive, "w:gz") as output:
+        for name, data in payloads.items():
+            member = tarfile.TarInfo(name)
+            member.size, member.mode = len(data), 0o755
+            output.addfile(member, io.BytesIO(data))
+    validation = evidence / "validation.json"
+    write(validation, {"fixture": "opaque validation carrier"})
+    observations = {}
+    for name in ("zeroclaw", "zerocode", "zerorelay"):
+        path = evidence / "abi" / (name + ".txt")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("fixture observation")
+        observations[name] = {"input": files[name], "output": hashed_file(path)}
+    write(evidence / "qualification.json", {"binding": binding, "role": "build", "target": target, "features": "fixture-a", "manifest": hashed_file(manifest), "archive": hashed_file(archive), "validation": hashed_file(validation), "web_receipt": hashed_file(web), "observations": observations, "cache": {"shared_key": "build", "prefix_key": "ubuntu-22.04-" + target, "save_if": False, "cargo_incremental": "0"}})
+for target, arch in ((targets[0], "X64"), (targets[1], "ARM64")):
+    root = pathlib.Path("natives") / ("stable-gnu-ubuntu22-native-" + target)
+    root.mkdir(parents=True)
+    archive_root = pathlib.Path("archives") / ("stable-gnu-ubuntu22-archive-" + target)
+    for name in ("archive-validation.json", "provider-tests.log", "plugin-smoke.md"):
+        (root / name).write_text("fixture carrier")
+    write(root / "qualification.json", {"binding": binding, "role": "native", "target": target, "runner_os": "Linux", "runner_arch": arch, "manifest": hashed_file(archive_root / "archive-evidence/input-manifest.json"), "archive": hashed_file(archive_root / ("zeroclaw-" + target + ".tar.gz")), "fixtures_receipt": hashed_file(fixtures), "validation": hashed_file(root / "archive-validation.json"), "provider_log": hashed_file(root / "provider-tests.log"), "smoke_evidence": hashed_file(root / "plugin-smoke.md")})
+build_root = pathlib.Path("archives") / ("stable-gnu-ubuntu22-archive-" + targets[0])
+build_receipt = build_root / "archive-evidence/qualification.json"
+native_root = pathlib.Path("natives") / ("stable-gnu-ubuntu22-native-" + targets[0])
+if MUTATION == "missing-archive":
+    shutil.rmtree(build_root)
+elif MUTATION == "missing-native":
+    shutil.rmtree(native_root)
+elif MUTATION == "bad-build-source":
+    replace_record(build_receipt, lambda value: value["binding"].update(source="other-source"))
+elif MUTATION == "bad-cache":
+    replace_record(build_receipt, lambda value: value["cache"].update(shared_key="other-role"))
+elif MUTATION == "bad-incremental":
+    replace_record(build_receipt, lambda value: value["cache"].update(cargo_incremental="1"))
+elif MUTATION == "missing-incremental":
+    replace_record(build_receipt, lambda value: value["cache"].pop("cargo_incremental"))
+elif MUTATION == "integer-incremental":
+    replace_record(build_receipt, lambda value: value["cache"].update(cargo_incremental=0))
+elif MUTATION == "bad-input":
+    replace_record(build_receipt, lambda value: value["observations"]["zeroclaw"]["input"].update(sha256="0" * 64))
+elif MUTATION == "bad-output-digest":
+    replace_record(build_receipt, lambda value: value["observations"]["zeroclaw"]["output"].update(sha256="0" * 64))
+elif MUTATION == "bad-archive-digest":
+    replace_record(build_receipt, lambda value: value["archive"].update(sha256="0" * 64))
+elif MUTATION == "bad-provider-log-digest":
+    replace_record(native_root / "qualification.json", lambda value: value["provider_log"].update(sha256="0" * 64))
+actual_output = subprocess.check_output
+def controlled_revision(args, **kwargs):
+    if args == ["git", "rev-parse", "HEAD"]:
+        return "fixture-source\n"
+    if args == ["git", "rev-parse", "HEAD^{tree}"]:
+        return "fixture-tree\n"
+    return actual_output(args, **kwargs)
+subprocess.check_output = controlled_revision
+actual_run = subprocess.run
+def existing_verifier(args, **kwargs):
+    assert args[:3] == ["python3", "scripts/ci/verify_release_archive.py", "verify"]
+    return actual_run([sys.executable] + args[1:], **kwargs)
+subprocess.run = existing_verifier
+"###;
+    let check = |inventory: &str, mutation: &str| {
+        let preparation = preparation.replace("VERIFIER_PATH", &format!("{verifier:?}"));
+        let python_selection = r#"python_program=''
+for candidate in python3 python; do
+  if command -v "$candidate" >/dev/null 2>&1 \
+    && "$candidate" -c 'import sys; sys.exit(sys.version_info < (3, 8))' 2>/dev/null; then
+    python_program="$candidate"
+    break
+  fi
+done
+test -n "$python_program"
+"#;
+        let script = format!(
+            "{python_selection}\"$python_program\" - <<'PY'\nMUTATION={mutation:?}\n{preparation}\n{inventory}\nPY\n"
+        );
+        run_release_recipe(&script, RELEASE_RECIPE_CONTEXTS[0], "", "false", "")
+    };
+    let accepted = check(inventory, "");
+    assert_eq!(accepted.status, Some(0), "{}", accepted.diagnostics);
+    for mutation in [
+        "missing-archive",
+        "missing-native",
+        "bad-build-source",
+        "bad-cache",
+        "bad-incremental",
+        "missing-incremental",
+        "integer-incremental",
+        "bad-input",
+        "bad-output-digest",
+        "bad-archive-digest",
+        "bad-provider-log-digest",
+    ] {
+        let refused = check(inventory, mutation);
+        assert_eq!(refused.status, Some(1), "{mutation}: {}", refused.diagnostics);
+    }
+    for (before, after, mutation) in [
+        (
+            r#"assert receipt["binding"] == binding and receipt["role"] == "build" and receipt["target"] == target"#,
+            r#"assert receipt["role"] == "build" and receipt["target"] == target"#,
+            "bad-build-source",
+        ),
+        (
+            r#"assert receipt["cache"]["shared_key"] == "build" and receipt["cache"]["prefix_key"] == "ubuntu-22.04-" + target"#,
+            r#"assert receipt["cache"]["prefix_key"] == "ubuntu-22.04-" + target"#,
+            "bad-cache",
+        ),
+        (
+            r#"assert receipt["cache"]["save_if"] is False and receipt["cache"]["cargo_incremental"] == "0""#,
+            r#"assert receipt["cache"]["save_if"] is False"#,
+            "bad-incremental",
+        ),
+        (
+            r#"assert observation["input"] == manifest["files"][name]"#,
+            "pass",
+            "bad-input",
+        ),
+        (
+            r#"assert observation["output"] == record(evidence / "abi" / (name + ".txt"))"#,
+            "pass",
+            "bad-output-digest",
+        ),
+        (
+            r#"assert receipt["manifest"] == record(manifest_path) and receipt["archive"] == record(archive)"#,
+            r#"assert receipt["manifest"] == record(manifest_path)"#,
+            "bad-archive-digest",
+        ),
+        (
+            r#"assert receipt["provider_log"] == record(root / "provider-tests.log") and receipt["smoke_evidence"] == record(root / "plugin-smoke.md")"#,
+            r#"assert receipt["smoke_evidence"] == record(root / "plugin-smoke.md")"#,
+            "bad-provider-log-digest",
+        ),
+    ] {
+        assert!(inventory.contains(before));
+        let mutant = inventory.replacen(before, after, 1);
+        let exposed = check(&mutant, mutation);
+        assert_eq!(
+            exposed.status,
+            Some(0),
+            "guard mutant {mutation}: {}",
+            exposed.diagnostics
+        );
+    }
 }
 
 #[test]
@@ -1114,7 +1699,7 @@ ${archive_args[@]+\"${archive_args[@]}\"} \\\n            \
 --evidence \"plugin-smoke-${{ matrix.target }}.md\"\n";
     for required in [
         "needs: [build, plugin-smoke-packages]",
-        "if: ${{ !cancelled() && !inputs.release_tools_only && needs.plugin-smoke-packages.result == 'success' }}",
+        "if: ${{ !cancelled() && inputs.qualification_profile == 'normal' && !inputs.release_tools_only && needs.plugin-smoke-packages.result == 'success' }}",
         "name: zeroclaw-manual-${{ inputs.distribution }}-${{ matrix.target }}",
         rehearsal_invocation,
     ] {
