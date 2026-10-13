@@ -1055,7 +1055,10 @@ and retry `plugin remove`: retry restores the package before applying normal
 admission policy. A claim whose delete had begun is marked, and a retry
 finishes that delete instead of restoring it. A hidden transaction is never, by its name alone, evidence
 that a healthy package can be deleted. Filesystem namespace changes and
-unsupported locking refuse recovery safely. Where the platform or filesystem
-has no rename that refuses an existing destination (FreeBSD, an NFS mount,
-Linux before 3.15), a package directory moves with a plain rename, which can
-replace only an empty directory, and nothing but a directory moves that way.
+unsupported locking refuse recovery safely. Package moves require an atomic
+rename that refuses every existing destination, including an empty directory.
+Where the platform or filesystem cannot provide it (other Unix platforms such
+as FreeBSD, an NFS mount without no-replace support, or Linux before 3.15),
+installation and recovery refuse the move. A failed claim leaves the final
+entry unmoved; a failed publication or restoration retains the package in its
+hidden transaction and reports that path. No plain replacing rename is used.

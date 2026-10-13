@@ -358,57 +358,47 @@ impl Transaction {
     }
 }
 
-/// Move a directory without replacing an existing destination where the
-/// filesystem can, and with [`rename_directory`] where it cannot. Only single
-/// entry names reach this helper.
+/// Move a package without replacing any existing destination. Refuse when the
+/// platform or filesystem cannot enforce that atomically: checking an entry's
+/// type before a replacing rename does not pin the entry against substitution.
+/// Only single entry names reach this helper.
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 fn rename_new(from: &Dir, name: &str, to: &Dir, dest: &str) -> std::io::Result<()> {
     use rustix::io::Errno;
 
     #[cfg(test)]
-    if FORCE_PLAIN_RENAME.with(std::cell::Cell::get) {
-        return rename_directory(from, name, to, dest);
-    }
-    match rustix::fs::renameat_with(from, name, to, dest, rustix::fs::RenameFlags::NOREPLACE) {
-        // The filesystem or kernel has no no-replace rename: an NFS client
-        // refuses any rename flag with EINVAL, and Linux before 3.15 or a FUSE
-        // server without rename2 answers ENOSYS or EOPNOTSUPP.
+    pause("rename-before-move");
+    let rename =
+        || rustix::fs::renameat_with(from, name, to, dest, rustix::fs::RenameFlags::NOREPLACE);
+    #[cfg(test)]
+    let result = FORCE_RENAME_ERROR
+        .with(std::cell::Cell::get)
+        .map_or_else(rename, Err);
+    #[cfg(not(test))]
+    let result = rename();
+    match result {
         Err(errno)
             if [Errno::INVAL, Errno::NOSYS, Errno::NOTSUP, Errno::OPNOTSUPP].contains(&errno) =>
         {
-            rename_directory(from, name, to, dest)
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("atomic no-replace package move unavailable ({errno})"),
+            ))
         }
         result => result.map_err(std::io::Error::from),
     }
 }
 
-/// Other Unix platforms have no no-replace rename.
+/// No atomic no-replace primitive is wired for other Unix platforms.
 #[cfg(all(
     unix,
     not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
 ))]
-fn rename_new(from: &Dir, name: &str, to: &Dir, dest: &str) -> std::io::Result<()> {
-    rename_directory(from, name, to, dest)
-}
-
-/// Move a directory with a plain rename where no no-replace rename exists.
-/// Renamed over an existing entry, a directory replaces at most an empty
-/// directory, because rename refuses a non-empty one and a non-directory, so no
-/// bytes are lost. Nothing but a directory moves this way: a renamed file would
-/// replace a file at the destination.
-#[cfg(unix)]
-fn rename_directory(from: &Dir, name: &str, to: &Dir, dest: &str) -> std::io::Result<()> {
-    use rustix::fs::{AtFlags, FileType};
-
-    let source = rustix::fs::statat(from, name, AtFlags::SYMLINK_NOFOLLOW)?;
-    if FileType::from_raw_mode(source.st_mode) != FileType::Directory {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "only a directory moves without a no-replace rename",
-        ));
-    }
-    rustix::fs::renameat(from, name, to, dest)?;
-    Ok(())
+fn rename_new(_: &Dir, _: &str, _: &Dir, _: &str) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic no-replace package move unavailable",
+    ))
 }
 
 #[cfg(all(
@@ -416,10 +406,9 @@ fn rename_directory(from: &Dir, name: &str, to: &Dir, dest: &str) -> std::io::Re
     any(target_os = "linux", target_os = "android", target_vendor = "apple")
 ))]
 thread_local! {
-    /// Set by a test to move packages the way a platform without a no-replace
-    /// rename does.
-    pub(super) static FORCE_PLAIN_RENAME: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
+    /// Override the atomic primitive's result without changing its error path.
+    pub(super) static FORCE_RENAME_ERROR: std::cell::Cell<Option<rustix::io::Errno>> =
+        const { std::cell::Cell::new(None) };
 }
 
 #[cfg(windows)]
@@ -628,37 +617,200 @@ mod lock_descriptor_tests {
     }
 }
 
-#[cfg(all(test, unix))]
-mod plain_rename_tests {
+#[cfg(all(
+    test,
+    any(target_os = "linux", target_os = "android", target_vendor = "apple")
+))]
+mod rename_tests {
     use super::*;
 
-    /// The move used without a no-replace rename puts a directory at a free
-    /// name or in place of an empty directory, and refuses everything else.
+    struct ForcedError(Option<rustix::io::Errno>);
+    impl ForcedError {
+        fn set(errno: rustix::io::Errno) -> Self {
+            Self(FORCE_RENAME_ERROR.with(|error| error.replace(Some(errno))))
+        }
+    }
+    impl Drop for ForcedError {
+        fn drop(&mut self) {
+            FORCE_RENAME_ERROR.with(|error| error.set(self.0));
+        }
+    }
+
     #[test]
-    fn plain_rename_moves_only_a_directory_and_never_replaces_bytes() {
+    fn unsupported_moves_preserve_source_and_each_destination() {
+        use rustix::io::Errno;
+        for errno in [Errno::INVAL, Errno::NOSYS, Errno::NOTSUP, Errno::OPNOTSUPP] {
+            let _forced = ForcedError::set(errno);
+            for destination in ["free", "file", "empty", "full", "link"] {
+                let temp = tempfile::tempdir().unwrap();
+                let root = Root::open(temp.path()).unwrap();
+                let dir = &root.dir;
+                dir.create_dir("source").unwrap();
+                dir.write("source/keep", b"source bytes").unwrap();
+                let source_id = same_file::Handle::from_path(temp.path().join("source")).unwrap();
+                match destination {
+                    "free" => {}
+                    "file" => dir.write(destination, b"destination bytes").unwrap(),
+                    "empty" | "full" => {
+                        dir.create_dir(destination).unwrap();
+                        if destination == "full" {
+                            dir.write("full/keep", b"destination bytes").unwrap();
+                        }
+                    }
+                    "link" => {
+                        std::os::unix::fs::symlink("source", temp.path().join(destination))
+                            .unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                let destination_id = (destination != "free")
+                    .then(|| same_file::Handle::from_path(temp.path().join(destination)).unwrap());
+                let error = rename_new(dir, "source", dir, destination).unwrap_err();
+                assert_eq!(
+                    error.kind(),
+                    std::io::ErrorKind::Unsupported,
+                    "{errno:?}/{destination}: {error}"
+                );
+                assert_eq!(dir.read("source/keep").unwrap(), b"source bytes");
+                assert_eq!(
+                    same_file::Handle::from_path(temp.path().join("source")).unwrap(),
+                    source_id
+                );
+                if let Some(destination_id) = destination_id {
+                    assert_eq!(
+                        same_file::Handle::from_path(temp.path().join(destination)).unwrap(),
+                        destination_id
+                    );
+                }
+                match destination {
+                    "free" => assert!(!dir.exists(destination)),
+                    "file" => assert_eq!(dir.read(destination).unwrap(), b"destination bytes"),
+                    "empty" => assert!(
+                        dir.open_dir(destination)
+                            .unwrap()
+                            .entries()
+                            .unwrap()
+                            .next()
+                            .is_none()
+                    ),
+                    "full" => assert_eq!(dir.read("full/keep").unwrap(), b"destination bytes"),
+                    "link" => assert_eq!(
+                        std::fs::read_link(temp.path().join(destination)).unwrap(),
+                        Path::new("source")
+                    ),
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_atomic_move_errors_keep_errno_and_bytes() {
+        use rustix::io::Errno;
+        for errno in [Errno::ACCESS, Errno::XDEV, Errno::NOENT] {
+            let _forced = ForcedError::set(errno);
+            let temp = tempfile::tempdir().unwrap();
+            let root = Root::open(temp.path()).unwrap();
+            root.dir.create_dir("source").unwrap();
+            root.dir.write("source/keep", b"source bytes").unwrap();
+            let error = rename_new(&root.dir, "source", &root.dir, "free").unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(errno.raw_os_error()));
+            assert_eq!(root.dir.read("source/keep").unwrap(), b"source bytes");
+            assert!(!root.dir.exists("free"));
+        }
+    }
+
+    #[test]
+    fn unsupported_claim_and_restore_retain_exact_directory_generations() {
         let temp = tempfile::tempdir().unwrap();
         let root = Root::open(temp.path()).unwrap();
-        let dir = &root.dir;
-        dir.create_dir("source").unwrap();
-        dir.write("source/keep", b"source bytes").unwrap();
-        dir.create_dir("full").unwrap();
-        dir.write("full/keep", b"full bytes").unwrap();
-        dir.write("file", b"file bytes").unwrap();
+        root.dir.create_dir("source").unwrap();
+        root.dir.write("source/keep", b"source bytes").unwrap();
+        let source_id = same_file::Handle::from_path(temp.path().join("source")).unwrap();
+        let tx = root.transaction("source", "recovering").unwrap();
+        {
+            let _forced = ForcedError::set(rustix::io::Errno::NOSYS);
+            let claim_result = tx.claim(&root, "source");
+            assert!(
+                matches!(
+                    &claim_result,
+                    Err(PluginError::Io(error)) if error.kind() == std::io::ErrorKind::Unsupported
+                ),
+                "claim result: {claim_result:?}"
+            );
+            assert_eq!(root.dir.read("source/keep").unwrap(), b"source bytes");
+            assert_eq!(
+                same_file::Handle::from_path(temp.path().join("source")).unwrap(),
+                source_id
+            );
+            assert!(!tx.dir.exists(PACKAGE));
+        }
+        tx.claim(&root, "source").unwrap();
+        let claimed = tx.dir.open_dir(PACKAGE).unwrap();
+        assert_eq!(identity(&claimed).unwrap(), source_id);
+        let _forced = ForcedError::set(rustix::io::Errno::NOSYS);
+        assert!(matches!(
+            tx.publish(&root, "source"),
+            Err(PluginError::Io(error)) if error.kind() == std::io::ErrorKind::Unsupported
+        ));
+        assert!(!root.dir.exists("source"));
+        assert_eq!(tx.dir.read("package/keep").unwrap(), b"source bytes");
+        assert_eq!(identity(&claimed).unwrap(), source_id);
+        root.dir.write("source", b"destination sentinel").unwrap();
+        let destination_id = same_file::Handle::from_path(temp.path().join("source")).unwrap();
+        assert!(matches!(
+            tx.publish(&root, "source"),
+            Err(PluginError::Io(error)) if error.kind() == std::io::ErrorKind::Unsupported
+        ));
+        assert_eq!(root.dir.read("source").unwrap(), b"destination sentinel");
+        assert_eq!(
+            same_file::Handle::from_path(temp.path().join("source")).unwrap(),
+            destination_id
+        );
+        assert_eq!(tx.dir.read("package/keep").unwrap(), b"source bytes");
+        assert_eq!(identity(&claimed).unwrap(), source_id);
+    }
 
-        assert!(rename_directory(dir, "source", dir, "full").is_err());
-        assert!(rename_directory(dir, "source", dir, "file").is_err());
-        assert!(rename_directory(dir, "file", dir, "free").is_err());
-        assert!(rename_directory(dir, "file", dir, "full").is_err());
-        assert_eq!(dir.read("source/keep").unwrap(), b"source bytes");
-        assert_eq!(dir.read("full/keep").unwrap(), b"full bytes");
-        assert_eq!(dir.read("file").unwrap(), b"file bytes");
-        assert!(!dir.exists("free"));
-
-        dir.create_dir("empty").unwrap();
-        rename_directory(dir, "source", dir, "empty").unwrap();
-        rename_directory(dir, "empty", dir, "moved").unwrap();
-        assert_eq!(dir.read("moved/keep").unwrap(), b"source bytes");
-        assert!(!dir.exists("source") && !dir.exists("empty"));
+    #[test]
+    fn atomic_claim_refuses_conflicts_then_restores_exact_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = Root::open(temp.path()).unwrap();
+        root.dir.create_dir("source").unwrap();
+        root.dir.write("source/keep", b"source bytes").unwrap();
+        let source_id = same_file::Handle::from_path(temp.path().join("source")).unwrap();
+        let tx = root.transaction("source", "recovering").unwrap();
+        tx.claim(&root, "source").unwrap();
+        assert!(!root.dir.exists("source"));
+        let claimed = tx.dir.open_dir(PACKAGE).unwrap();
+        assert_eq!(identity(&claimed).unwrap(), source_id);
+        root.dir.create_dir("source").unwrap();
+        let destination_id = same_file::Handle::from_path(temp.path().join("source")).unwrap();
+        assert!(tx.publish(&root, "source").is_err());
+        assert_eq!(
+            same_file::Handle::from_path(temp.path().join("source")).unwrap(),
+            destination_id
+        );
+        assert!(
+            root.dir
+                .open_dir("source")
+                .unwrap()
+                .entries()
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        assert_eq!(tx.dir.read("package/keep").unwrap(), b"source bytes");
+        assert_eq!(identity(&claimed).unwrap(), source_id);
+        root.dir.remove_dir("source").unwrap();
+        tx.publish(&root, "source").unwrap();
+        assert_eq!(root.dir.read("source/keep").unwrap(), b"source bytes");
+        assert_eq!(
+            same_file::Handle::from_path(temp.path().join("source")).unwrap(),
+            source_id
+        );
+        assert!(!tx.dir.exists(PACKAGE));
+        drop(claimed);
+        tx.finish(&root).unwrap();
     }
 }
 

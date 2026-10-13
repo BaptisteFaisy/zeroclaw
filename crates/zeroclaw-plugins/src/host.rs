@@ -5539,27 +5539,45 @@ capabilities = ["tool"]
         ));
     }
 
-    /// Without a no-replace rename (FreeBSD, an NFS mount, Linux before 3.15),
-    /// install publishes, and recovery claims, deletes and restores, through a
-    /// plain directory rename.
+    /// An unavailable no-replace primitive refuses publication and recovery,
+    /// preserving the staged package and every final package's bytes.
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     #[test]
-    fn install_and_recovery_work_without_a_no_replace_rename() {
-        recovery::FORCE_PLAIN_RENAME.with(|force| force.set(true));
+    fn install_and_recovery_refuse_without_a_no_replace_rename() {
+        struct Reset(Option<rustix::io::Errno>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                recovery::FORCE_RENAME_ERROR.with(|error| error.set(self.0));
+            }
+        }
+        let _reset = Reset(
+            recovery::FORCE_RENAME_ERROR
+                .with(|error| error.replace(Some(rustix::io::Errno::NOSYS))),
+        );
         let plugins = tempdir().unwrap();
         let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
         let source = tempdir().unwrap();
         write_tool_source(source.path(), "plain", b"\0asm plain");
-        assert_eq!(
-            host.install(source.path().to_str().unwrap()).unwrap(),
-            "plain"
-        );
+        let expected = package_bytes(source.path());
+        let result = host.install(source.path().to_str().unwrap());
+        let Err(PluginError::RecoveryRetained { path, reason }) = result else {
+            panic!("an unsupported publication must retain the stage: {result:?}");
+        };
+        assert_eq!(package_bytes(Path::new(&path)), expected);
+        assert!(reason.contains("no-replace"), "{reason}");
+        assert!(!plugins.path().join("plain").exists());
 
         let broken = plugins.path().join("broken");
         std::fs::create_dir(&broken).unwrap();
         std::fs::write(broken.join("manifest.toml"), "name =").unwrap();
-        host.remove("broken").unwrap();
-        assert!(!broken.exists());
+        let broken_before = package_bytes(&broken);
+        let broken_id = same_file::Handle::from_path(&broken).unwrap();
+        assert!(matches!(
+            host.remove("broken"),
+            Err(PluginError::Io(error)) if error.kind() == std::io::ErrorKind::Unsupported
+        ));
+        assert_eq!(package_bytes(&broken), broken_before);
+        assert_eq!(same_file::Handle::from_path(&broken).unwrap(), broken_id);
 
         let late = plugins.path().join("late");
         std::fs::create_dir(&late).unwrap();
@@ -5567,13 +5585,11 @@ capabilities = ["tool"]
         let before = package_bytes(&late);
         assert!(matches!(
             host.remove("late"),
-            Err(PluginError::UnadmittedPackage { .. })
+            Err(PluginError::Io(error)) if error.kind() == std::io::ErrorKind::Unsupported
         ));
         assert_eq!(package_bytes(&late), before);
-        assert_eq!(
-            dir_entries(plugins.path()),
-            [".zeroclaw-package-lock-v1", "late", "plain"]
-        );
+        assert_eq!(package_bytes(source.path()), expected);
+        assert_eq!(package_bytes(Path::new(&path)), expected);
     }
 
     /// A lock file this user cannot write, such as one another user created in
