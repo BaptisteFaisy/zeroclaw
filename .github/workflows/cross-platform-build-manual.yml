@@ -107,6 +107,420 @@ jobs:
             echo "- cargo tauri --version: \`$cargo_version\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
+
+      - name: Qualify signing example argv and supported output
+        id: signer_argv
+        if: >-
+          inputs.release_tools_only && inputs.distribution == 'dist' &&
+          matrix.tool == 'cross' && github.repository == 'zeroclaw-labs/zeroclaw' &&
+          github.ref == 'refs/heads/test/11310-signing-example-argv-qualification-20261013'
+        timeout-minutes: 12
+        shell: bash
+        env:
+          SIGNER_TOOLS_ONLY: ${{ inputs.release_tools_only }}
+          SIGNER_DISTRIBUTION: ${{ inputs.distribution }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REPOSITORY" = zeroclaw-labs/zeroclaw
+          test "$GITHUB_REF" = refs/heads/test/11310-signing-example-argv-qualification-20261013
+          test "$SIGNER_TOOLS_ONLY" = true
+          test "$SIGNER_DISTRIBUTION" = dist
+          test "$RUNNER_OS/$RUNNER_ARCH" = Linux/X64
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          sdk_parent=d0a8dbe10cdd1eb90c6ba0843a4a8313846b4954
+          sdk_parents="$(git cat-file -p HEAD | sed '/^$/q' | sed -n 's/^parent //p')"
+          test "$sdk_parents" = "$sdk_parent"
+          timeout --signal=TERM --kill-after=5s 30s git fetch --no-tags --depth=1 https://github.com/zeroclaw-labs/zeroclaw.git "$sdk_parent"
+          test "$(git rev-parse "$sdk_parent^{tree}")" = 16e7422b91e175762acea4afc6ba0e7718176c08
+          test "$(git diff --name-only "$sdk_parent" HEAD)" = .github/workflows/cross-platform-build-manual.yml
+          sdk_source_clean() {
+            local sdk_state
+            sdk_state="$(git status --porcelain=v1 --untracked-files=all)"
+            test -z "$sdk_state"
+            printf '%s\n' \
+            '5465b0bdf2d5e6382183b15897f9bf759b034fbfcfcffd91db3db1a137eca728  Cargo.lock' \
+            '22a9ad4c2305ad3b06cd179ec34a4e739fcb634c9ec2d38e5da529ed55331ea1  Cargo.toml' \
+            'cc7a34a9cc6d4f4b428bec77f21f69fd934eb26bf7dfdb5b445cecf377dfc210  .cargo/config.toml' \
+            'c42f84745542e95852a7827cd7899a6039fde35e9b0853ce7f157046c8dc5120  crates/zeroclaw-plugins/Cargo.toml' \
+            '03df5d92c74973e8b94b89f62de6d4f04a6e1b1098dfad0e5439a754c586a23b  crates/zeroclaw-plugins/src/signature.rs' \
+            'fba408330edf20706d5f080b9cf758ed8eb35efa5cf65bca19fde9623ab274e3  crates/zeroclaw-plugins/examples/sign_manifest.rs' \
+            '145d5d51d81350f66de8838e330a4881154b0244ad71d9d6ad31e61ddddda93c  crates/zeroclaw-tools/Cargo.toml' \
+            '2a82f2923c413238c2c8da8e933b80798d8b3f8c6f02c8e720af460ca69063da  crates/zeroclaw-hardware/Cargo.toml' | sha256sum --check --strict
+          }
+          sdk_source_clean
+          sdk_evidence="$(mktemp -d "$RUNNER_TEMP/signer-argv-evidence.XXXXXX")"
+          chmod 700 "$sdk_evidence"
+          printf 'evidence_dir=%s\n' "$sdk_evidence" >> "$GITHUB_OUTPUT"
+          python3 - "$sdk_evidence" "$sdk_parent" <<'SOURCE_PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          source = {
+              "head": os.environ["GITHUB_SHA"],
+              "tree": subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], text=True).strip(),
+              "parent": sys.argv[2],
+              "parent_tree": "16e7422b91e175762acea4afc6ba0e7718176c08",
+              "run": os.environ["GITHUB_RUN_ID"],
+              "attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "runner": os.environ["RUNNER_OS"] + "/" + os.environ["RUNNER_ARCH"],
+              "branch": os.environ["GITHUB_REF"],
+              "scope": "current d0 argv/output; valid strict-directory proof reused separately",
+          }
+          Path(sys.argv[1], "source.json").write_text(json.dumps(source, indent=2) + "\n", encoding="utf-8")
+          SOURCE_PY
+          rustc --version
+          cargo --version
+          set +e
+          cargo build --locked -p zeroclaw-plugins --no-default-features --features plugins-wasm-cranelift --example sign_manifest
+          sdk_build_status=$?
+          set -e
+          printf '{"exit":%s,"command":["cargo","build","--locked","-p","zeroclaw-plugins","--no-default-features","--features","plugins-wasm-cranelift","--example","sign_manifest"]}\n' "$sdk_build_status" > "$sdk_evidence/build.json"
+          printf 'SIGNER:BUILD exit=%s\n' "$sdk_build_status"
+          sdk_source_clean
+          test "$sdk_build_status" -eq 0
+          python3 - target/debug/examples/sign_manifest "$sdk_evidence" <<'SIGNER_PY'
+          import base64
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import shutil
+          import stat
+          import subprocess
+          import sys
+          import tempfile
+
+          binary_input = Path(sys.argv[1])
+          binary_info = binary_input.lstat()
+          if (not stat.S_ISREG(binary_info.st_mode) or binary_input.is_symlink()
+                  or binary_info.st_uid != os.getuid()):
+              raise SystemExit("SIGNER:FAIL compiled binary type/owner")
+          binary = binary_input.resolve(strict=True)
+          evidence_input = Path(sys.argv[2])
+          evidence_info = evidence_input.lstat()
+          if (not stat.S_ISDIR(evidence_info.st_mode) or evidence_input.is_symlink()
+                  or evidence_info.st_uid != os.getuid()):
+              raise SystemExit("SIGNER:FAIL evidence directory type/owner")
+          evidence = evidence_input.resolve(strict=True)
+          runner_temp = Path(os.environ["RUNNER_TEMP"]).resolve(strict=True)
+          binary_hash = hashlib.sha256(binary.read_bytes()).hexdigest()
+          scratch = Path(tempfile.mkdtemp(prefix="signer-argv-private.", dir=str(runner_temp)))
+          scratch.chmod(0o700)
+          owned = scratch.lstat()
+          case_records = []
+          public_outputs = {}
+          phase = "setup"
+          private_material = b""
+          failure_reason = "unexpected-io-or-runtime"
+          last_status = None
+          key = None
+
+
+          def require(condition, reason):
+              global failure_reason
+              if not condition:
+                  failure_reason = reason
+                  raise RuntimeError("signer proof refused")
+
+
+          def digest(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+          def invoke(name, args, expected_status, stderr_contains=None):
+              global phase, last_status
+              phase = name
+              last_status = None
+              require(digest(binary) == binary_hash, "compiled binary changed")
+              result = subprocess.run(
+                  [str(binary)] + [str(arg) for arg in args],
+                  cwd=str(scratch),
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  timeout=20,
+                  check=False,
+              )
+              last_status = result.returncode
+              require(len(result.stdout) <= 8192 and len(result.stderr) <= 8192, "oversized output")
+              public_outputs[name] = (result.stdout, result.stderr)
+              require(result.returncode == expected_status, "unexpected process exit")
+              if expected_status == 0:
+                  require(re.fullmatch(rb"[0-9a-f]{64}\n", result.stdout) is not None, "invalid public stdout")
+              else:
+                  require(result.stdout == b"", "refusal printed stdout")
+              if stderr_contains is None:
+                  require(result.stderr == b"", "unexpected stderr")
+              else:
+                  require(stderr_contains in result.stderr, "missing expected diagnostic")
+              case_records.append(
+                  {"name": name, "argv": [str(arg) for arg in args], "exit": result.returncode}
+              )
+              print("SIGNER:CASE name=%s exit=%d" % (name, result.returncode), flush=True)
+              return result.stdout
+
+
+          def public_field(document, key, pattern):
+              matches = re.findall(r'^' + key + r' = "(' + pattern + r')"$', document, re.MULTILINE)
+              require(len(matches) == 1, "missing or duplicate controlled root field")
+              return matches[0]
+
+
+          def publish_checked_outputs():
+              if not private_material:
+                  return False
+              encodings = [private_material, private_material.hex().encode(), base64.b64encode(private_material)]
+              for stdout, stderr in public_outputs.values():
+                  require(all(value not in stdout + stderr for value in encodings), "private-output-refused")
+              for name, (stdout, stderr) in public_outputs.items():
+                  (evidence / (name + ".stdout")).write_bytes(stdout)
+                  (evidence / (name + ".stderr")).write_bytes(stderr)
+              return True
+
+
+          try:
+              require(binary.is_file() and not binary.is_symlink() and os.access(binary, os.X_OK), "not an executable")
+              # Paths with spaces exercise real argv; all files are synthetic and owned.
+              inputs = scratch / "input with space"
+              inputs.mkdir(mode=0o700)
+              key = scratch / "private with space" / "publisher.pk8"
+              payload = inputs / "component.wasm"
+              payload.write_bytes(b"controlled signer argv payload; not claimed to be valid Wasm\n")
+              manifest = inputs / "manifest.toml"
+              manifest.write_text(
+                  'name = "signer-argv-fixture"\nversion = "0.1.0"\nwasm_path = "component.wasm"\n'
+                  '\n[config_schema]\ntype = "object"\nadditionalProperties = false\n',
+                  encoding="utf-8",
+              )
+              no_wasm = inputs / "no-wasm.toml"
+              no_wasm.write_text('name = "signer-argv-skill"\nversion = "0.1.0"\n', encoding="utf-8")
+              generated_key = invoke("keygen_new", ["keygen", key], 0)
+              require(key.is_file() and not key.is_symlink(), "key file missing")
+              require(stat.S_IMODE(key.stat().st_mode) == 0o600, "private file mode")
+              require(stat.S_IMODE(key.parent.stat().st_mode) == 0o700, "private directory mode")
+              private_material = key.read_bytes()
+              require(bool(private_material), "empty generated key")
+              invoke("keygen_existing", ["keygen", key], 1, b"create the private key file")
+              require(key.read_bytes() == private_material, "key changed after overwrite refusal")
+
+              signed = scratch / "signed with space" / "manifest.toml"
+              signed_key = invoke(
+                  "sign_payload", ["sign", manifest, signed, "--key", key, "--payload", payload], 0
+              )
+              require(signed_key == generated_key, "sign stdout differs from generated public key")
+              document = signed.read_text(encoding="utf-8")
+              require(len(document.encode("utf-8")) <= 8192, "oversized signed output")
+              require(public_field(document, "wasm_sha256", "[0-9a-f]{64}") == digest(payload), "payload digest mismatch")
+              require(public_field(document, "publisher_key", "[0-9a-f]{64}").encode() + b"\n" == generated_key, "publisher mismatch")
+              public_field(document, "signature", "[A-Za-z0-9_-]+")
+              require(document.index("publisher_key =") < document.index("[config_schema]"), "publisher field layout")
+              require(document.index("signature =") < document.index("[config_schema]"), "signature field layout")
+
+              without_digest = scratch / "signed no digest" / "manifest.toml"
+              warning_key = invoke(
+                  "sign_no_payload", ["sign", manifest, without_digest, "--key", key], 0,
+                  b"warning: the manifest has no wasm_sha256; hosts in strict signature mode",
+              )
+              require(warning_key == generated_key, "warning path printed a different key")
+              warning_document = without_digest.read_text(encoding="utf-8")
+              require(re.search(r"^wasm_sha256\s*=", warning_document, re.MULTILINE) is None, "unexpected digest")
+
+              refused = scratch / "never-created" / "manifest.toml"
+              invoke(
+                  "sign_payload_without_wasm_path",
+                  ["sign", no_wasm, refused, "--key", key, "--payload", payload], 1,
+                  b"the manifest declares no wasm_path",
+              )
+              require(not refused.exists() and not refused.parent.exists(), "refused output created")
+              extra_key = scratch / "never-created-key.pk8"
+              for name, args in [
+                  ("argv_empty", []),
+                  ("argv_unknown_command", ["unknown-command"]),
+                  ("argv_keygen_missing_path", ["keygen"]),
+                  ("argv_keygen_extra_path", ["keygen", extra_key, "extra"]),
+                  ("argv_sign_missing_key_value", ["sign", manifest, refused, "--key"]),
+                  ("argv_sign_missing_payload_value", ["sign", manifest, refused, "--key", key, "--payload"]),
+                  ("argv_sign_unknown_extra_argument", ["sign", manifest, refused, "--key", key, "--unknown"]),
+              ]:
+                  invoke(name, args, 1, b"usage:")
+                  require(not refused.exists() and not refused.parent.exists(), "invalid argv created output")
+                  require(not extra_key.exists(), "invalid argv created key")
+              require(len(case_records) == 12 and len({x["name"] for x in case_records}) == 12, "incomplete cases")
+              require(key.read_bytes() == private_material, "private key changed")
+              require(digest(binary) == binary_hash, "binary changed after cases")
+
+              # Publish only verified public output after ALL cases and private-key checks.
+              # No private bytes/hash enter the receipt; retained raw failures are not dumped.
+              private_encodings = [private_material, private_material.hex().encode(), base64.b64encode(private_material)]
+              public_documents = {
+                  "signed-manifest.toml": document.encode("utf-8"),
+                  "no-digest-manifest.toml": warning_document.encode("utf-8"),
+              }
+              for data in public_documents.values():
+                  require(all(value not in data for value in private_encodings), "private-output-refused")
+              require(publish_checked_outputs(), "public output privacy check unavailable")
+              for name, data in public_documents.items():
+                  (evidence / name).write_bytes(data)
+              (evidence / "cases.json").write_text(
+                  json.dumps({"binary_sha256": binary_hash, "cases": case_records,
+                              "payload_sha256": digest(payload), "input_manifest_sha256": digest(manifest),
+                              "private_key_unchanged": True, "private_key_material_uploaded": False,
+                              "locale": {k: os.environ.get(k) for k in ["LANG", "LC_ALL"]}}, indent=2) + "\n",
+                  encoding="utf-8",
+              )
+              phase = "completed"
+          except Exception as error:
+              # Preserve a fixed guard reason and actual status. Raw output is retained
+              # only after the explicit private-byte/hex/base64 check; otherwise withheld.
+              original_reason = failure_reason
+              outputs_retained = False
+              try:
+                  if not private_material and key is not None and key.exists():
+                      key_info = key.lstat()
+                      if (stat.S_ISREG(key_info.st_mode) and not key.is_symlink()
+                              and key_info.st_uid == os.getuid() and 0 < key_info.st_size <= 1024):
+                          private_material = key.read_bytes()
+                  if original_reason != "private-output-refused":
+                      outputs_retained = publish_checked_outputs()
+                  (evidence / "failure.json").write_text(
+                      json.dumps({"phase": phase, "reason": original_reason, "exit": last_status,
+                                  "type": type(error).__name__, "public_outputs_retained": outputs_retained}) + "\n",
+                      encoding="utf-8",
+                  )
+              except Exception:
+                  # Diagnostic failure must not convert or mask the original refusal.
+                  pass
+              print("SIGNER:FAIL phase=%s type=%s reason=%s exit=%s" %
+                    (phase, type(error).__name__, original_reason, last_status), file=sys.stderr, flush=True)
+              raise SystemExit(1) from None
+          finally:
+              try:
+                  current = scratch.lstat()
+                  require(stat.S_ISDIR(current.st_mode) and not scratch.is_symlink(), "owned scratch type changed")
+                  require((current.st_dev, current.st_ino, current.st_uid) ==
+                          (owned.st_dev, owned.st_ino, os.getuid()), "owned scratch identity changed")
+                  shutil.rmtree(scratch)
+              except Exception as error:
+                  print("SIGNER:FAIL phase=cleanup type=%s reason=%s exit=%s" %
+                        (type(error).__name__, failure_reason, last_status), file=sys.stderr, flush=True)
+                  raise SystemExit(1) from None
+
+          try:
+              require(phase == "completed", "missing completion")
+              allowed = {"source.json", "build.json", "cases.json", "signed-manifest.toml", "no-digest-manifest.toml"}
+              allowed.update(name + suffix for name in public_outputs for suffix in [".stdout", ".stderr"])
+              require({p.name for p in evidence.iterdir()} == allowed, "unexpected evidence inventory")
+              for path in evidence.iterdir():
+                  info = path.lstat()
+                  require(stat.S_ISREG(info.st_mode) and not path.is_symlink() and info.st_uid == os.getuid(), "unsafe evidence file")
+              (evidence / "driver-complete.json").write_text(
+                  json.dumps({"cases": 12, "all_expected_status_output_state_checks": True,
+                              "private_scratch_removed": True, "scope": "Linux argv/output; directory install proof reused separately"}) + "\n",
+                  encoding="utf-8",
+              )
+          except Exception as error:
+              print("SIGNER:FAIL phase=evidence type=%s reason=%s exit=%s" %
+                    (type(error).__name__, failure_reason, last_status), file=sys.stderr, flush=True)
+              raise SystemExit(1) from None
+          print("SIGNER:COMPLETE cases=12 private-scratch-removed=true", flush=True)
+          SIGNER_PY
+          sdk_source_clean
+          printf 'SIGNER:SOURCE-CLEAN complete=true\n'
+
+      - name: Stage only public signer evidence
+        id: signer_evidence
+        if: >-
+          always() && matrix.tool == 'cross' &&
+          github.ref == 'refs/heads/test/11310-signing-example-argv-qualification-20261013' &&
+          steps.signer_argv.outputs.evidence_dir != ''
+        timeout-minutes: 1
+        shell: bash
+        env:
+          SIGNER_EVIDENCE_DIR: ${{ steps.signer_argv.outputs.evidence_dir }}
+          SIGNER_STEP_OUTCOME: ${{ steps.signer_argv.outcome }}
+        run: |
+          python3 - <<'STAGE_PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import stat
+          import sys
+          import tempfile
+
+          root = Path(os.environ["RUNNER_TEMP"]).resolve(strict=True)
+          source_input = Path(os.environ["SIGNER_EVIDENCE_DIR"])
+          info = source_input.lstat()
+          if (not stat.S_ISDIR(info.st_mode) or source_input.is_symlink()
+                  or info.st_uid != os.getuid() or source_input.parent.resolve() != root
+                  or not source_input.name.startswith("signer-argv-evidence.")):
+              raise SystemExit("unsafe evidence directory")
+          source = source_input.resolve(strict=True)
+          names = [
+              "keygen_new", "keygen_existing", "sign_payload", "sign_no_payload",
+              "sign_payload_without_wasm_path", "argv_empty", "argv_unknown_command",
+              "argv_keygen_missing_path", "argv_keygen_extra_path", "argv_sign_missing_key_value",
+              "argv_sign_missing_payload_value", "argv_sign_unknown_extra_argument",
+          ]
+          mandatory = {"source.json", "build.json", "cases.json", "signed-manifest.toml",
+                       "no-digest-manifest.toml", "driver-complete.json"}
+          mandatory.update(name + suffix for name in names for suffix in [".stdout", ".stderr"])
+          permitted = mandatory | {"failure.json"}
+          actual = {path.name for path in source.iterdir()}
+          if not actual.issubset(permitted) or "source.json" not in actual:
+              raise SystemExit("unexpected or missing evidence entry")
+          for path in source.iterdir():
+              item = path.lstat()
+              if (not stat.S_ISREG(item.st_mode) or path.is_symlink()
+                      or item.st_uid != os.getuid() or item.st_nlink != 1
+                      or item.st_size > 65536):
+                  raise SystemExit("unsafe evidence file")
+          receipt = json.loads((source / "source.json").read_text(encoding="utf-8"))
+          if receipt.get("parent") != "d0a8dbe10cdd1eb90c6ba0843a4a8313846b4954":
+              raise SystemExit("wrong source receipt")
+          success = os.environ["SIGNER_STEP_OUTCOME"] == "success"
+          if success:
+              if actual != mandatory:
+                  raise SystemExit("incomplete successful evidence")
+              cases = json.loads((source / "cases.json").read_text(encoding="utf-8"))
+              if [case["name"] for case in cases["cases"]] != names:
+                  raise SystemExit("wrong case selection")
+              if json.loads((source / "build.json").read_text(encoding="utf-8"))["exit"] != 0:
+                  raise SystemExit("successful source with failed build")
+              if json.loads((source / "driver-complete.json").read_text(encoding="utf-8"))["cases"] != 12:
+                  raise SystemExit("missing process completion")
+
+          # The artifact service sees only this fresh whitelist copy, never scratch.
+          destination = Path(tempfile.mkdtemp(prefix="signer-argv-public.", dir=str(root)))
+          destination.chmod(0o700)
+          hashes = []
+          for name in sorted(actual):
+              data = (source / name).read_bytes()
+              (destination / name).write_bytes(data)
+              hashes.append(hashlib.sha256(data).hexdigest() + "  " + name)
+          (destination / "SHA256SUMS").write_text("\n".join(hashes) + "\n", encoding="utf-8")
+          (destination / "qualification.json").write_text(
+              json.dumps({"success": success, "source_step_outcome": os.environ["SIGNER_STEP_OUTCOME"],
+                          "files": sorted(actual), "partial_failure_evidence_is_not_acceptance": True}) + "\n",
+              encoding="utf-8",
+          )
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write("public_dir=" + str(destination) + "\n")
+          print("SIGNER:PUBLIC-EVIDENCE complete=" + str(success).lower(), flush=True)
+          STAGE_PY
+
+      - name: Upload bounded public signer evidence
+        if: >-
+          always() && steps.signer_evidence.outputs.public_dir != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: signer-argv-d0-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.signer_evidence.outputs.public_dir }}
+          if-no-files-found: error
+          retention-days: 1
   web:
     name: Build Web Dashboard
     if: ${{ !inputs.release_tools_only }}
