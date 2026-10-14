@@ -65,6 +65,19 @@ def child_mocks(child, exited=True):
     return stack
 
 
+def compiler_outputs(private, linked=False):
+    """Benign unit bytes, not compiler/native/Wasm execution or provenance proof."""
+    values = ((evidence.CLI_ARTIFACT, b"fake contract binary", 0o700),
+              (evidence.COMPONENT_ARTIFACT, b"fake contract component", 0o600))
+    for relative, data, mode in values:
+        path = private.joinpath(*relative)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        evidence.private_write(path, data)
+        path.chmod(mode)
+        if linked:
+            os.link(path, path.with_name(path.name + ".deps-alias"))
+
+
 def export_fixture(root):
     """Synthetic contract data only; not pixels, CLI, native process or guest proof."""
     context = {k: v for k, v in binding().items() if k in
@@ -77,14 +90,21 @@ def export_fixture(root):
     capture.tokens, capture.failure = ["synthetic-export-secret"], None
     capture.slices, capture.started_cases = ["A: synthetic admitted output"], []
     capture.manager = mock.Mock()
+    capture.manager.deadline = evidence.time.monotonic() + 60
     capture.manager.cleanup.return_value = []
     capture.setup, capture.build, capture.case = mock.Mock(), mock.Mock(), mock.Mock()
     capture.source = capture.auxiliary = root / "unused-source"
     capture.source_snapshot = capture.aux_snapshot = "a" * 64
-    capture.binary, capture.wasm_path = capture.private / "binary", capture.private / "component"
-    evidence.private_write(capture.binary, b"fake contract binary")
+    compiler_outputs(capture.private)
+    (capture.private / "materialized").mkdir(mode=0o700)
+    capture.compiled_artifacts = {
+        "binary": evidence.materialize_compiler_artifact(
+            capture.private, evidence.CLI_ARTIFACT, capture.manager.deadline),
+        "component": evidence.materialize_compiler_artifact(
+            capture.private, evidence.COMPONENT_ARTIFACT, capture.manager.deadline)}
+    capture.binary = evidence.materialized_artifact_path(capture.private, evidence.CLI_ARTIFACT)
+    capture.wasm_path = evidence.materialized_artifact_path(capture.private, evidence.COMPONENT_ARTIFACT)
     capture.wasm = b"fake contract component"
-    evidence.private_write(capture.wasm_path, capture.wasm)
     capture.binary_hash = evidence.sha(capture.binary.read_bytes())
     capture.provenance = {**context, "execution_started": True,
                           "source_before": "a" * 64, "source_after": "a" * 64,
@@ -113,7 +133,58 @@ def evidence_environment(root, outcome="success"):
             "EVIDENCE_CAPTURE_OUTCOME": outcome}
 
 
+@contextlib.contextmanager
+def bridge_control(directory):
+    """Actual Bridge.run caller with OS/PTY/process operations controlled, not run."""
+    with contextlib.ExitStack() as stack:
+        bridge = object.__new__(evidence.Bridge)
+        bridge.directory = directory
+        bridge.deadline = evidence.time.monotonic() + 10
+        bridge.guard = evidence.OutputGuard("synthetic-secret")
+        bridge.events, bridge.master, bridge.pid = [], None, None
+        bridge.child, bridge.status, bridge.binding = None, None, None
+        raw = b"fake contract binary"
+        wanted = {**binding(), "binary_sha256": evidence.sha(raw)}
+        bridge.spec = {"binding": wanted, "binary": "unused", "config": str(directory),
+                       "argv": [], "environment": {}}
+        bridge.drive, bridge.pump = mock.Mock(), mock.Mock(return_value=False)
+        terminal = {"isatty": [True] * 3, "rows": 24, "columns": 80}
+        for name, value in [("terminal_info", terminal), ("wait_file", {"window": 42,
+                            "xterm_pid": 301, "window_pixels": [800, 480]}), ("bounded_read", raw)]:
+            stack.enter_context(mock.patch.object(evidence, name, return_value=value))
+        stack.enter_context(mock.patch.object(evidence.termios, "tcgetattr", return_value=[]))
+        restore = stack.enter_context(mock.patch.object(evidence.termios, "tcsetattr"))
+        stack.enter_context(mock.patch.object(evidence.tty, "setraw"))
+        flags = stack.enter_context(mock.patch.object(evidence.fcntl, "fcntl", return_value=0))
+        stack.enter_context(mock.patch.object(evidence.fcntl, "ioctl"))
+        stack.enter_context(mock.patch.object(evidence.os, "pipe", return_value=(10010, 10011)))
+        stack.enter_context(mock.patch.object(evidence.pty, "fork", return_value=(54321, 10012)))
+        close = stack.enter_context(mock.patch.object(evidence.os, "close"))
+        stack.enter_context(mock.patch.object(evidence.os, "set_blocking"))
+        stack.enter_context(mock.patch.object(evidence.os, "write", return_value=1))
+        stack.enter_context(mock.patch.object(evidence.signal, "getsignal", return_value=evidence.signal.SIG_DFL))
+        stack.enter_context(mock.patch.object(evidence.os, "waitid", return_value=types.SimpleNamespace(
+            si_pid=54321, si_code=os.CLD_EXITED, si_status=0)))
+        stack.enter_context(mock.patch.object(evidence.os, "waitpid", return_value=(54321, 0)))
+        stack.enter_context(mock.patch.object(evidence.os, "killpg"))
+        stack.enter_context(mock.patch.object(evidence, "group_exists", return_value=False))
+        identities = {}
+        def bind_child(child, deadline):
+            child.identity = {"pid": child.pid, "parent_pid": child.parent,
+                              "pgid": child.pid, "session": child.pid, "start_ticks": 17}
+            identities[child.pid] = {**child.identity, "state": "Z"}
+            return child
+        stack.enter_context(mock.patch.object(evidence.OwnedChild, "bind", autospec=True, side_effect=bind_child))
+        stack.enter_context(mock.patch.object(evidence, "process_identity", side_effect=lambda pid: identities[pid]))
+        yield bridge, {"close": close, "restore": restore, "flags": flags}
+
+
 class CaptureControls(unittest.TestCase):
+    def setUp(self):
+        pending = mock.patch.object(evidence, "PENDING_CANCELLATION", None)
+        pending.start()
+        self.addCleanup(pending.stop)
+
     def test_exact_selected_empty_value_is_the_only_positive_mode(self):
         config, text, events = admitted_fixture()
         result = evidence.validate_case("A", config, text, events)
@@ -788,6 +859,525 @@ class CaptureControls(unittest.TestCase):
             self.assertEqual(receipt["failure"], "cli_cleanup_incomplete")
             self.assertFalse(receipt["cleanup"]["direct_reaped"])
             self.assertFalse(receipt["cleanup"]["group_absent"])
+
+
+    def test_build_materializes_single_and_multilink_compiler_outputs(self):
+        for linked in (False, True):
+            with self.subTest(linked=linked), tempfile.TemporaryDirectory() as directory:
+                capture = object.__new__(evidence.Capture)
+                capture.private = Path(directory) / "private"
+                capture.private.mkdir(mode=0o700)
+                capture.source, capture.provenance = Path(directory) / "source", {}
+                capture.manager = mock.Mock(deadline=evidence.time.monotonic() + 60)
+                calls = []
+                def build(args, seconds, **kwargs):
+                    calls.append((args, seconds, kwargs))
+                    self.assertFalse((capture.private / "materialized").exists())
+                    if len(calls) == 2:
+                        compiler_outputs(capture.private, linked)
+                    return b""
+                capture.manager.run.side_effect = build
+                capture.build()
+                self.assertEqual([row[1] for row in calls], [25 * 60, 6 * 60])
+                self.assertEqual(calls[0][0][:8], ["cargo", "+1.98.0", "build", "--locked",
+                                                 "-p", "zeroclaw", "--bin", "zeroclaw"])
+                self.assertIn("plugins-wasm-cranelift", calls[0][0])
+                self.assertNotIn("--no-default-features", calls[0][0])
+                self.assertIn("wasm32-wasip2", calls[1][0])
+                for relative, destination, key in [(evidence.CLI_ARTIFACT, capture.binary, "binary"),
+                                                   (evidence.COMPONENT_ARTIFACT, capture.wasm_path, "component")]:
+                    original = capture.private.joinpath(*relative)
+                    self.assertEqual(original.stat().st_nlink, 2 if linked else 1)
+                    self.assertEqual(destination.stat().st_nlink, 1)
+                    self.assertFalse(os.path.samefile(original, destination))
+                    self.assertEqual(original.read_bytes(), destination.read_bytes())
+                    self.assertEqual(capture.compiled_artifacts[key]["sha256"],
+                                     evidence.sha(original.read_bytes()))
+                    evidence.verify_materialized_artifact(capture.private, capture.compiled_artifacts[key],
+                                                          capture.manager.deadline)
+                self.assertEqual(capture.binary.stat().st_mode & 0o777, 0o700)
+                self.assertEqual(capture.wasm_path.stat().st_mode & 0o777, 0o600)
+
+    def test_compiler_copy_refuses_source_boundaries_and_instability(self):
+        for fault in ("outside", "symlink", "parent", "owner", "nonregular", "size", "empty",
+                      "changed", "named-swap", "read"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as stack:
+                private = Path(directory) / "private"
+                private.mkdir(mode=0o700)
+                compiler_outputs(private)
+                (private / "materialized").mkdir(mode=0o700)
+                source = private.joinpath(*evidence.CLI_ARTIFACT)
+                relative = evidence.CLI_ARTIFACT
+                if fault == "outside":
+                    relative = ("..", "debug", "zeroclaw")
+                elif fault == "symlink":
+                    source.rename(source.with_name("real"))
+                    source.symlink_to(source.with_name("real"))
+                elif fault == "parent":
+                    source.parent.rename(private / "saved-debug")
+                    source.parent.symlink_to(private / "saved-debug", target_is_directory=True)
+                elif fault == "changed":
+                    read = evidence.os.read
+                    changed = []
+                    def changing(fd, size):
+                        chunk = read(fd, size)
+                        if not changed:
+                            changed.append(True)
+                            source.write_bytes(b"changed during copy")
+                        return chunk
+                    stack.enter_context(mock.patch.object(evidence.os, "read", side_effect=changing))
+                elif fault == "named-swap":
+                    open_file, swapped = evidence.os.open, []
+                    def opening(path, flags, *args, **kwargs):
+                        fd = open_file(path, flags, *args, **kwargs)
+                        if path == "zeroclaw" and not flags & os.O_WRONLY and not swapped:
+                            swapped.append(True)
+                            source.rename(source.with_name("old-source"))
+                            evidence.private_write(source, b"replacement source")
+                        return fd
+                    stack.enter_context(mock.patch.object(evidence.os, "open", side_effect=opening))
+                elif fault == "read":
+                    stack.enter_context(mock.patch.object(evidence.os, "read", side_effect=OSError))
+                else:
+                    fstat = evidence.os.fstat
+                    def metadata(fd):
+                        st = fstat(fd)
+                        if not evidence.stat.S_ISREG(st.st_mode):
+                            return st
+                        values = {"st_" + k: v for k, v in evidence.artifact_identity(st).items()}
+                        if fault == "owner": values["st_uid"] += 1
+                        elif fault == "nonregular": values["st_mode"] = evidence.stat.S_IFIFO | 0o600
+                        elif fault == "size": values["st_size"] = 256 * 1024 * 1024 + 1
+                        else: values["st_size"] = 0
+                        return types.SimpleNamespace(**values)
+                    stack.enter_context(mock.patch.object(evidence.os, "fstat", side_effect=metadata))
+                with self.assertRaises(evidence.Refusal):
+                    evidence.materialize_compiler_artifact(private, relative, evidence.time.monotonic() + 10)
+
+    def test_compiler_copy_partial_io_and_close_failures_never_grant_a_copy(self):
+        for fault in ("partial", "short-read", "zero", "write", "source-close", "destination-close",
+                      "existing", "linked-destination"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as stack:
+                private = Path(directory) / "private"
+                private.mkdir(mode=0o700)
+                compiler_outputs(private, linked=True)
+                (private / "materialized").mkdir(mode=0o700)
+                destination = private / "materialized/zeroclaw"
+                if fault in ("existing", "linked-destination"):
+                    evidence.private_write(destination, b"untouched destination")
+                    if fault == "linked-destination":
+                        os.link(destination, destination.with_name("alias"))
+                write, close, open_file, read = evidence.os.write, evidence.os.close, evidence.os.open, evidence.os.read
+                labels, closed, injected, opened_fds, closed_fds = {}, [], [], [], []
+                def opened(path, flags, *args, **kwargs):
+                    fd = open_file(path, flags, *args, **kwargs)
+                    opened_fds.append(fd)
+                    if evidence.stat.S_ISREG(os.fstat(fd).st_mode):
+                        labels[fd] = "destination-close" if flags & os.O_WRONLY else "source-close"
+                    return fd
+                def closing(fd):
+                    label = labels.get(fd, "directory")
+                    close(fd)
+                    closed.append(label)
+                    closed_fds.append(fd)
+                    if label == fault and not injected:
+                        injected.append(True)
+                        raise OSError("controlled close fault")
+                stack.enter_context(mock.patch.object(evidence.os, "open", side_effect=opened))
+                stack.enter_context(mock.patch.object(evidence.os, "close", side_effect=closing))
+                if fault in ("partial", "zero", "write"):
+                    def writing(fd, data):
+                        if fault == "zero": return 0
+                        if fault == "write": raise OSError("controlled write fault")
+                        return write(fd, data[:1])
+                    stack.enter_context(mock.patch.object(evidence.os, "write", side_effect=writing))
+                if fault == "short-read":
+                    stack.enter_context(mock.patch.object(evidence.os, "read", side_effect=lambda fd, size: read(fd, min(size, 1))))
+                if fault in ("partial", "short-read"):
+                    record = evidence.materialize_compiler_artifact(private, evidence.CLI_ARTIFACT,
+                                                                   evidence.time.monotonic() + 10)
+                    self.assertEqual(destination.read_bytes(), b"fake contract binary")
+                    self.assertEqual(record["sha256"], evidence.sha(destination.read_bytes()))
+                else:
+                    with self.assertRaises(evidence.Refusal):
+                        evidence.materialize_compiler_artifact(private, evidence.CLI_ARTIFACT,
+                                                               evidence.time.monotonic() + 10)
+                if fault in ("source-close", "destination-close"):
+                    self.assertIn("source-close", closed)
+                    self.assertIn("destination-close", closed)
+                    self.assertEqual(len(injected), 1)
+                    self.assertEqual(set(opened_fds), set(closed_fds))
+                if fault in ("existing", "linked-destination"):
+                    self.assertEqual(destination.read_bytes(), b"untouched destination")
+
+    def test_actual_build_bridge_and_final_recheck_bind_both_original_and_copy(self):
+        for mutation in ("source", "copy", "component", "ledger"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / "quickstart-cli-evidence-123-1"
+                root.mkdir(mode=0o700)
+                capture = export_fixture(root)
+                def case(name):
+                    if name != "C": return
+                    if mutation == "ledger":
+                        capture.compiled_artifacts["component"] = capture.compiled_artifacts["binary"]
+                    else:
+                        path = (capture.private.joinpath(*evidence.CLI_ARTIFACT) if mutation == "source"
+                                else capture.binary if mutation == "copy" else capture.wasm_path)
+                        path.write_bytes(b"changed fixture bytes")
+                capture.case.side_effect = case
+                with mock.patch.object(evidence, "snapshot", return_value="a" * 64):
+                    self.assertEqual(capture.run(), 1)
+                self.assertFalse((root / "export-decision.json").exists())
+                self.assertFalse(evidence.verify_failure(root, capture.context)["execution_proof"])
+        with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as stack:
+            root = Path(directory)
+            capture = export_fixture(root)
+            bridge = object.__new__(evidence.Bridge)
+            bridge.directory, bridge.deadline = root, evidence.time.monotonic() + 10
+            bridge.spec = {"binding": {**binding(), "binary_sha256": capture.binary_hash},
+                           "binary": str(capture.binary)}
+            bridge.guard = evidence.OutputGuard("synthetic-secret")
+            terminal = {"isatty": [True] * 3, "rows": 24, "columns": 80}
+            stack.enter_context(mock.patch.object(evidence, "terminal_info", return_value=terminal))
+            stack.enter_context(mock.patch.object(evidence, "wait_file", return_value={
+                "window": 42, "xterm_pid": 301, "window_pixels": [800, 480]}))
+            stack.enter_context(mock.patch.object(evidence.termios, "tcgetattr", return_value=[]))
+            stack.enter_context(mock.patch.object(evidence.fcntl, "fcntl", return_value=0))
+            pipe = stack.enter_context(mock.patch.object(evidence.os, "pipe", side_effect=evidence.Refusal("before_fork")))
+            with self.assertRaisesRegex(evidence.Refusal, "before_fork"):
+                bridge.run()
+            pipe.assert_called_once()
+            pipe.reset_mock()
+            capture.binary.write_bytes(b"changed fixture bytes")
+            with self.assertRaisesRegex(evidence.Refusal, "binary_changed"):
+                bridge.run()
+            pipe.assert_not_called()
+
+    def test_private_export_and_failure_readers_keep_their_single_link_boundary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "context.json"
+            evidence.private_write(path, b"{}")
+            os.link(path, root / "private-alias")
+            with self.assertRaisesRegex(evidence.Refusal, "file_boundary"):
+                evidence.bounded_read(path, 64)
+            (root / "private-alias").unlink()
+            export = root / "export"
+            export.mkdir(mode=0o700)
+            evidence.private_write(export / "context.json", b"{}")
+            os.link(export / "context.json", root / "export-alias")
+            with self.assertRaisesRegex(evidence.Refusal, "file_boundary"):
+                evidence.verify_export(export, [])
+            context = {k: v for k, v in binding().items() if k in
+                       ("run_id", "attempt", "job", "auxiliary_sha", "source_sha", "source_tree")}
+            evidence.minimum_failure(root, context, "capture_failed")
+            os.link(root / "failure/receipt.json", root / "failure-alias")
+            with self.assertRaisesRegex(evidence.Refusal, "file_boundary"):
+                evidence.verify_failure(root, context)
+
+
+    def test_pending_cancellation_during_term_reaches_kill_reap_and_cache_commit(self):
+        for sig in (evidence.signal.SIGTERM, evidence.signal.SIGINT, evidence.signal.SIGHUP):
+            with self.subTest(signal=sig), mock.patch.object(evidence, "PENDING_CANCELLATION", None):
+                child, events, clock = owned_child(), [], [0.0]
+                def sleep(seconds):
+                    clock[0] += seconds
+                    evidence.interrupted(sig, None)
+                    evidence.interrupted(evidence.signal.SIGTERM, None)
+                def kill(pgid, number):
+                    self.assertFalse(child.retired)
+                    self.assertEqual(pgid, child.pid)
+                    events.append(number)
+                def group(pgid, deadline, live_only=False):
+                    return live_only and evidence.signal.SIGKILL not in events
+                def reap(*args):
+                    self.assertTrue(child.retired)
+                    self.assertEqual(events, [evidence.signal.SIGTERM, evidence.signal.SIGKILL])
+                    events.append("reap")
+                    return child.pid, 0
+                with child_mocks(child), mock.patch.object(evidence.time, "monotonic", side_effect=lambda: clock[0]), \
+                        mock.patch.object(evidence.time, "sleep", side_effect=sleep), \
+                        mock.patch.object(evidence.os, "killpg", side_effect=kill), \
+                        mock.patch.object(evidence.os, "waitpid", side_effect=reap) as wait, \
+                        mock.patch.object(evidence, "group_exists", side_effect=group):
+                    result = evidence.stop_process(child)
+                    self.assertTrue(evidence.cleanup_proved(result))
+                    self.assertIs(evidence.stop_process(child), result)
+                    wait.assert_called_once()
+                self.assertEqual(evidence.PENDING_CANCELLATION, sig)
+                with self.assertRaisesRegex(evidence.Refusal, "interrupted"):
+                    evidence.cancellation_checkpoint()
+                self.assertEqual(events[-1], "reap")
+
+    def test_pending_cancellation_does_not_rearm_retired_or_uncertain_anchors(self):
+        for fault in ("retired", "identity", "read", "wait", "sigchld"):
+            with self.subTest(fault=fault), mock.patch.object(evidence, "PENDING_CANCELLATION", None):
+                child = owned_child()
+                evidence.interrupted(evidence.signal.SIGINT, None)
+                with child_mocks(child), contextlib.ExitStack() as stack:
+                    kill = stack.enter_context(mock.patch.object(evidence.os, "killpg"))
+                    wait = stack.enter_context(mock.patch.object(evidence.os, "waitpid", return_value=(child.pid, 0)))
+                    if fault == "retired": child.retired = True
+                    elif fault == "identity":
+                        stack.enter_context(mock.patch.object(evidence, "process_identity", return_value={
+                            **child.identity, "start_ticks": 18, "state": "Z"}))
+                    elif fault == "read":
+                        stack.enter_context(mock.patch.object(evidence, "process_identity", side_effect=OSError))
+                    elif fault == "wait": wait.side_effect = KeyboardInterrupt
+                    else:
+                        stack.enter_context(mock.patch.object(evidence.signal, "getsignal", return_value=evidence.signal.SIG_IGN))
+                    self.assertFalse(evidence.cleanup_proved(evidence.stop_process(child)))
+                    signals = kill.call_count
+                    evidence.stop_process(child)
+                    self.assertEqual(kill.call_count, signals)
+                    if fault != "wait":
+                        kill.assert_not_called()
+                        wait.assert_not_called()
+                    else:
+                        self.assertTrue(child.retired)
+
+    def test_processes_real_finally_and_multi_cleanup_close_after_pending_or_fault(self):
+        child, events = owned_child(), []
+        child.stdout = mock.Mock(closed=False)
+        def close():
+            child.stdout.closed = True
+            events.append("close")
+        child.stdout.close.side_effect = close
+        child.stdout.fileno.return_value = 10009
+        manager = evidence.Processes(100)
+        manager.items = [child]
+        def reading(*args):
+            evidence.interrupted(evidence.signal.SIGTERM, None)
+            return b""
+        with child_mocks(child), mock.patch.object(manager, "spawn", return_value=child), \
+                mock.patch.object(evidence.time, "monotonic", return_value=0), \
+                mock.patch.object(evidence.os, "set_blocking"), \
+                mock.patch.object(evidence.select, "select", return_value=([child.stdout], [], [])), \
+                mock.patch.object(evidence.os, "read", side_effect=reading), \
+                mock.patch.object(evidence.os, "killpg", side_effect=lambda *args: events.append("signal")), \
+                mock.patch.object(evidence.os, "waitpid", side_effect=lambda *args: (events.append("reap"), (child.pid, 0))[1]):
+            with self.assertRaisesRegex(evidence.Refusal, "interrupted"):
+                manager.run(["synthetic-not-executed"], 1)
+            self.assertEqual(events, ["signal", "signal", "reap", "close"])
+            result = manager.cleanup()
+            self.assertTrue(evidence.cleanup_proved(result[0]))
+            self.assertEqual(events.count("signal"), 2)
+        evidence.PENDING_CANCELLATION = None
+        children = [owned_child(), owned_child()]
+        children[1].pid += 1
+        children[1].proc.pid = children[1].pid
+        children[1].identity.update(pid=children[1].pid, pgid=children[1].pid, session=children[1].pid)
+        children[0].stdout = mock.Mock(closed=True)
+        children[1].stdout = mock.Mock(closed=False)
+        def bad_close():
+            evidence.interrupted(evidence.signal.SIGINT, None)
+            raise OSError("controlled close failure")
+        children[1].stdout.close.side_effect = bad_close
+        manager.items = children
+        identities = {item.pid: {**item.identity, "state": "Z"} for item in children}
+        with mock.patch.object(evidence.os, "killpg") as kill, \
+                mock.patch.object(evidence.os, "waitid", side_effect=lambda kind, pid, flags: types.SimpleNamespace(
+                    si_pid=pid, si_code=os.CLD_EXITED, si_status=0)), \
+                mock.patch.object(evidence.os, "waitpid", side_effect=lambda pid, flags: (pid, 0)), \
+                mock.patch.object(evidence, "process_identity", side_effect=lambda pid: identities[pid]), \
+                mock.patch.object(evidence, "group_exists", return_value=False), \
+                mock.patch.object(evidence.signal, "getsignal", return_value=evidence.signal.SIG_DFL):
+            records = manager.cleanup()
+        self.assertEqual(len(records), 2)
+        children[0].stdout.close.assert_called_once()
+        children[1].stdout.close.assert_called_once()
+        self.assertFalse(evidence.cleanup_proved(records[0]))
+        self.assertTrue(evidence.cleanup_proved(records[1]))
+        self.assertEqual(kill.call_count, 4)
+
+    def test_bridge_and_capture_pending_cancellation_across_receipt_boundaries(self):
+        for stage in ("stop", "output", "result", "ready", "close"):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as directory, \
+                    mock.patch.object(evidence, "PENDING_CANCELLATION", None), \
+                    bridge_control(Path(directory)) as (bridge, controls):
+                write_json, private_write = evidence.write_json, evidence.private_write
+                def writing_json(path, value, **kwargs):
+                    write_json(path, value, **kwargs)
+                    if stage == "result" and path.name == "bridge-result.json":
+                        evidence.interrupted(evidence.signal.SIGHUP, None)
+                def writing_private(path, data, **kwargs):
+                    private_write(path, data, **kwargs)
+                    if (stage == "output" and path.name == "output.private") or (
+                            stage == "ready" and path.name == "bridge-result.json.ready"):
+                        evidence.interrupted(evidence.signal.SIGINT, None)
+                if stage == "close":
+                    def closing(fd):
+                        if fd == 10012: raise OSError("controlled close failure")
+                    controls["close"].side_effect = closing
+                with mock.patch.object(evidence, "write_json", side_effect=writing_json), \
+                        mock.patch.object(evidence, "private_write", side_effect=writing_private), \
+                        mock.patch.object(evidence.os, "killpg", side_effect=(
+                            (lambda *args: evidence.interrupted(evidence.signal.SIGTERM, None)) if stage == "stop" else None)):
+                    self.assertEqual(bridge.run(), 1)
+                receipt = evidence.json.loads((Path(directory) / "bridge-result.json").read_bytes())
+                self.assertIsNotNone(receipt["failure"])
+                controls["restore"].assert_called_once()
+                self.assertTrue(any(call.args[1] == evidence.fcntl.F_SETFL for call in controls["flags"].call_args_list))
+        for stage in ("cleanup.json", "export-decision.json", "finished.json"):
+            with self.subTest(capture_stage=stage), tempfile.TemporaryDirectory() as directory, \
+                    mock.patch.object(evidence, "PENDING_CANCELLATION", None):
+                root = Path(directory) / "quickstart-cli-evidence-123-1"
+                root.mkdir(mode=0o700)
+                capture = export_fixture(root)
+                write = evidence.write_json
+                def writing(path, *args, **kwargs):
+                    write(path, *args, **kwargs)
+                    if path.name == stage:
+                        evidence.interrupted(evidence.signal.SIGTERM, None)
+                with mock.patch.object(evidence, "snapshot", return_value="a" * 64), \
+                        mock.patch.object(evidence, "write_json", side_effect=writing):
+                    self.assertEqual(capture.run(), 1)
+                self.assertFalse((root / "export-decision.json").exists())
+                self.assertEqual(evidence.verify_failure(root, capture.context)["code"], "interrupted")
+
+    def test_normal_checkpoints_do_not_interrupt_spawn_registration_or_change_child_masks(self):
+        manager = evidence.Processes(100)
+        proc = mock.Mock(pid=54321, returncode=None, stdout=None)
+        captured = []
+        def bind(child, deadline):
+            evidence.interrupted(evidence.signal.SIGTERM, None)
+            self.assertIn(child, manager.items)
+            child.identity = {"pid": child.pid, "parent_pid": child.parent, "pgid": child.pid,
+                              "session": child.pid, "start_ticks": 17}
+            captured.append(child)
+            return child
+        with mock.patch.object(evidence.time, "monotonic", return_value=0), \
+                mock.patch.object(evidence.subprocess, "Popen", return_value=proc) as popen, \
+                mock.patch.object(evidence.OwnedChild, "bind", autospec=True, side_effect=bind), \
+                mock.patch.object(evidence.signal, "pthread_sigmask") as mask:
+            child = manager.spawn(["synthetic-not-executed"])
+            self.assertIs(child, captured[0])
+            self.assertTrue(child.identity)
+            self.assertTrue(popen.call_args.kwargs["start_new_session"])
+            self.assertNotIn("preexec_fn", popen.call_args.kwargs)
+            mask.assert_not_called()
+        with self.assertRaisesRegex(evidence.Refusal, "interrupted"):
+            child.wait(1)
+        with mock.patch.object(evidence.subprocess, "Popen") as popen:
+            with self.assertRaisesRegex(evidence.Refusal, "interrupted"):
+                manager.spawn(["synthetic-not-executed"])
+            popen.assert_not_called()
+        with mock.patch.object(evidence.select, "select") as select_call:
+            with self.assertRaisesRegex(evidence.Refusal, "interrupted"):
+                object.__new__(evidence.Bridge).pump(1)
+            select_call.assert_not_called()
+        with mock.patch.object(evidence, "PENDING_CANCELLATION", None), contextlib.ExitStack() as stack:
+            listener = mock.Mock()
+            listener.getsockname.return_value = ("127.0.0.1", 12345)
+            def accepting():
+                evidence.interrupted(evidence.signal.SIGHUP, None)
+                raise evidence.socket.timeout()
+            listener.accept.side_effect = accepting
+            stack.enter_context(mock.patch.object(evidence.socket, "socket", return_value=listener))
+            stack.enter_context(mock.patch.object(evidence, "read_json", return_value={"deadline": 10}))
+            stack.enter_context(mock.patch.object(evidence, "bounded_read", return_value=b"synthetic archive"))
+            stack.enter_context(mock.patch.object(evidence, "write_json"))
+            stack.enter_context(mock.patch.object(evidence.time, "monotonic", return_value=0))
+            with self.assertRaisesRegex(evidence.Refusal, "interrupted"):
+                evidence.serve(Path("/unused-contract/spec.json"))
+            listener.close.assert_called_once()
+
+    def test_finalizer_preserves_only_verified_current_minimum_failure_bytes(self):
+        for code in ("cleanup_incomplete", "interrupted", "capture_refused", "export_refused"):
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / "quickstart-cli-evidence-123-1"
+                root.mkdir(mode=0o700)
+                context = evidence.context_from_env(evidence_environment(root))
+                evidence.write_json(root / "state.json", {"started": True})
+                evidence.minimum_failure(root, context, code)
+                before = [(root / name).read_bytes() for name in ("failure/receipt.json", "failure-decision.json")]
+                with mock.patch.dict(os.environ, evidence_environment(root, "failure")), \
+                        mock.patch.object(evidence, "export_outputs") as outputs:
+                    self.assertEqual(evidence.finalize(root), 1)
+                outputs.assert_called_once_with(False, True)
+                self.assertEqual(before, [(root / name).read_bytes() for name in ("failure/receipt.json", "failure-decision.json")])
+                self.assertEqual(evidence.verify_failure(root, context)["code"], code)
+        for mutation in ("run_id", "attempt", "job", "auxiliary_sha", "source_sha", "source_tree", "digest", "extra", "code"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / "quickstart-cli-evidence-123-1"
+                root.mkdir(mode=0o700)
+                context = evidence.context_from_env(evidence_environment(root))
+                evidence.write_json(root / "state.json", {"started": True})
+                evidence.minimum_failure(root, context, "cleanup_incomplete")
+                decision = evidence.read_json(root / "failure-decision.json")
+                if mutation in ("extra", "code"):
+                    value = evidence.read_json(root / "failure/receipt.json")
+                    if mutation == "extra": value["output"] = "synthetic-private-value"
+                    else: value["code"] = "synthetic-private-value"
+                    evidence.write_json(root / "failure/receipt.json", value, replace=True)
+                    decision["receipt_sha256"] = evidence.sha((root / "failure/receipt.json").read_bytes())
+                elif mutation == "digest": decision["receipt_sha256"] = "0" * 64
+                else: decision["binding"][mutation] = "wrong"
+                evidence.write_json(root / "failure-decision.json", decision, replace=True)
+                with mock.patch.dict(os.environ, evidence_environment(root, "failure")), \
+                        mock.patch.object(evidence, "export_outputs") as outputs:
+                    self.assertEqual(evidence.finalize(root), 1)
+                outputs.assert_called_once_with(False, True)
+                self.assertEqual(evidence.verify_failure(root, context)["code"], "finalizer_refused")
+                self.assertNotIn(b"synthetic-private-value", (root / "failure/receipt.json").read_bytes())
+
+    def test_finalizer_fallback_recheck_and_write_faults_never_enable_unchecked_upload(self):
+        for fault in ("missing", "recheck", "write", "revoke"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / "quickstart-cli-evidence-123-1"
+                root.mkdir(mode=0o700)
+                context = evidence.context_from_env(evidence_environment(root))
+                verify, calls = evidence.verify_failure, []
+                def checking(*args):
+                    calls.append(True)
+                    if fault == "recheck" and len(calls) == 3:
+                        raise OSError("controlled recheck fault")
+                    return verify(*args)
+                with mock.patch.dict(os.environ, evidence_environment(root, "failure")), \
+                        mock.patch.object(evidence, "verify_failure", side_effect=checking), \
+                        mock.patch.object(evidence, "export_outputs") as outputs, contextlib.ExitStack() as stack:
+                    if fault == "write":
+                        stack.enter_context(mock.patch.object(evidence, "minimum_failure", side_effect=OSError))
+                    if fault == "revoke":
+                        stack.enter_context(mock.patch.object(evidence, "revoke_success", side_effect=OSError))
+                    self.assertEqual(evidence.finalize(root), 1)
+                if fault == "missing":
+                    outputs.assert_called_once_with(False, True)
+                    self.assertEqual(verify(root, context)["code"], "finalizer_refused")
+                else:
+                    outputs.assert_not_called()
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(evidence, "PENDING_CANCELLATION", None):
+            root = Path(directory) / "quickstart-cli-evidence-123-1"
+            root.mkdir(mode=0o700)
+            capture = export_fixture(root)
+            with mock.patch.object(evidence, "snapshot", return_value="a" * 64):
+                self.assertEqual(capture.run(), 0)
+            def output(success, failure):
+                if success:
+                    evidence.interrupted(evidence.signal.SIGINT, None)
+            with mock.patch.dict(os.environ, evidence_environment(root)), \
+                    mock.patch.object(evidence, "export_outputs", side_effect=output) as outputs:
+                self.assertEqual(evidence.finalize(root), 1)
+            self.assertEqual(outputs.call_args, mock.call(False, True))
+            self.assertFalse((root / "export-decision.json").exists())
+            self.assertFalse(evidence.verify_failure(root, capture.context)["execution_proof"])
+
+    def test_snapshot_git_oid_compatibility_keeps_independent_sha256_and_overlay_refusal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            raw = b"hello\n"
+            oid = "ce013625030ba8dba906f756967f9e9ca394464a"
+            path = root / "known.txt"
+            evidence.private_write(path, raw)
+            index = ("100644 " + oid + " 0\tknown.txt\0").encode()
+            with mock.patch.object(evidence, "git", return_value=index):
+                actual = evidence.snapshot(None, root)
+                wanted = evidence.sha(evidence.json.dumps(
+                    [("known.txt", "100644", oid, evidence.sha(raw))], separators=(",", ":")).encode())
+                self.assertEqual(actual, wanted)
+                path.write_bytes(b"private overlay\n")
+                with self.assertRaisesRegex(evidence.Refusal, "source_overlay"):
+                    evidence.snapshot(None, root)
 
 
 if __name__ == "__main__":

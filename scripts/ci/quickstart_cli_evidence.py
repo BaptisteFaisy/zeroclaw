@@ -47,6 +47,12 @@ EXPORTS = ("provenance.json", "context.json", "cases.json", "actions.json",
 ANSI = re.compile(rb"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 CAVEAT = ("The tool registry registers it when it is next built, unless its name "
           "clashes with a tool already registered or its tool description cannot be read.")
+CLI_ARTIFACT = ("cli-target", "debug", "zeroclaw")
+COMPONENT_ARTIFACT = ("fixture-target", "wasm32-wasip2", "debug",
+                      "zeroclaw_tool_plugin_fixture.wasm")
+# The first received cancellation is a process-local fact, not a signal mask.
+# Only explicit normal-work checkpoints raise; cleanup and receipt commits defer it.
+PENDING_CANCELLATION = None
 
 
 class Refusal(RuntimeError):
@@ -60,6 +66,14 @@ def require(condition, code):
 
 def sha(data):
     return hashlib.sha256(data).hexdigest()
+
+
+def cancellation_pending():
+    return PENDING_CANCELLATION is not None
+
+
+def cancellation_checkpoint():
+    require(not cancellation_pending(), "interrupted")
 
 
 def bounded_read(path, limit, owners=None):
@@ -82,6 +96,169 @@ def bounded_read(path, limit, owners=None):
         return bytes(data)
     finally:
         os.close(fd)
+
+
+def compiler_artifact_spec(relative):
+    require(type(relative) in (tuple, list), "artifact_path")
+    relative = tuple(relative)
+    if relative == CLI_ARTIFACT:
+        return 256 * 1024 * 1024, 0o700
+    require(relative == COMPONENT_ARTIFACT, "artifact_path")
+    return 8 * 1024 * 1024, 0o600
+
+
+def artifact_identity(st):
+    return {key: getattr(st, "st_" + key) for key in
+            ("dev", "ino", "uid", "mode", "nlink", "size", "mtime_ns", "ctime_ns")}
+
+
+def close_artifact_fds(fds):
+    failed = False
+    for fd in reversed(fds):
+        try:
+            os.close(fd)
+        except BaseException:
+            failed = True
+    require(not failed, "artifact_close")
+
+
+def artifact_directory(private, parts, fds, bindings):
+    require(private.is_absolute(), "artifact_root")
+    before = private.lstat()
+    require(stat.S_ISDIR(before.st_mode) and before.st_uid == os.getuid()
+            and stat.S_IMODE(before.st_mode) == 0o700, "artifact_root")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    parent = os.open(private, flags)
+    fds.append(parent)
+    identity = lambda st: (st.st_dev, st.st_ino, st.st_uid, st.st_mode)
+    require(identity(os.fstat(parent)) == identity(before), "artifact_directory_changed")
+    bindings.append((None, private, parent, identity(before)))
+    for part in parts:
+        require(type(part) is str and part not in ("", ".", "..") and "/" not in part,
+                "artifact_path")
+        child = os.open(part, flags, dir_fd=parent)
+        fds.append(child)
+        current = os.fstat(child)
+        require(stat.S_ISDIR(current.st_mode) and current.st_uid == os.getuid()
+                and not current.st_mode & 0o022, "artifact_directory")
+        bindings.append((parent, part, child, identity(current)))
+        parent = child
+    return parent
+
+
+def verify_artifact_directories(bindings):
+    for parent, name, fd, wanted in bindings:
+        named = os.lstat(name) if parent is None else os.stat(
+            name, dir_fd=parent, follow_symlinks=False)
+        for current in (named, os.fstat(fd)):
+            require((current.st_dev, current.st_ino, current.st_uid, current.st_mode) == wanted,
+                    "artifact_directory_changed")
+
+
+def read_compiler_artifact(private, relative, deadline, consume=None):
+    """Only these completed Cargo outputs may be regular multi-link sources.
+
+    All private copies, receipts and exports still use strict bounded_read.
+    Held directory/file descriptors and named-path rechecks bind this observation;
+    they do not defend against a privileged writer or attest a running compiler.
+    """
+    limit = compiler_artifact_spec(relative)[0]
+    fds, bindings = [], []
+    try:
+        parent = artifact_directory(private, relative[:-1], fds, bindings)
+        named = os.stat(relative[-1], dir_fd=parent, follow_symlinks=False)
+        fd = os.open(relative[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                     dir_fd=parent)
+        fds.append(fd)
+        before = os.fstat(fd)
+        require(stat.S_ISREG(before.st_mode) and before.st_uid == os.getuid()
+                and before.st_nlink > 0 and 0 < before.st_size <= limit
+                and not before.st_mode & (stat.S_ISUID | stat.S_ISGID | 0o022), "artifact_source")
+        require(tuple(relative) != CLI_ARTIFACT or before.st_mode & stat.S_IXUSR,
+                "artifact_executable")
+        require(artifact_identity(named) == artifact_identity(before), "artifact_changed")
+        digest, total = hashlib.sha256(), 0
+        while True:
+            cancellation_checkpoint()
+            require(time.monotonic() < deadline, "artifact_deadline")
+            request = min(4096, limit + 1 - total)
+            chunk = os.read(fd, request)
+            require(len(chunk) <= request, "artifact_read")
+            if not chunk:
+                break
+            total += len(chunk)
+            require(total <= limit, "artifact_overflow")
+            digest.update(chunk)
+            if consume is not None:
+                consume(chunk)
+        require(total == before.st_size and artifact_identity(os.fstat(fd)) == artifact_identity(before)
+                and artifact_identity(os.stat(relative[-1], dir_fd=parent, follow_symlinks=False))
+                == artifact_identity(before), "artifact_changed")
+        verify_artifact_directories(bindings)
+        return {"identity": artifact_identity(before), "bytes": total, "sha256": digest.hexdigest()}
+    except OSError:
+        raise Refusal("artifact_io") from None
+    finally:
+        close_artifact_fds(fds)
+
+
+def materialized_artifact_path(private, relative):
+    compiler_artifact_spec(relative)
+    return private / "materialized" / relative[-1]
+
+
+def materialize_compiler_artifact(private, relative, deadline):
+    limit, mode = compiler_artifact_spec(relative)
+    fds, bindings = [], []
+    try:
+        parent = artifact_directory(private, ("materialized",), fds, bindings)
+        fd = os.open(relative[-1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                     | os.O_CLOEXEC, 0o600, dir_fd=parent)
+        fds.append(fd)
+        def consume(chunk):
+            offset = 0
+            while offset < len(chunk):
+                cancellation_checkpoint()
+                require(time.monotonic() < deadline, "artifact_deadline")
+                count = os.write(fd, chunk[offset:])
+                require(type(count) is int and 0 < count <= len(chunk) - offset, "artifact_write")
+                offset += count
+        source = read_compiler_artifact(private, relative, deadline, consume)
+        os.fchmod(fd, mode)
+        copied = os.fstat(fd)
+        require(stat.S_ISREG(copied.st_mode) and copied.st_uid == os.getuid()
+                and copied.st_nlink == 1 and stat.S_IMODE(copied.st_mode) == mode
+                and copied.st_size == source["bytes"]
+                and (copied.st_dev, copied.st_ino) != (source["identity"]["dev"], source["identity"]["ino"]),
+                "artifact_copy")
+        require(artifact_identity(os.stat(relative[-1], dir_fd=parent, follow_symlinks=False))
+                == artifact_identity(copied), "artifact_copy_changed")
+        verify_artifact_directories(bindings)
+        record = {"relative": list(relative), "source": source["identity"],
+                  "copy": artifact_identity(copied), "bytes": source["bytes"], "sha256": source["sha256"]}
+    except OSError:
+        raise Refusal("artifact_io") from None
+    finally:
+        close_artifact_fds(fds)
+    path = materialized_artifact_path(private, relative)
+    data = bounded_read(path, limit)
+    require(len(data) == record["bytes"] and sha(data) == record["sha256"]
+            and artifact_identity(path.lstat()) == record["copy"], "artifact_copy_changed")
+    return record
+
+
+def verify_materialized_artifact(private, record, deadline):
+    require(type(record) is dict and set(record) == {"relative", "source", "copy", "bytes", "sha256"},
+            "artifact_ledger")
+    relative = record["relative"]
+    source = read_compiler_artifact(private, relative, deadline)
+    require(source == {"identity": record["source"], "bytes": record["bytes"],
+                       "sha256": record["sha256"]}, "artifact_source_changed")
+    path = materialized_artifact_path(private, relative)
+    require(artifact_identity(path.lstat()) == record["copy"], "artifact_copy_changed")
+    data = bounded_read(path, compiler_artifact_spec(relative)[0])
+    require(len(data) == record["bytes"] and sha(data) == record["sha256"]
+            and artifact_identity(path.lstat()) == record["copy"], "artifact_copy_changed")
 
 
 def private_write(path, data, replace=False):
@@ -314,6 +491,7 @@ class OwnedChild:
         """Exit observation only. Direct reap belongs exclusively to stop()."""
         end = time.monotonic() + timeout
         while True:
+            cancellation_checkpoint()
             code = self.poll()
             if code is not None:
                 return code
@@ -390,26 +568,51 @@ def cleanup_proved(result):
             and result.get("direct_waits") == 1 and result.get("failure") is None)
 
 
+def finish_owned_child(child):
+    """No cancellation checkpoint until stop, all owned closes and cache commit finish."""
+    result = None
+    try:
+        result = stop_process(child)
+    except BaseException:
+        result = {"pid": child.pid, "role": child.role, "direct_reaped": False,
+                  "group_absent": False, "failure": "cleanup_error"}
+        child._evidence_cleanup = result
+    finally:
+        if child.stdout is not None:
+            try:
+                child.stdout.close()
+                require(child.stdout.closed is True, "process_pipe_close")
+            except BaseException:
+                result["failure"] = "process_pipe_close"
+    return result
+
+
 class Processes:
     def __init__(self, deadline):
         self.deadline = deadline
         self.items = []
 
     def spawn(self, args, env=None, cwd=None, stdout=subprocess.PIPE, role="command"):
+        cancellation_checkpoint()
         require(time.monotonic() < self.deadline, "job_deadline")
         proc = subprocess.Popen(args, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                                 stdout=stdout, stderr=subprocess.STDOUT, start_new_session=True)
         child = OwnedChild(proc.pid, role, proc)
         self.items.append(child)  # Retain even if identity acquisition refuses.
+        # Do not honor a newly latched cancellation between creation/registration
+        # and identity acquisition. The owning caller can now enter its finally.
         return child.bind(min(self.deadline, time.monotonic() + 1))
 
     def run(self, args, seconds, env=None, cwd=None, cap=STAGE_CAP):
-        proc = self.spawn(args, env, cwd)
-        end = min(self.deadline, time.monotonic() + seconds)
+        proc = None
         data = bytearray()
         try:
+            proc = self.spawn(args, env, cwd)
+            end = min(self.deadline, time.monotonic() + seconds)
+            cancellation_checkpoint()
             os.set_blocking(proc.stdout.fileno(), False)
             while True:
+                cancellation_checkpoint()
                 require(time.monotonic() < end, "subprocess_timeout")
                 ready, _, _ = select.select([proc.stdout], [], [], min(0.1, end - time.monotonic()))
                 if ready:
@@ -421,17 +624,18 @@ class Processes:
                 elif proc.poll() is not None:
                     continue
             require(proc.wait(timeout=max(0.01, end - time.monotonic())) == 0, "subprocess_failed")
-            return bytes(data)
         finally:
-            result = stop_process(proc)
-            require(cleanup_proved(result), "subprocess_cleanup")
-            proc.stdout.close()
+            if proc is not None:
+                result = finish_owned_child(proc)
+                require(cleanup_proved(result), "subprocess_cleanup")
+        cancellation_checkpoint()
+        return bytes(data)
 
     def cleanup(self):
         results = []
         for proc in reversed(self.items):
             try:
-                results.append(stop_process(proc))
+                results.append(finish_owned_child(proc))
             except BaseException:
                 results.append({"pid": proc.pid, "direct_reaped": False,
                                 "group_absent": False, "failure": "cleanup_error"})
@@ -445,6 +649,7 @@ def git(manager, repo, *args):
 def snapshot(manager, repo):
     records = []
     for entry in git(manager, repo, "ls-files", "--stage", "-z").split(b"\0"):
+        cancellation_checkpoint()
         if not entry:
             continue
         header, name = entry.split(b"\t", 1)
@@ -455,13 +660,16 @@ def snapshot(manager, repo):
             digest = oid
         elif mode == "120000":
             raw = os.readlink(path).encode()
-            require(hashlib.sha1(b"blob " + str(len(raw)).encode() + b"\0" + raw).hexdigest() == oid,
+            # Match this legacy Git object format; content receipts use SHA256.
+            require(hashlib.sha1(b"blob " + str(len(raw)).encode() + b"\0" + raw,
+                                 usedforsecurity=False).hexdigest() == oid,
                     "source_overlay")
             digest = sha(raw)
         else:
             raw = bounded_read(path, 32 * 1024 * 1024)
             canonical = raw.replace(b"\r\n", b"\n") if path.suffix in (".ps1", ".sln") else raw
-            require(hashlib.sha1(b"blob " + str(len(canonical)).encode() + b"\0" + canonical).hexdigest() == oid,
+            require(hashlib.sha1(b"blob " + str(len(canonical)).encode() + b"\0" + canonical,
+                                 usedforsecurity=False).hexdigest() == oid,
                     "source_overlay")
             digest = sha(raw)
         records.append((name.decode(), mode, oid, digest))
@@ -538,6 +746,7 @@ def serve(spec_path):
                                                      "index_sha256": sha(index)}, ready=True)
         write_json(directory / "server-counts.json", counts)
         while time.monotonic() < spec["deadline"]:
+            cancellation_checkpoint()
             try:
                 client, _ = listener.accept()
             except socket.timeout:
@@ -576,8 +785,10 @@ def window_binding(spec, window):
 def wait_file(path, deadline):
     marker = path.with_name(path.name + ".ready")
     while not marker.exists():
+        cancellation_checkpoint()
         require(time.monotonic() < deadline, "ipc_timeout")
         time.sleep(0.02)
+    cancellation_checkpoint()
     return read_json(path)
 
 
@@ -589,6 +800,7 @@ def terminal_info(fd=0):
 def bounded_write(fd, data, deadline):
     offset = 0
     while offset < len(data):
+        cancellation_checkpoint()
         require(time.monotonic() < deadline, "write_timeout")
         _, ready, _ = select.select([], [fd], [], min(0.05, deadline - time.monotonic()))
         if ready:
@@ -618,6 +830,7 @@ class Bridge:
         self.replies = 0
 
     def pump(self, deadline):
+        cancellation_checkpoint()
         require(time.monotonic() < min(deadline, self.deadline), "prompt_timeout")
         ready, _, _ = select.select([self.master, 0], [], [], min(0.05, deadline - time.monotonic()))
         if 0 in ready:
@@ -650,6 +863,7 @@ class Bridge:
             require(self.pump(end), "early_cli_exit")
 
     def send(self, action, data):
+        cancellation_checkpoint()
         validate_terminal(terminal_info())
         validate_terminal(terminal_info(self.master))
         require(len(data) <= 256, "input_overflow")
@@ -727,6 +941,7 @@ class Bridge:
         try:
             tty.setraw(0)
             os.set_blocking(1, False)
+            cancellation_checkpoint()
             self.pid, self.master = pty.fork()
             if self.pid == 0:
                 try:
@@ -761,23 +976,52 @@ class Bridge:
             failure = str(error) if isinstance(error, Refusal) else "bridge_io_failure"
         finally:
             if self.child is not None:
-                cleanup = stop_process(self.child)
+                cleanup = finish_owned_child(self.child)
                 self.status = self.child.returncode
             if not cleanup_proved(cleanup):
                 failure = "cli_cleanup_incomplete"
             for fd in (self.master, read_end, write_end):
                 if fd is not None:
-                    os.close(fd)
-            termios.tcsetattr(0, termios.TCSANOW, old)
-            fcntl.fcntl(1, fcntl.F_SETFL, old_flags)
-            private_write(self.directory / "output.private", bytes(self.guard.data))
-            write_json(self.directory / "bridge-result.json", {
+                    try:
+                        os.close(fd)
+                    except BaseException:
+                        failure = "bridge_cleanup_incomplete"
+            for restore in (lambda: termios.tcsetattr(0, termios.TCSANOW, old),
+                            lambda: fcntl.fcntl(1, fcntl.F_SETFL, old_flags)):
+                try:
+                    restore()
+                except BaseException:
+                    failure = "bridge_cleanup_incomplete"
+            if cancellation_pending() and failure is None:
+                failure = "interrupted"
+            try:
+                private_write(self.directory / "output.private", bytes(self.guard.data))
+            except BaseException:
+                failure = "bridge_output_incomplete"
+            result = {
                 "binding": self.binding, "terminal": info, "cli_pid": self.pid,
                 "parent_pid": os.getpid(), "exit": self.status, "failure": failure,
                 "observed_sha256": self.guard.observed.hexdigest(),
                 "display_sha256": self.guard.forwarded.hexdigest(),
                 "bytes": len(self.guard.data), "display_bytes": self.guard.forwarded_bytes,
-                "events": self.events, "cleanup": cleanup}, ready=True)
+                "events": self.events, "cleanup": cleanup}
+            target = self.directory / "bridge-result.json"
+            write_json(target, result)
+            # A signal delivered while writing the private result must appear
+            # in it before ready admission. Later cancellation still exits1;
+            # the ready commit is not a retroactive OS cancellation transaction.
+            if cancellation_pending() and result["failure"] is None:
+                failure = result["failure"] = "interrupted"
+                write_json(target, result, replace=True)
+            marker = target.with_name(target.name + ".ready")
+            private_write(marker, b"")
+            if cancellation_pending() and result["failure"] is None:
+                marker.unlink()
+                failure = result["failure"] = "interrupted"
+                write_json(target, result, replace=True)
+                private_write(marker, b"")
+            if cancellation_pending():
+                failure = failure or "interrupted"
         return 1 if failure else 0
 
 
@@ -1080,8 +1324,12 @@ class Capture:
                                     "cache_upload": False}
         self.manager.run(cli, 25 * 60, env=safe_env(), cwd=self.source)
         self.manager.run(fixture, 6 * 60, env=safe_env(), cwd=self.source)
-        self.binary = cli_target / "debug/zeroclaw"
-        self.wasm_path = fixture_target / "wasm32-wasip2/debug/zeroclaw_tool_plugin_fixture.wasm"
+        (self.private / "materialized").mkdir(mode=0o700)
+        self.compiled_artifacts = {
+            "binary": materialize_compiler_artifact(self.private, CLI_ARTIFACT, self.manager.deadline),
+            "component": materialize_compiler_artifact(self.private, COMPONENT_ARTIFACT, self.manager.deadline)}
+        self.binary = materialized_artifact_path(self.private, CLI_ARTIFACT)
+        self.wasm_path = materialized_artifact_path(self.private, COMPONENT_ARTIFACT)
         self.binary_hash = sha(bounded_read(self.binary, 256 * 1024 * 1024))
         self.wasm = bounded_read(self.wasm_path, 8 * 1024 * 1024)
         self.provenance.update({"binary_sha256": self.binary_hash, "component_sha256": sha(self.wasm),
@@ -1264,12 +1512,22 @@ class Capture:
 
     def run(self):
         try:
+            cancellation_checkpoint()
             self.setup()
             self.build()
             for case in CASES:
                 self.case(case)
             require(snapshot(self.manager, self.source) == self.source_snapshot, "source_changed")
             require(snapshot(self.manager, self.auxiliary) == self.aux_snapshot, "auxiliary_changed")
+            require(type(self.compiled_artifacts) is dict
+                    and set(self.compiled_artifacts) == {"binary", "component"}
+                    and self.compiled_artifacts["binary"]["relative"] == list(CLI_ARTIFACT)
+                    and self.compiled_artifacts["component"]["relative"] == list(COMPONENT_ARTIFACT)
+                    and self.binary == materialized_artifact_path(self.private, CLI_ARTIFACT)
+                    and self.wasm_path == materialized_artifact_path(self.private, COMPONENT_ARTIFACT),
+                    "artifact_ledger")
+            for record in self.compiled_artifacts.values():
+                verify_materialized_artifact(self.private, record, self.manager.deadline)
             require(sha(bounded_read(self.binary, 256 * 1024 * 1024)) == self.binary_hash
                     and sha(bounded_read(self.wasm_path, 8 * 1024 * 1024)) == sha(self.wasm), "binary_changed")
             self.provenance.update({"source_after": self.source_snapshot, "auxiliary_after": self.aux_snapshot,
@@ -1277,6 +1535,8 @@ class Capture:
         except BaseException as error:
             self.failure = str(error) if isinstance(error, Refusal) else "capture_failed"
         finally:
+            # The signal handler only latches. Cleanup/receipt preparation has
+            # no cancellation throw; export admission below follows owned cleanup.
             resources = self.manager.cleanup()
             reaped = all(cleanup_proved(r) for r in resources)
             cli_cleanup = []
@@ -1300,6 +1560,8 @@ class Capture:
                 reaped = reaped and not display_files_remaining
             if not reaped:
                 self.failure = "cleanup_incomplete"
+            elif cancellation_pending():
+                self.failure = "interrupted"
             cleanup = {"status": "reaped" if reaped else "incomplete", "harness_started": True,
                        "owned_processes": resources, "CLI_reap_receipts": cli_cleanup,
                        "display_files_remaining": display_files_remaining,
@@ -1310,20 +1572,27 @@ class Capture:
             try:
                 if self.failure is None and reaped:
                     self.export_files(cleanup)  # All rich bytes remain private.
+                if cancellation_pending() and self.failure is None:
+                    self.failure = "interrupted"
                 if reaped:
                     remove_owned(self.root, self.private)
                     cleanup["temporary_material_removed"] = True
                 if self.failure is None and reaped:
                     write_json(self.staging / "cleanup.json", cleanup, replace=True)
                     self.seal_staging()
+                    cancellation_checkpoint()
                     publish_bundle(self.root, self.staging, self.tokens, self.context)
+                    cancellation_checkpoint()
                     write_json(self.root / "finished.json", {"binding": self.context,
                                "complete": True, "cleanup": True})
             except BaseException:
                 self.failure = "export_refused"
+            if cancellation_pending() and reaped:
+                self.failure = "interrupted"
             if self.failure is not None:
                 minimum_failure(self.root, self.context,
-                                "cleanup_incomplete" if not reaped else "capture_refused")
+                                "cleanup_incomplete" if not reaped else (
+                                    "interrupted" if cancellation_pending() else "capture_refused"))
         return 1 if self.failure else 0
 
 
@@ -1334,6 +1603,7 @@ def finalize(root):
             and root.stat().st_uid == os.getuid() and stat.S_IMODE(root.stat().st_mode) == 0o700,
             "root_binding")
     try:
+        cancellation_checkpoint()
         state = read_json(root / "state.json")
         require(state["started"] is True and os.environ.get("EVIDENCE_CAPTURE_OUTCOME") == "success",
                 "capture_not_successful")
@@ -1344,16 +1614,31 @@ def finalize(root):
                 and decision["schema"] == 1 and decision["kind"] == "success"
                 and decision["safe"] is True and decision["binding"] == context, "export_decision")
         require(validate_bundle(root / "export", [], context) == decision["files"], "export_changed")
+        cancellation_checkpoint()
+        export_outputs(True, False)
+        cancellation_checkpoint()
     except BaseException:
-        minimum_failure(root, context, "finalizer_refused")
-        export_outputs(False, True)
+        try:
+            revoke_success(root)
+            try:
+                verify_failure(root, context)
+            except BaseException:
+                minimum_failure(root, context, "finalizer_refused")
+            # Never admit an unchecked old receipt or an unchecked fallback write.
+            verify_failure(root, context)
+            export_outputs(False, True)
+        except BaseException:
+            # No eligible output on a failed revoke/write/recheck. The official
+            # failed-step gate also denies rich upload if output I/O was partial.
+            return 1
         return 1
-    export_outputs(True, False)
     return 0
 
 
-def interrupted(_signum, _frame):
-    raise Refusal("interrupted")
+def interrupted(signum, _frame):
+    global PENDING_CANCELLATION
+    if signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP) and PENDING_CANCELLATION is None:
+        PENDING_CANCELLATION = signum
 
 
 def main():
@@ -1370,14 +1655,16 @@ def main():
         signal.signal(sig, interrupted)
     try:
         if args.finalize:
-            return finalize(args.finalize.absolute())
-        if args.bridge:
-            return Bridge(args.bridge.absolute()).run()
-        if args.serve:
+            result = finalize(args.finalize.absolute())
+        elif args.bridge:
+            result = Bridge(args.bridge.absolute()).run()
+        elif args.serve:
             serve(args.serve.absolute())
-            return 0
-        require(args.source and args.auxiliary and args.root, "arguments_missing")
-        return Capture(args.source.absolute(), args.auxiliary.absolute(), args.root.absolute()).run()
+            result = 0
+        else:
+            require(args.source and args.auxiliary and args.root, "arguments_missing")
+            result = Capture(args.source.absolute(), args.auxiliary.absolute(), args.root.absolute()).run()
+        return 1 if cancellation_pending() else result
     except Exception as error:
         code = str(error) if isinstance(error, Refusal) else "boundary_failure"
         print(json.dumps({"status": "failure", "code": code}))
