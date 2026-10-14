@@ -1200,8 +1200,8 @@ class CaptureControls(unittest.TestCase):
                     write_json(path, value, **kwargs)
                     if stage == "result" and path.name == "bridge-result.json":
                         evidence.interrupted(evidence.signal.SIGHUP, None)
-                def writing_private(path, data, **kwargs):
-                    private_write(path, data, **kwargs)
+                def writing_private(path, data, replace=False, **kwargs):
+                    private_write(path, data, replace, **kwargs)
                     if (stage == "output" and path.name == "output.private") or (
                             stage == "ready" and path.name == "bridge-result.json.ready"):
                         evidence.interrupted(evidence.signal.SIGINT, None)
