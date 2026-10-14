@@ -13953,9 +13953,10 @@ mod tests {
     async fn local_session_factory_populates_channels_and_resume_preserves_them() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = make_acp_test_config(&tmp);
-        config.tools.optional.extend(
-            ["ask_user", "channel_room", "poll", "escalate_to_human"].map(str::to_string),
-        );
+        config
+            .tools
+            .optional
+            .extend(["ask_user", "channel_room", "poll", "escalate_to_human"].map(str::to_string));
         let (mut dispatcher, sessions) = make_acp_test_dispatcher(config);
         dispatcher.local_session_channel_factory = Some(session_factory_stub());
         dispatcher.set_tui_id_for_test(Some("tui-local".into()));
@@ -14260,9 +14261,10 @@ mod tests {
     async fn local_acp_rehydration_restores_session_channels() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = make_acp_test_config(&tmp);
-        config.tools.optional.extend(
-            ["ask_user", "channel_room", "poll", "escalate_to_human"].map(str::to_string),
-        );
+        config
+            .tools
+            .optional
+            .extend(["ask_user", "channel_room", "poll", "escalate_to_human"].map(str::to_string));
         let data_dir = config.data_dir.clone();
         let (mut dispatcher, sessions, _chat_backend, _acp_store) =
             make_persistence_test_dispatcher(config, &data_dir);
