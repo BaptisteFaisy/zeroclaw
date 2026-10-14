@@ -3412,15 +3412,32 @@ impl Agent {
     }
 
     fn tool_protocol_prompts(&self) -> Result<Arc<crate::agent::turn::ToolProtocolPrompts>> {
-        Ok(Arc::new(crate::agent::turn::ToolProtocolPrompts::new(
-            self.build_system_prompt_with_dispatcher(&NativeToolDispatcher)?,
-            self.build_system_prompt_with_dispatcher(&XmlToolDispatcher)?,
-        )))
+        Ok(Arc::new(
+            crate::agent::turn::ToolProtocolPrompts::with_max_chars(
+                // The turn may switch transport after construction: keep both
+                // variants complete (0 = no cap, as in `finalize_system_prompt`)
+                // and cap the provider-bound request after the swap.
+                self.build_system_prompt_with_dispatcher_and_cap(&NativeToolDispatcher, 0)?,
+                self.build_system_prompt_with_dispatcher_and_cap(&XmlToolDispatcher, 0)?,
+                self.config.resolved.max_system_prompt_chars,
+            ),
+        ))
     }
 
     fn build_system_prompt_with_dispatcher(
         &self,
         dispatcher: &dyn ToolDispatcher,
+    ) -> Result<String> {
+        self.build_system_prompt_with_dispatcher_and_cap(
+            dispatcher,
+            self.config.resolved.max_system_prompt_chars,
+        )
+    }
+
+    fn build_system_prompt_with_dispatcher_and_cap(
+        &self,
+        dispatcher: &dyn ToolDispatcher,
+        max_chars: usize,
     ) -> Result<String> {
         let expose_text_tool_protocol =
             !self.config.resolved.strict_tool_parsing || dispatcher.should_send_tool_specs();
@@ -3434,6 +3451,7 @@ impl Agent {
             &no_tools
         };
         let instructions = dispatcher.prompt_instructions(prompt_tools);
+        let hidden_builtin_names = self.tools.hidden_builtin_names();
         // Prompt policy facts come from the same ApprovalManager the
         // execution gate consults (borrowed, render-time). A builder without
         // a manager retains its legacy autonomy fallback but cannot name
@@ -3447,6 +3465,7 @@ impl Agent {
             agent_workspace_dir: &self.agent_workspace_dir,
             model_name: &self.model_name,
             tools: prompt_tools,
+            hidden_builtin_names: Some(&hidden_builtin_names),
             skills: &self.skills,
             skills_prompt_mode: self.skills_prompt_mode,
             identity_config: Some(&self.identity_config),
@@ -3462,7 +3481,6 @@ impl Agent {
         let mut prompt = self
             .prompt_builder
             .build_with_approval_policy(&ctx, &prompt_always_ask)?;
-        append_timestamp_orientation(&mut prompt);
         let receipts = &self.config.resolved.tool_receipts;
         if receipts.enabled && receipts.inject_system_prompt {
             prompt.push_str(crate::agent::tool_receipts::SYSTEM_PROMPT_ADDENDUM);
@@ -3485,7 +3503,14 @@ impl Agent {
             prompt.push_str("\n\n");
             prompt.push_str(&pinned_section);
         }
-        Ok(prompt)
+        // Keep the runtime orientation at the end of the complete prompt so
+        // truncation cannot retain an earlier copy and append a second one.
+        append_timestamp_orientation(&mut prompt);
+        // Match the channel/CLI prompt path: cap the fully assembled prompt,
+        // including dispatcher instructions, receipts, and MCP sections.
+        Ok(crate::agent::system_prompt::finalize_system_prompt(
+            prompt, max_chars,
+        ))
     }
 
     fn rebuild_system_prompt_for_dispatcher(
@@ -4535,7 +4560,7 @@ impl Agent {
                 new_messages: new_msgs,
             });
         }
-        let tool_protocol_prompts = match self.tool_protocol_prompts() {
+        let mut tool_protocol_prompts = match self.tool_protocol_prompts() {
             Ok(prompts) => prompts,
             Err(error) => {
                 let notice = self.trim_history(Some(&turn_id));
@@ -5047,16 +5072,24 @@ impl Agent {
                             new_model,
                         )
                     {
-                        if let Err(error) = self
+                        // Rebuild the per-turn protocol prompts too: a capped
+                        // native request is built from them, so keeping the
+                        // turn-start pair would send the pre-switch model
+                        // label and workspace instructions.
+                        let refreshed = self
                             .rebuild_streamed_system_prompt_for_active_provider(&mut loop_history)
-                        {
-                            let notice = self.trim_history(Some(&turn_id));
-                            forward_history_trim_notice(&event_tx, notice).await;
-                            return Err(StreamedTurnError {
-                                error,
-                                committed_response,
-                                new_messages: new_msgs,
-                            });
+                            .and_then(|()| self.tool_protocol_prompts());
+                        match refreshed {
+                            Ok(prompts) => tool_protocol_prompts = prompts,
+                            Err(error) => {
+                                let notice = self.trim_history(Some(&turn_id));
+                                forward_history_trim_notice(&event_tx, notice).await;
+                                return Err(StreamedTurnError {
+                                    error,
+                                    committed_response,
+                                    new_messages: new_msgs,
+                                });
+                            }
                         }
                         let notice = self.trim_history(Some(&turn_id));
                         forward_history_trim_notice(&event_tx, notice).await;
@@ -8854,6 +8887,7 @@ mod tests {
             responses: Mutex<Vec<zeroclaw_providers::ChatResponse>>,
             supports_native: bool,
             captured_messages: CapturedTranscripts,
+            captured_tool_specs: Option<Arc<Mutex<Vec<Vec<crate::tools::ToolSpec>>>>>,
         }
 
         #[async_trait]
@@ -8877,6 +8911,11 @@ mod tests {
                 self.captured_messages
                     .lock()
                     .push(request.messages.to_vec());
+                if let Some(specs) = &self.captured_tool_specs {
+                    specs
+                        .lock()
+                        .push(request.tools.unwrap_or_default().to_vec());
+                }
                 let mut guard = self.responses.lock();
                 if guard.is_empty() {
                     return Ok(zeroclaw_providers::ChatResponse {
@@ -8916,9 +8955,316 @@ mod tests {
                     responses: Mutex::new(vec![]),
                     supports_native,
                     captured_messages: Arc::clone(&captured),
+                    captured_tool_specs: None,
                 }),
                 captured,
             )
+        }
+
+        struct DeferredSchemaProbeTool {
+            calls: Arc<AtomicUsize>,
+        }
+
+        zeroclaw_api::mock_tool_attribution!(DeferredSchemaProbeTool);
+
+        #[async_trait]
+        impl Tool for DeferredSchemaProbeTool {
+            fn name(&self) -> &str {
+                "builtin_probe"
+            }
+
+            fn description(&self) -> &str {
+                "Probe an admitted built-in.\nFull deferred description sentinel."
+            }
+
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {"probe_argument": {"type": "string"}},
+                    "required": ["probe_argument"]
+                })
+            }
+
+            async fn execute(&self, args: serde_json::Value) -> Result<crate::tools::ToolResult> {
+                assert_eq!(args["probe_argument"], "selected value");
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(crate::tools::ToolResult {
+                    success: true,
+                    output: "deferred probe executed".into(),
+                    error: None,
+                })
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        enum DeferredBuiltinRequestFlow {
+            SearchFirst,
+            Direct,
+            SearchAndExecute,
+        }
+
+        async fn prove_deferred_builtin_provider_requests(
+            supports_native: bool,
+            flow: DeferredBuiltinRequestFlow,
+        ) {
+            use crate::tools::scoped::{ScopedAssembly, ScopedToolRegistry};
+            use zeroclaw_config::schema::{AliasedAgentConfig, RuntimeProfileConfig};
+
+            let workspace = tempfile::TempDir::new().expect("temp workspace");
+            let calls = Arc::new(AtomicUsize::new(0));
+            let probe = DeferredSchemaProbeTool {
+                calls: Arc::clone(&calls),
+            };
+            let probe_spec = probe.spec();
+            let eager_names = [
+                "shell",
+                "file_read",
+                "file_write",
+                "file_edit",
+                "memory_recall",
+                "memory_store",
+            ];
+            let mut raw_tools: Vec<Box<dyn Tool>> = eager_names
+                .iter()
+                .map(|name| Box::new(NamedMockTool::new(name)) as Box<dyn Tool>)
+                .collect();
+            raw_tools.push(Box::new(probe));
+            raw_tools.push(Box::new(NamedMockTool::new("unselected_builtin")));
+
+            let mut config = Config::default();
+            config.runtime_profiles.insert(
+                "deferred-test".into(),
+                RuntimeProfileConfig {
+                    deferred_builtin_tools: true,
+                    ..RuntimeProfileConfig::default()
+                },
+            );
+            config.agents.insert(
+                "default".into(),
+                AliasedAgentConfig {
+                    runtime_profile: "deferred-test".into(),
+                    ..AliasedAgentConfig::default()
+                },
+            );
+            let security = Arc::new(crate::security::SecurityPolicy::default());
+            let assembled = ScopedToolRegistry::assemble(ScopedAssembly {
+                config: &config,
+                agent_alias: "default",
+                security: &security,
+                built: crate::tools::AllToolsResult::from_prebuilt_tools(raw_tools),
+                skills: &[],
+                runtime: Arc::new(crate::platform::NativeRuntime::new()),
+                caller_allowed: None,
+                connect_mcp: false,
+                connect_peripherals: false,
+                exclude_memory: false,
+                acp_delivery: false,
+                list_deferred_mcp_specs: false,
+                emit_assembly_logs: false,
+                mcp_registry: None,
+            })
+            .await;
+            let activated = assembled
+                .activated_handle
+                .clone()
+                .expect("schema selection state");
+            let search = assembled.tool_search_handle.clone();
+            let captured: CapturedTranscripts = Arc::new(Mutex::new(Vec::new()));
+            let captured_specs = Arc::new(Mutex::new(Vec::new()));
+            let tool_response = |name: &str, arguments: serde_json::Value| {
+                zeroclaw_providers::ChatResponse {
+                    text: (!supports_native).then(|| {
+                        format!("<tool_call>{{\"name\":\"{name}\",\"arguments\":{arguments}}}</tool_call>")
+                    }),
+                    tool_calls: if supports_native {
+                        vec![zeroclaw_providers::ToolCall {
+                            id: format!("call-{name}"),
+                            name: name.into(),
+                            arguments: arguments.to_string(),
+                            extra_content: None,
+                        }]
+                    } else {
+                        vec![]
+                    },
+                    usage: None,
+                    reasoning_content: None,
+                }
+            };
+            let search_response = tool_response(
+                "tool_search",
+                serde_json::json!({"query": "select:builtin_probe"}),
+            );
+            let execute_response = tool_response(
+                "builtin_probe",
+                serde_json::json!({"probe_argument": "selected value"}),
+            );
+            let responses = match flow {
+                DeferredBuiltinRequestFlow::SearchFirst => {
+                    vec![search_response, execute_response]
+                }
+                DeferredBuiltinRequestFlow::Direct => vec![execute_response],
+                DeferredBuiltinRequestFlow::SearchAndExecute => {
+                    assert!(!supports_native, "mixed batch exercises text parsing");
+                    let mut response = search_response;
+                    response.text = Some(format!(
+                        "{}\n{}",
+                        response.text.as_deref().unwrap(),
+                        execute_response.text.as_deref().unwrap()
+                    ));
+                    vec![response]
+                }
+            };
+            let provider = Box::new(CapturingModelProvider {
+                responses: Mutex::new(responses),
+                supports_native,
+                captured_messages: Arc::clone(&captured),
+                captured_tool_specs: Some(Arc::clone(&captured_specs)),
+            });
+            let mut agent = blank_input_agent(provider);
+            agent.workspace_dir = workspace.path().to_path_buf();
+            agent.agent_workspace_dir = workspace.path().to_path_buf();
+            agent.tools = assembled.registry;
+            agent.activated_tools = Some(Arc::clone(&activated));
+            agent.tool_search = search;
+            assert!(agent.tools.hidden_builtin_names().contains("builtin_probe"));
+
+            assert_eq!(
+                agent
+                    .turn("select and run the built-in probe")
+                    .await
+                    .unwrap(),
+                "done"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let requests = captured.lock();
+            let specs = captured_specs.lock();
+            let search_first = matches!(flow, DeferredBuiltinRequestFlow::SearchFirst);
+            let selected = !matches!(flow, DeferredBuiltinRequestFlow::Direct);
+            assert_eq!(
+                agent.tools.hidden_builtin_names().contains("builtin_probe"),
+                !selected
+            );
+            let expected_requests = if search_first { 3 } else { 2 };
+            assert_eq!(requests.len(), expected_requests);
+            assert_eq!(specs.len(), expected_requests);
+            let initial_prompt = &requests[0]
+                .iter()
+                .find(|message| message.role == "system")
+                .expect("provider receives system prompt")
+                .content;
+            assert!(initial_prompt.contains("builtin_probe - Probe an admitted built-in."));
+            assert!(initial_prompt.contains("unselected_builtin - mock"));
+            assert!(!initial_prompt.contains("probe_argument"));
+            assert!(!initial_prompt.contains("Full deferred description sentinel."));
+
+            if supports_native {
+                for name in eager_names.into_iter().chain(["tool_search"]) {
+                    assert!(
+                        specs[0].iter().any(|spec| spec.name == name),
+                        "eager schema {name}"
+                    );
+                }
+                assert!(specs[0].iter().all(|spec| spec.name != "builtin_probe"));
+                for request_specs in &specs[1..] {
+                    if selected {
+                        let selected = request_specs
+                            .iter()
+                            .find(|spec| spec.name == "builtin_probe")
+                            .expect(
+                                "selection exposes the complete native schema on the next request",
+                            );
+                        assert_eq!(selected.parameters, probe_spec.parameters);
+                        assert_eq!(selected.description, probe_spec.description);
+                    } else {
+                        assert!(
+                            request_specs
+                                .iter()
+                                .all(|spec| spec.name != "builtin_probe")
+                        );
+                    }
+                    assert!(
+                        request_specs
+                            .iter()
+                            .all(|spec| spec.name != "unselected_builtin")
+                    );
+                }
+            } else {
+                assert!(
+                    specs.iter().all(Vec::is_empty),
+                    "text providers receive no native specs"
+                );
+                for name in eager_names.into_iter().chain(["tool_search"]) {
+                    assert!(
+                        initial_prompt.contains(&format!("**{name}**")),
+                        "eager text schema {name}"
+                    );
+                }
+                assert!(!initial_prompt.contains("**builtin_probe**"));
+            }
+
+            let after_first_response = requests[1]
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(after_first_response.contains("<functions>"), selected);
+            assert_eq!(
+                after_first_response.contains("Full deferred description sentinel."),
+                selected
+            );
+            if selected {
+                assert!(after_first_response.contains("probe_argument"));
+            }
+            assert_eq!(
+                after_first_response.contains("deferred probe executed"),
+                !search_first
+            );
+            assert!(
+                requests
+                    .last()
+                    .unwrap()
+                    .iter()
+                    .any(|message| message.content.contains("deferred probe executed"))
+            );
+            assert!(
+                activated.lock().unwrap().get("builtin_probe").is_none(),
+                "built-in selection must not create a second executable owner"
+            );
+        }
+
+        #[tokio::test]
+        async fn native_agent_requests_expose_builtin_schema_only_after_selection() {
+            prove_deferred_builtin_provider_requests(true, DeferredBuiltinRequestFlow::SearchFirst)
+                .await;
+        }
+
+        #[tokio::test]
+        async fn text_agent_requests_receive_selected_builtin_schema_before_execution() {
+            prove_deferred_builtin_provider_requests(
+                false,
+                DeferredBuiltinRequestFlow::SearchFirst,
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn admitted_hidden_builtin_executes_before_schema_selection() {
+            for supports_native in [true, false] {
+                prove_deferred_builtin_provider_requests(
+                    supports_native,
+                    DeferredBuiltinRequestFlow::Direct,
+                )
+                .await;
+            }
+        }
+
+        #[tokio::test]
+        async fn text_agent_executes_hidden_builtin_in_tool_search_batch() {
+            prove_deferred_builtin_provider_requests(
+                false,
+                DeferredBuiltinRequestFlow::SearchAndExecute,
+            )
+            .await;
         }
 
         #[test]
@@ -9071,6 +9417,61 @@ mod tests {
                 prompt.contains("SOUL_MD_CONTROL_9341"),
                 "SOUL.md must still reach the Chat system prompt"
             );
+        }
+
+        #[tokio::test]
+        async fn streamed_agent_caps_fully_assembled_system_prompt_on_every_turn() {
+            let (provider, captured) = capturing_provider(false);
+            let mut agent = test_agent_with_provider(provider, vec![Box::new(MockTool)]);
+            agent.config.resolved.compact_context = true;
+            agent.config.resolved.max_system_prompt_chars = 4_000;
+            // MCP/tool guidance is appended after the base identity prompt.
+            // The cap must cover this tail, even when the dispatcher switches
+            // from native to XML tool instructions at the turn boundary.
+            agent.mcp_pinned = vec![zeroclaw_tools::mcp_context::PinnedResourceBlock {
+                key: "docs__large".into(),
+                rendered: format!("<mcp-resource>{}</mcp-resource>", "界".repeat(5_000)),
+            }];
+            let assert_capped = |prompt: &str| {
+                assert_eq!(prompt.chars().count(), 4_000);
+                assert!(prompt.ends_with(crate::agent::prompt::TIMESTAMP_ORIENTATION));
+                assert_eq!(
+                    prompt
+                        .matches(crate::agent::prompt::TIMESTAMP_ORIENTATION)
+                        .count(),
+                    1,
+                    "the capped prompt must not repeat the timestamp orientation"
+                );
+                assert!(prompt.contains("## Project Context"));
+            };
+
+            let initial = agent.build_system_prompt().expect("initial prompt");
+            assert_capped(&initial);
+            agent.history = vec![ConversationMessage::Chat(ChatMessage::system(initial))];
+            agent.set_tool_dispatcher(Box::new(XmlToolDispatcher));
+            let ConversationMessage::Chat(rebuilt) = &agent.history[0] else {
+                panic!("rebuilt system prompt must be a chat message");
+            };
+            assert_capped(&rebuilt.content);
+            assert!(rebuilt.content.contains(XML_TOOLS_MARKER));
+
+            for message in ["first", "follow-up"] {
+                let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
+                agent
+                    .turn_streamed(message, event_tx, None)
+                    .await
+                    .expect("streamed Agent turn should succeed");
+            }
+            let captured = captured.lock();
+            assert_eq!(captured.len(), 2);
+            for request in captured.iter() {
+                let system = request
+                    .iter()
+                    .find(|message| message.role == "system")
+                    .expect("provider-visible system prompt");
+                assert_capped(&system.content);
+                assert!(system.content.contains(XML_TOOLS_MARKER));
+            }
         }
 
         #[tokio::test]
@@ -18409,6 +18810,167 @@ model_provider = "custom.only"
              provider/model (ollama/llama3); captured events: {events:?}"
         );
         drop(events);
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_model_switch_refreshes_capped_native_request() {
+        use axum::{Json, Router, response::IntoResponse};
+
+        // The switch target is a native-tool (OpenAI) provider whose requests
+        // are captured, so the post-switch request itself can be inspected.
+        // Every path is served and recorded, so a provider-side URL change
+        // shows up in the failure message instead of a bare 404.
+        let requests: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&requests);
+        let seen_by_server = Arc::clone(&seen);
+        let app = Router::new().fallback(
+            move |method: axum::http::Method, uri: axum::http::Uri, body: axum::body::Bytes| {
+                let captured = Arc::clone(&captured);
+                let seen = Arc::clone(&seen_by_server);
+                async move {
+                    seen.lock().push(format!("{method} {}", uri.path()));
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+                    let stream = body["stream"].as_bool().unwrap_or(false);
+                    captured.lock().push(body);
+                    if stream {
+                        let chunk = serde_json::json!({
+                            "choices": [{"delta": {"content": "switched answer"}, "finish_reason": "stop"}]
+                        });
+                        (
+                            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                            format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+                        )
+                            .into_response()
+                    } else {
+                        Json(serde_json::json!({
+                            "choices": [{
+                                "message": {"role": "assistant", "content": "switched answer"},
+                                "finish_reason": "stop"
+                            }]
+                        }))
+                        .into_response()
+                    }
+                }
+            },
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake switched provider");
+        let address = listener.local_addr().expect("fake provider address");
+        zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve fake switched provider");
+        });
+
+        let mut config = zeroclaw_config::schema::Config {
+            reliability: zeroclaw_config::schema::ReliabilityConfig {
+                provider_retries: 0,
+                provider_backoff_ms: 0,
+                ..zeroclaw_config::schema::ReliabilityConfig::default()
+            },
+            ..zeroclaw_config::schema::Config::default()
+        };
+        {
+            let entry = config
+                .providers
+                .models
+                .ensure("openai", "switched")
+                .expect("openai model_provider type slot");
+            entry.api_key = Some("switched-key".to_string());
+            entry.uri = Some(format!("http://{address}"));
+            entry.model = Some("switched-model".to_string());
+            // Chat Completions keeps the request shape (system message,
+            // native `tools`) straightforward to inspect.
+            entry.wire_api = Some(zeroclaw_config::schema::WireApi::ChatCompletions);
+        }
+        let switch_cfg = ProviderSwitchConfig {
+            config: Some(Arc::new(config)),
+            live_config: None,
+            live: None,
+        };
+        // Any cap makes a native request come from the per-turn protocol
+        // prompts rather than from the (rebuilt) history prompt.
+        let cap = 200_000;
+        let agent_config = zeroclaw_config::schema::AliasedAgentConfig {
+            resolved: zeroclaw_config::schema::ResolvedRuntime {
+                strict_tool_parsing: true,
+                max_system_prompt_chars: cap,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let workspace = tempfile::TempDir::new().expect("temp dir");
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
+                .expect("memory creation"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(StreamSwitchTriggerProvider {
+                call_count: Arc::new(Mutex::new(0usize)),
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(ModelSwitchTriggerTool {
+                    target_provider: "openai.switched".to_string(),
+                    target_model: "switched-model".to_string(),
+                })],
+            ))
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .config(agent_config)
+            .workspace_dir(workspace.path().to_path_buf())
+            .model_provider_name("openai".to_string())
+            .model_name("gpt-4o-mini".to_string())
+            .provider_switch_config(switch_cfg)
+            .build()
+            .expect("agent builder");
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            agent.turn_streamed("please switch the model", event_tx, None),
+        )
+        .await
+        .expect("streamed turn must not hang");
+        assert!(
+            response.is_ok(),
+            "the switched provider answers the turn: {:?}; requests seen: {:?}",
+            response.err().map(|error| error.to_string()),
+            seen.lock()
+        );
+        assert_eq!(agent.model_name, "switched-model");
+
+        let requests = requests.lock();
+        let request = requests
+            .first()
+            .expect("the switched provider must receive the post-switch request");
+        let system = request["messages"]
+            .as_array()
+            .and_then(|messages| messages.iter().find(|message| message["role"] == "system"))
+            .and_then(|message| message["content"].as_str())
+            .expect("the post-switch request must carry a system prompt");
+        assert!(
+            request.get("tools").is_some(),
+            "the post-switch request must use the native tool protocol"
+        );
+        assert!(
+            system.contains("Model: switched-model"),
+            "the capped native request must be rebuilt for the switched model"
+        );
+        assert!(
+            !system.contains("Model: gpt-4o-mini"),
+            "the capped native request must not reuse the turn-start prompt"
+        );
+        assert!(system.chars().count() <= cap);
     }
 
     fn turn_datetime_agent(
