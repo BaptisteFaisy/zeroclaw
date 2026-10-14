@@ -1355,6 +1355,449 @@ test -n "$python_program"
     }
 }
 
+fn arm64_baseline_python(manual: &str) -> String {
+    let build = yaml_block(manual, "  stable-gnu-build:\n");
+    let step = yaml_block(build, "      - name: Capture GNU ARM64 runner baseline\n");
+    explicit_bash_body(step, "          ")
+        .strip_prefix("python3 - <<'PY'\n")
+        .and_then(|body| body.strip_suffix("PY\n"))
+        .expect("baseline uses one fixed inline Python body")
+        .to_string()
+}
+
+fn assert_arm64_baseline_wiring(manual: &str) {
+    let build = yaml_block(manual, "  stable-gnu-build:\n");
+    let capture = yaml_block(build, "      - name: Capture GNU ARM64 runner baseline\n");
+    let upload = yaml_block(
+        build,
+        "      - name: Upload GNU ARM64 runner baseline before build\n",
+    );
+    assert_eq!(
+        build
+            .matches("- name: Capture GNU ARM64 runner baseline\n")
+            .count(),
+        1
+    );
+    assert_eq!(
+        build
+            .matches("- name: Upload GNU ARM64 runner baseline before build\n")
+            .count(),
+        1
+    );
+    assert_eq!(
+        capture
+            .split_once("        run: |\n")
+            .expect("literal capture body")
+            .0,
+        r##"        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        timeout-minutes: 1
+        shell: bash
+        env:
+          BASELINE_SOURCE: ${{ github.sha }}
+          BASELINE_RUN_ID: ${{ github.run_id }}
+          BASELINE_RUN_ATTEMPT: ${{ github.run_attempt }}
+          BASELINE_TARGET: ${{ matrix.target }}
+          BASELINE_DISTRIBUTION: ${{ inputs.distribution }}
+          BASELINE_PROFILE: ${{ inputs.qualification_profile }}
+          BASELINE_RELEASE_TOOLS_ONLY: ${{ inputs.release_tools_only }}
+"##
+    );
+    assert_eq!(
+        upload.trim_end(),
+        r##"        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        timeout-minutes: 2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: runner-baseline-gnu-arm64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/gnu-arm64-baseline-${{ github.run_id }}-${{ github.run_attempt }}/baseline.json
+            ${{ runner.temp }}/gnu-arm64-baseline-${{ github.run_id }}-${{ github.run_attempt }}/baseline.sha256
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0"##
+    );
+    let compiler = build.find("- name: Install cross compiler\n").unwrap();
+    let capture_start = build
+        .find("- name: Capture GNU ARM64 runner baseline\n")
+        .unwrap();
+    let upload_start = build
+        .find("- name: Upload GNU ARM64 runner baseline before build\n")
+        .unwrap();
+    let payloads = build.find("- name: Build release\n").unwrap();
+    assert!(compiler < capture_start && capture_start < upload_start && upload_start < payloads);
+    assert!(!build.contains("CARGO_BUILD_JOBS") && !build.contains("RUSTFLAGS:"));
+    assert!(!capture.contains("GITHUB_ENV") && !capture.contains("continue-on-error"));
+    let body = arm64_baseline_python(manual);
+    for required in [
+        "READ_LIMIT = 4096",
+        "JSON_LIMIT = 16384",
+        "deadline = time.monotonic() + 4",
+        "child.wait(timeout=1)",
+        "stderr=subprocess.DEVNULL",
+        "os.O_EXCL | os.O_NOFOLLOW",
+        "directory.mkdir(mode=0o700)",
+        "os.umask(0o077)",
+        "0o600",
+        "raise SystemExit(\"ARM64 runner baseline capture refused\") from None",
+    ] {
+        assert!(body.contains(required), "baseline must retain {required}");
+    }
+}
+
+#[test]
+fn gnu_arm64_runner_baseline_wiring_refuses_scope_upload_and_budget_mutants() {
+    let manual = workflow("cross-platform-build-manual.yml");
+    assert_arm64_baseline_wiring(&manual);
+    for (before, after) in [
+        (
+            "        if: matrix.target == 'aarch64-unknown-linux-gnu'\n",
+            "        if: true\n",
+        ),
+        ("        timeout-minutes: 1\n", "        timeout-minutes: 2\n"),
+        ("        timeout-minutes: 2\n", "        timeout-minutes: 3\n"),
+        (
+            "BASELINE_RUN_ATTEMPT: ${{ github.run_attempt }}",
+            "BASELINE_RUN_ATTEMPT: '1'",
+        ),
+        ("BASELINE_SOURCE: ${{ github.sha }}", "BASELINE_SOURCE: other"),
+        (
+            "BASELINE_PROFILE: ${{ inputs.qualification_profile }}",
+            "BASELINE_PROFILE: normal",
+        ),
+        (
+            "runner-baseline-gnu-arm64-${{ github.run_id }}-${{ github.run_attempt }}",
+            "stable-gnu-ubuntu22-archive-aarch64-unknown-linux-gnu",
+        ),
+        ("/baseline.json\n", "/*\n"),
+        ("          retention-days: 1\n", "          retention-days: 7\n"),
+        ("          if-no-files-found: error\n", "          if-no-files-found: warn\n"),
+        (
+            "        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1\n",
+            "        uses: actions/upload-artifact@main\n",
+        ),
+        ("READ_LIMIT = 4096", "READ_LIMIT = 8192"),
+        ("JSON_LIMIT = 16384", "JSON_LIMIT = 32768"),
+        ("deadline = time.monotonic() + 4", "deadline = time.monotonic() + 40"),
+        ("stderr=subprocess.DEVNULL", "stderr=subprocess.PIPE"),
+        ("directory.mkdir(mode=0o700)", "directory.mkdir(mode=0o755)"),
+        (
+            "        shell: bash\n        env:\n          BASELINE_SOURCE:",
+            "        continue-on-error: true\n        shell: bash\n        env:\n          BASELINE_SOURCE:",
+        ),
+        (
+            "          BASELINE_SOURCE:",
+            "          CARGO_BUILD_JOBS: 2\n          BASELINE_SOURCE:",
+        ),
+    ] {
+        // Change only this GNU job: other existing uploads/retentions are unrelated.
+        let build = yaml_block(&manual, "  stable-gnu-build:\n");
+        assert!(
+            build.contains(before),
+            "mutation must reach actual source: {before}"
+        );
+        let mutant_build = build.replacen(before, after, 1);
+        let mutant = manual.replacen(build, &mutant_build, 1);
+        assert!(std::panic::catch_unwind(|| assert_arm64_baseline_wiring(&mutant)).is_err());
+    }
+    let build = yaml_block(&manual, "  stable-gnu-build:\n");
+    let upload = yaml_block(
+        build,
+        "      - name: Upload GNU ARM64 runner baseline before build\n",
+    );
+    let unguarded = upload.replacen(
+        "        if: matrix.target == 'aarch64-unknown-linux-gnu'\n",
+        "        if: true\n",
+        1,
+    );
+    let mutant = manual.replacen(upload, &unguarded, 1);
+    assert!(std::panic::catch_unwind(|| assert_arm64_baseline_wiring(&mutant)).is_err());
+    let upload_step = format!(
+        "      - name: Upload GNU ARM64 runner baseline before build\n{upload}"
+    );
+    let moved = build.replacen(&upload_step, "", 1);
+    let payloads = yaml_block(&moved, "      - name: Build release\n");
+    let moved = moved.replacen(payloads, &format!("{payloads}{upload_step}"), 1);
+    let mutant = manual.replacen(build, &moved, 1);
+    assert!(std::panic::catch_unwind(|| assert_arm64_baseline_wiring(&mutant)).is_err());
+}
+
+#[cfg(unix)]
+fn observe_arm64_baseline_fixture(source: &str) -> RecipeObservation {
+    // Execute only the actual collector's Python with controlled metadata boundaries.
+    // No real git/dpkg/resource/kernel/compiler/provider command runs in this fixture.
+    let source = serde_json::to_string(source).expect("encode actual inline source");
+    let fixture = r###"import contextlib, io, json, os, pathlib, re, stat, subprocess, tempfile, types
+from unittest import mock
+
+PRIVATE = "fixture-private-value"
+PACKAGE_NAMES = (
+    "gcc-aarch64-linux-gnu", "gcc-11-aarch64-linux-gnu",
+    "g++-aarch64-linux-gnu", "g++-11-aarch64-linux-gnu",
+    "binutils-aarch64-linux-gnu", "libc6-arm64-cross", "libc6-dev-arm64-cross",
+)
+FILES = {
+    "/etc/os-release": b'ID=ubuntu\nVERSION_ID="22.04"\nPRIVATE=fixture-private-value\n',
+    "/proc/meminfo": b"MemTotal: 16000 kB\nMemAvailable: 8000 kB\nSwapTotal: 3000 kB\nSwapFree: 2000 kB\nPrivate: fixture-private-value\n",
+    "/sys/fs/cgroup/memory.max": b"max\n",
+    "/sys/fs/cgroup/memory.current": b"1234\n",
+    "/sys/fs/cgroup/memory.events": b"low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\nprivate fixture-private-value\n",
+    "/sys/fs/cgroup/cpu.max": b"max 100000\n",
+}
+
+def namespace():
+    result = {"__name__": "controlled_baseline"}
+    exec(compile(SOURCE, "actual-workflow-baseline", "exec"), result)
+    assert result["PACKAGES"] == PACKAGE_NAMES
+    return result
+
+def exercise(changes=None, malformed=False, unavailable=False, tiny=False, refuse=False, bad_tree=False):
+    code = namespace()
+    reads, commands = [], []
+    with tempfile.TemporaryDirectory() as scratch:
+        root = pathlib.Path(scratch)
+        env = {
+            "GITHUB_ACTIONS": "true", "RUNNER_OS": "Linux", "RUNNER_ARCH": "X64",
+            "GITHUB_SHA": "a" * 40, "BASELINE_SOURCE": "a" * 40,
+            "GITHUB_RUN_ID": "17", "BASELINE_RUN_ID": "17",
+            "GITHUB_RUN_ATTEMPT": "2", "BASELINE_RUN_ATTEMPT": "2",
+            "GITHUB_JOB": "stable-gnu-build", "BASELINE_TARGET": "aarch64-unknown-linux-gnu",
+            "BASELINE_DISTRIBUTION": "dist", "BASELINE_PROFILE": "stable-gnu-ubuntu22",
+            "BASELINE_RELEASE_TOOLS_ONLY": "false", "RUNNER_TEMP": scratch,
+            "ImageOS": "ubuntu22", "ImageVersion": "20261012.1", "PRIVATE": PRIVATE,
+        }
+        env.update(changes or {})
+        def read(path, mode, *, buffering=-1):
+            assert path in FILES and mode == "rb"
+            assert buffering == 0, "metadata must use the unbuffered raw boundary"
+            reads.append(path)
+            if unavailable:
+                raise FileNotFoundError("controlled missing metadata")
+            data = FILES[path]
+            if malformed:
+                data = b"MemTotal: fixture-private-value\n" if path == "/proc/meminfo" else b"x" * 4096
+            class BoundedRawFile(io.RawIOBase):
+                def read(self, size=-1):
+                    assert 0 < size <= 4096, "unbounded metadata read"
+                    return data[:size]
+            return BoundedRawFile()
+        def command(args):
+            commands.append(args)
+            if args == ["git", "--no-optional-locks", "rev-parse", "HEAD"]:
+                return "a" * 40 + "\n"
+            if args == ["git", "--no-optional-locks", "rev-parse", "HEAD^{tree}"]:
+                return PRIVATE if bad_tree else "b" * 40 + "\n"
+            assert args == ["dpkg-query", "-W", "-f=${Package}\t${Version}\t${db:Status-Status}\n", *PACKAGE_NAMES]
+            if unavailable:
+                return code["unknown"]("unavailable")
+            if malformed:
+                return PRIVATE
+            return "".join(name + "\t1.2.3\tinstalled\n" for name in PACKAGE_NAMES)
+        code["open"], code["metadata_command"] = read, command
+        if tiny:
+            code["JSON_LIMIT"] = 1
+        output = io.StringIO()
+        saved_mask = os.umask(0)
+        try:
+            with mock.patch.dict(os.environ, env, clear=True), \
+                 mock.patch.object(os, "cpu_count", return_value=4), \
+                 mock.patch.object(os, "sched_getaffinity", return_value={0, 1, 2, 3}, create=True), \
+                 mock.patch.object(os, "statvfs", return_value=types.SimpleNamespace(f_bavail=1024, f_frsize=4096)), \
+                 contextlib.redirect_stdout(output):
+                try:
+                    code["main"]()
+                except (ValueError, OSError):
+                    assert refuse, "valid capture unexpectedly refused"
+                    assert not list(root.rglob("baseline.json"))
+                    return
+            assert not refuse, "invalid binding/size was accepted"
+            directory = root / "gnu-arm64-baseline-17-2"
+            assert directory.is_dir(), "run/attempt directory must bind the actual identity"
+            assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+            assert {path.name for path in directory.iterdir()} == {"baseline.json", "baseline.sha256"}
+            payload = (directory / "baseline.json").read_bytes()
+            assert len(payload) <= code["JSON_LIMIT"] <= 16384
+            for path in directory.iterdir():
+                info = path.stat()
+                assert info.st_uid == os.geteuid() and info.st_nlink == 1
+                assert stat.S_IMODE(info.st_mode) == 0o600
+            report = json.loads(payload)
+            assert report["binding"] == {"source": "a" * 40, "tree": "b" * 40,
+                "run": 17, "attempt": 2, "job_key": "stable-gnu-build", "target": "aarch64-unknown-linux-gnu"}
+            assert report["inputs"] == {"distribution": "dist",
+                "qualification_profile": "stable-gnu-ubuntu22", "release_tools_only": False}
+            assert set(report) == {"schema_version", "binding", "inputs", "observed_at_utc", "runner", "snapshot", "scope"}
+            assert PRIVATE.encode() not in payload and PRIVATE not in output.getvalue()
+            assert re.fullmatch(r"ARM64 runner baseline recorded: bytes=[0-9]+ sha256=[0-9a-f]{64}\n", output.getvalue())
+            import hashlib
+            digest = hashlib.sha256(payload).hexdigest()
+            assert (directory / "baseline.sha256").read_text() == digest + "  baseline.json\n"
+            assert digest in output.getvalue()
+            assert set(reads) == set(FILES)
+            assert len(commands) == 3
+            if malformed or unavailable:
+                for key in ("os_release", "memory_kib", "packages"):
+                    assert report["snapshot"][key]["status"] == "UNKNOWN"
+                for value in report["snapshot"]["visible_cgroup"].values():
+                    assert value["status"] == "UNKNOWN"
+            else:
+                assert report["snapshot"]["memory_kib"]["MemTotal"] == 16000
+                assert report["snapshot"]["visible_cgroup"]["memory_max"] == "max"
+                assert report["snapshot"]["os_release"] == {"ID": "ubuntu", "VERSION_ID": "22.04"}
+        finally:
+            os.umask(saved_mask)
+
+def reader(raw, timeout=False, status=0, missing=False):
+    code = namespace()
+    class Pipe:
+        closed = False
+        def fileno(self):
+            return 91
+        def close(self):
+            self.closed = True
+    class Child:
+        stdout = Pipe()
+        finished = False
+        killed = False
+        def poll(self):
+            return status if self.finished else None
+        def kill(self):
+            self.killed, self.finished = True, True
+        def wait(self, timeout):
+            assert 0 <= timeout <= 4
+            self.finished = True
+            return status
+    child = Child()
+    remaining = bytearray(raw)
+    def popen(args, **kwargs):
+        assert args == ["controlled-metadata"]
+        assert kwargs == {"stdin": subprocess.DEVNULL, "stdout": subprocess.PIPE, "stderr": subprocess.DEVNULL}
+        if missing:
+            raise FileNotFoundError("controlled missing command")
+        return child
+    def select(readers, writers, errors, duration):
+        assert readers == [child.stdout] and not writers and not errors
+        assert 0 < duration <= 4, "subprocess capture timeout widened"
+        return ([], [], []) if timeout else (readers, [], [])
+    def read(fd, size):
+        assert fd == 91 and 0 < size <= 1024
+        value = bytes(remaining[:size])
+        del remaining[:size]
+        return value
+    with mock.patch.object(subprocess, "Popen", side_effect=popen), \
+         mock.patch.object(code["select"], "select", side_effect=select), \
+         mock.patch.object(os, "read", side_effect=read), \
+         mock.patch.object(code["time"], "monotonic", return_value=0):
+        value = code["metadata_command"](["controlled-metadata"])
+    assert value == "ok\n" if raw == b"ok\n" and not timeout and not status and not missing else value["status"] == "UNKNOWN"
+    if not missing:
+        assert child.stdout.closed
+        assert child.killed if timeout or len(raw) >= 4096 else not child.killed
+
+try:
+    exercise()
+    exercise(malformed=True)
+    exercise(unavailable=True)
+    exercise(tiny=True, refuse=True)
+    exercise({"GITHUB_SHA": "c" * 40, "BASELINE_SOURCE": "c" * 40}, refuse=True)
+    exercise(bad_tree=True, refuse=True)
+    for key, value in (
+        ("BASELINE_SOURCE", "c" * 40), ("GITHUB_SHA", "c" * 40),
+        ("BASELINE_RUN_ID", "18"), ("BASELINE_RUN_ATTEMPT", "1"),
+        ("GITHUB_RUN_ATTEMPT", "0"), ("BASELINE_TARGET", "x86_64-unknown-linux-gnu"),
+        ("BASELINE_DISTRIBUTION", "dist-broad"), ("BASELINE_PROFILE", "normal"),
+        ("BASELINE_RELEASE_TOOLS_ONLY", "true"), ("GITHUB_JOB", "other-job"),
+        ("GITHUB_ACTIONS", "false"), ("RUNNER_OS", "Windows"), ("RUNNER_ARCH", "ARM64"),
+    ):
+        exercise({key: value}, refuse=True)
+    reader(b"ok\n")
+    reader(b"x" * 8192)
+    reader(b"ok\n", timeout=True)
+    reader(b"ok\n", status=7)
+    reader(b"ok\n", missing=True)
+except AssertionError:
+    raise SystemExit(91) from None
+"###;
+    run_release_recipe(
+        &format!("python3 - <<'PY'\nSOURCE = {source}\n{fixture}\nPY"),
+        RELEASE_RECIPE_CONTEXTS[0],
+        "",
+        "false",
+        "",
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn gnu_arm64_runner_baseline_fixture_preserves_bindings_privacy_and_unknowns() {
+    let source = arm64_baseline_python(&workflow("cross-platform-build-manual.yml"));
+    let observed = observe_arm64_baseline_fixture(&source);
+    assert_eq!(observed.status, Some(0), "{}", observed.diagnostics);
+}
+
+#[cfg(unix)]
+#[test]
+fn gnu_arm64_runner_baseline_fixture_rejects_identity_bounds_and_privacy_mutants() {
+    let source = arm64_baseline_python(&workflow("cross-platform-build-manual.yml"));
+    for (before, after) in [
+        ("source != os.environ.get(\"BASELINE_SOURCE\")", "False"),
+        ("run != os.environ.get(\"BASELINE_RUN_ID\")", "False"),
+        ("attempt != os.environ.get(\"BASELINE_RUN_ATTEMPT\")", "False"),
+        (
+            "if any(os.environ.get(key) != value for key, value in expected.items()):",
+            "if False:",
+        ),
+        ("checkout.strip() != source", "False"),
+        ("not re.fullmatch(r\"[0-9a-f]{40}\\n?\", tree)", "False"),
+        ("if len(data) > JSON_LIMIT:", "if False:"),
+        ("handle.read(READ_LIMIT)", "handle.read()"),
+        ("open(path, \"rb\", buffering=0)", "open(path, \"rb\", buffering=8192)"),
+        ("if len(data) >= READ_LIMIT:", "if False:"),
+        ("deadline = time.monotonic() + 4", "deadline = time.monotonic() + 40"),
+        ("stderr=subprocess.DEVNULL", "stderr=subprocess.PIPE"),
+        (
+            "    data = (json.dumps(report,",
+            "    report[\"environment\"] = dict(os.environ)\n    data = (json.dumps(report,",
+        ),
+        (
+            "    print(\"ARM64 runner baseline recorded:",
+            "    print(report)\n    print(\"ARM64 runner baseline recorded:",
+        ),
+    ] {
+        assert!(
+            source.contains(before),
+            "mutation must reach actual body: {before}"
+        );
+        let observed = observe_arm64_baseline_fixture(&source.replacen(before, after, 1));
+        assert_eq!(observed.status, Some(91), "{before}: {}", observed.diagnostics);
+    }
+}
+
+#[test]
+fn gnu_arm64_runner_baseline_cli_propagates_refusal_without_traceback() {
+    let manual = workflow("cross-platform-build-manual.yml");
+    let body = explicit_bash_body(
+        yaml_block(
+            yaml_block(&manual, "  stable-gnu-build:\n"),
+            "      - name: Capture GNU ARM64 runner baseline\n",
+        ),
+        "          ",
+    );
+    // Empty controlled environment refuses before any metadata or resource access.
+    let observed = run_release_recipe(&body, RELEASE_RECIPE_CONTEXTS[0], "", "false", "");
+    assert_eq!(observed.status, Some(1), "{}", observed.diagnostics);
+    assert!(
+        observed
+            .diagnostics
+            .contains("ARM64 runner baseline capture refused")
+    );
+    assert!(!observed.diagnostics.contains("Traceback"));
+    let before = "raise SystemExit(\"ARM64 runner baseline capture refused\") from None";
+    assert!(body.contains(before));
+    let mutant = body.replacen(before, "pass", 1);
+    let exposed = run_release_recipe(&mutant, RELEASE_RECIPE_CONTEXTS[0], "", "false", "");
+    assert_eq!(exposed.status, Some(0), "{}", exposed.diagnostics);
+}
+
 #[test]
 fn macos_desktop_release_notarizes_published_dmg() {
     let workflow_path =

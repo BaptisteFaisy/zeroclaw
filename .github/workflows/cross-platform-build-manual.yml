@@ -754,6 +754,288 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y ${{ matrix.cross_compiler }}
+      - name: Capture GNU ARM64 runner baseline
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        timeout-minutes: 1
+        shell: bash
+        env:
+          BASELINE_SOURCE: ${{ github.sha }}
+          BASELINE_RUN_ID: ${{ github.run_id }}
+          BASELINE_RUN_ATTEMPT: ${{ github.run_attempt }}
+          BASELINE_TARGET: ${{ matrix.target }}
+          BASELINE_DISTRIBUTION: ${{ inputs.distribution }}
+          BASELINE_PROFILE: ${{ inputs.qualification_profile }}
+          BASELINE_RELEASE_TOOLS_ONLY: ${{ inputs.release_tools_only }}
+        run: |
+          python3 - <<'PY'
+          import datetime
+          import hashlib
+          import json
+          import os
+          import re
+          import select
+          import stat
+          import subprocess
+          import time
+          from pathlib import Path
+
+          READ_LIMIT = 4096
+          JSON_LIMIT = 16384
+          PACKAGES = (
+              "gcc-aarch64-linux-gnu", "gcc-11-aarch64-linux-gnu",
+              "g++-aarch64-linux-gnu", "g++-11-aarch64-linux-gnu",
+              "binutils-aarch64-linux-gnu", "libc6-arm64-cross", "libc6-dev-arm64-cross",
+          )
+
+
+          def unknown(reason):
+              return {"status": "UNKNOWN", "reason": reason}
+
+
+          def metadata_command(args):
+              # Four seconds for capture, one for killing/reaping this foreground child.
+              deadline = time.monotonic() + 4
+              try:
+                  child = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                           stderr=subprocess.DEVNULL)
+              except OSError:
+                  return unknown("unavailable")
+              data = bytearray()
+              try:
+                  while True:
+                      remaining = deadline - time.monotonic()
+                      if remaining <= 0 or not select.select([child.stdout], [], [], remaining)[0]:
+                          return unknown("timeout")
+                      chunk = os.read(child.stdout.fileno(), min(1024, READ_LIMIT - len(data)))
+                      if not chunk:
+                          break
+                      data.extend(chunk)
+                      if len(data) >= READ_LIMIT:
+                          return unknown("at-read-limit")
+                  if child.wait(timeout=max(0, deadline - time.monotonic())) != 0:
+                      return unknown("command-failed")
+                  return data.decode("ascii")
+              except (OSError, UnicodeError, subprocess.TimeoutExpired):
+                  return unknown("unavailable")
+              finally:
+                  if child.poll() is None:
+                      try:
+                          child.kill()
+                      except ProcessLookupError:
+                          pass
+                      child.wait(timeout=1)
+                  child.stdout.close()
+
+
+          def read_metadata(path):
+              try:
+                  with open(path, "rb", buffering=0) as handle:
+                      data = handle.read(READ_LIMIT)
+                  if len(data) >= READ_LIMIT:
+                      return unknown("at-read-limit")
+                  return data.decode("ascii")
+              except (OSError, UnicodeError):
+                  return unknown("unavailable")
+
+
+          def number(value):
+              if not re.fullmatch(r"[0-9]{1,20}", value) or int(value) > 2**64 - 1:
+                  raise ValueError("invalid number")
+              return int(value)
+
+
+          def selected_numbers(text, names, unit=""):
+              if not isinstance(text, str):
+                  return text
+              values = {}
+              try:
+                  for line in text.splitlines():
+                      key = line.split(":", 1)[0] if unit else line.split(" ", 1)[0]
+                      if key not in names:
+                          continue
+                      if key in values:
+                          raise ValueError("duplicate field")
+                      match = re.fullmatch(re.escape(key) + (r":\s+([0-9]+) kB" if unit else r" ([0-9]+)"), line)
+                      if not match:
+                          raise ValueError("malformed field")
+                      values[key] = number(match[1])
+                  return {key: values.get(key, unknown("missing")) for key in names}
+              except ValueError:
+                  return unknown("malformed")
+
+
+          def scalar(path, allow_max=False):
+              text = read_metadata(path)
+              if not isinstance(text, str):
+                  return text
+              try:
+                  value = text.strip()
+                  return "max" if allow_max and value == "max" else number(value)
+              except ValueError:
+                  return unknown("malformed")
+
+
+          def os_release():
+              text = read_metadata("/etc/os-release")
+              if not isinstance(text, str):
+                  return text
+              values = {}
+              for line in text.splitlines():
+                  key, separator, value = line.partition("=")
+                  if key not in ("ID", "VERSION_ID"):
+                      continue
+                  if not separator or key in values:
+                      return unknown("malformed")
+                  if value.startswith('"') and value.endswith('"'):
+                      value = value[1:-1]
+                  if not re.fullmatch(r"[a-zA-Z0-9._-]{1,80}", value):
+                      return unknown("malformed")
+                  values[key] = value
+              return {key: values.get(key, unknown("missing")) for key in ("ID", "VERSION_ID")}
+
+
+          def cpu_max():
+              text = read_metadata("/sys/fs/cgroup/cpu.max")
+              if not isinstance(text, str):
+                  return text
+              try:
+                  quota, period = text.strip().split(" ")
+                  result = {"quota": "max" if quota == "max" else number(quota), "period": number(period)}
+                  return result if result["period"] > 0 else unknown("malformed")
+              except ValueError:
+                  return unknown("malformed")
+
+
+          def packages():
+              text = metadata_command(["dpkg-query", "-W", "-f=${Package}\t${Version}\t${db:Status-Status}\n", *PACKAGES])
+              if not isinstance(text, str):
+                  return text
+              values = {}
+              for line in text.splitlines():
+                  fields = line.split("\t")
+                  if (len(fields) != 3 or fields[0] not in PACKAGES or fields[0] in values
+                          or not re.fullmatch(r"[0-9][A-Za-z0-9.+:~_-]{0,127}", fields[1])
+                          or fields[2] != "installed"):
+                      return unknown("malformed")
+                  values[fields[0]] = {"version": fields[1], "status": fields[2]}
+              return values if set(values) == set(PACKAGES) else unknown("missing")
+
+
+          def public_image(key):
+              value = os.environ.get(key, "")
+              return value if re.fullmatch(r"[A-Za-z0-9._-]{1,80}", value) else unknown("unavailable")
+
+
+          def main():
+              if (os.environ.get("GITHUB_ACTIONS") != "true"
+                      or os.environ.get("RUNNER_OS") != "Linux"
+                      or os.environ.get("RUNNER_ARCH") != "X64"):
+                  raise ValueError("runner identity")
+              expected = {
+                  "BASELINE_TARGET": "aarch64-unknown-linux-gnu",
+                  "BASELINE_DISTRIBUTION": "dist",
+                  "BASELINE_PROFILE": "stable-gnu-ubuntu22",
+                  "BASELINE_RELEASE_TOOLS_ONLY": "false",
+                  "GITHUB_JOB": "stable-gnu-build",
+              }
+              if any(os.environ.get(key) != value for key, value in expected.items()):
+                  raise ValueError("input identity")
+              source = os.environ.get("GITHUB_SHA", "")
+              if not re.fullmatch(r"[0-9a-f]{40}", source) or source != os.environ.get("BASELINE_SOURCE"):
+                  raise ValueError("source identity")
+              run = os.environ.get("GITHUB_RUN_ID", "")
+              attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "")
+              if (not re.fullmatch(r"[1-9][0-9]{0,19}", run)
+                      or not re.fullmatch(r"[1-9][0-9]{0,19}", attempt)
+                      or run != os.environ.get("BASELINE_RUN_ID")
+                      or attempt != os.environ.get("BASELINE_RUN_ATTEMPT")):
+                  raise ValueError("run identity")
+              checkout = metadata_command(["git", "--no-optional-locks", "rev-parse", "HEAD"])
+              tree = metadata_command(["git", "--no-optional-locks", "rev-parse", "HEAD^{tree}"])
+              if (not isinstance(checkout, str) or checkout.strip() != source
+                      or not isinstance(tree, str) or not re.fullmatch(r"[0-9a-f]{40}\n?", tree)):
+                  raise ValueError("checkout identity")
+              root = Path(os.environ["RUNNER_TEMP"])
+              if not root.is_absolute():
+                  raise ValueError("temporary directory")
+              root = root.resolve(strict=True)
+              try:
+                  cpu_count = os.cpu_count()
+                  cpu = cpu_count if type(cpu_count) is int and 0 < cpu_count <= 1048576 else unknown("unavailable")
+                  affinity_count = len(os.sched_getaffinity(0))
+                  affinity = affinity_count if 0 < affinity_count <= 1048576 else unknown("unavailable")
+              except (AttributeError, OSError):
+                  cpu, affinity = unknown("unavailable"), unknown("unavailable")
+              try:
+                  disk = os.statvfs(root)
+                  available = disk.f_bavail * disk.f_frsize
+                  disk_bytes = available if 0 <= available <= 2**64 - 1 else unknown("unavailable")
+              except OSError:
+                  disk_bytes = unknown("unavailable")
+              report = {
+                  "schema_version": 1,
+                  "binding": {"source": source, "tree": tree.strip(), "run": int(run), "attempt": int(attempt),
+                              "job_key": "stable-gnu-build", "target": os.environ["BASELINE_TARGET"]},
+                  "inputs": {"distribution": os.environ["BASELINE_DISTRIBUTION"],
+                             "qualification_profile": os.environ["BASELINE_PROFILE"], "release_tools_only": False},
+                  "observed_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                  "runner": {"os": "Linux", "arch": "X64", "image_os": public_image("ImageOS"),
+                             "image_version": public_image("ImageVersion")},
+                  "snapshot": {
+                      "cpu_count": cpu, "affinity_count": affinity, "available_disk_bytes": disk_bytes,
+                      "os_release": os_release(),
+                      "memory_kib": selected_numbers(read_metadata("/proc/meminfo"),
+                                                    ("MemTotal", "MemAvailable", "SwapTotal", "SwapFree"), "kB"),
+                      "visible_cgroup": {
+                          "memory_max": scalar("/sys/fs/cgroup/memory.max", True),
+                          "memory_current": scalar("/sys/fs/cgroup/memory.current"),
+                          "memory_events": selected_numbers(read_metadata("/sys/fs/cgroup/memory.events"),
+                                                           ("low", "high", "max", "oom", "oom_kill", "oom_group_kill")),
+                          "cpu_max": cpu_max(),
+                      },
+                      "packages": packages(),
+                  },
+                  "scope": "Initial visible metadata only; not effective-limit, peak, failure-cause or repair proof.",
+              }
+              data = (json.dumps(report, sort_keys=True, indent=2, allow_nan=False) + "\n").encode("utf-8")
+              if len(data) > JSON_LIMIT:
+                  raise ValueError("JSON size")
+              digest = hashlib.sha256(data).hexdigest()
+              directory = root / ("gnu-arm64-baseline-" + run + "-" + attempt)
+              os.umask(0o077)
+              directory.mkdir(mode=0o700)
+              info = directory.lstat()
+              if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+                  raise ValueError("directory ownership")
+              for name, content in (("baseline.json", data), ("baseline.sha256", (digest + "  baseline.json\n").encode("ascii"))):
+                  descriptor = os.open(directory / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                  with os.fdopen(descriptor, "wb") as handle:
+                      info = os.fstat(handle.fileno())
+                      if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                              or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600):
+                          raise ValueError("file ownership")
+                      handle.write(content)
+              print("ARM64 runner baseline recorded: bytes=" + str(len(data)) + " sha256=" + digest)
+
+
+          if __name__ == "__main__":
+              try:
+                  main()
+              except Exception:
+                  raise SystemExit("ARM64 runner baseline capture refused") from None
+          PY
+      - name: Upload GNU ARM64 runner baseline before build
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        timeout-minutes: 2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: runner-baseline-gnu-arm64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/gnu-arm64-baseline-${{ github.run_id }}-${{ github.run_attempt }}/baseline.json
+            ${{ runner.temp }}/gnu-arm64-baseline-${{ github.run_id }}-${{ github.run_attempt }}/baseline.sha256
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
       - name: Build release
         id: payloads
         uses: ./.github/actions/build-release-payloads
