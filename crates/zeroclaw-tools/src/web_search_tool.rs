@@ -4981,7 +4981,10 @@ mod tests {
                 .windows(4)
                 .any(|window| window == b"\r\n\r\n")
             {
-                assert!(head_len < head.len(), "request head exceeds fixture capacity");
+                assert!(
+                    head_len < head.len(),
+                    "request head exceeds fixture capacity"
+                );
                 let read = stream
                     .read(&mut head[head_len..])
                     .await
@@ -5031,7 +5034,10 @@ mod tests {
                 Ok(()) => {}
                 Err(error) => {
                     assert!(
-                        matches!(error.kind(), ErrorKind::BrokenPipe | ErrorKind::ConnectionReset),
+                        matches!(
+                            error.kind(),
+                            ErrorKind::BrokenPipe | ErrorKind::ConnectionReset
+                        ),
                         "write trailing chunk framing: {error}"
                     );
                 }
