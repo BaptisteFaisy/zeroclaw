@@ -72,6 +72,7 @@ jobs:
           import urllib.request
 
           ANCESTOR = "6b98ff79ba9c7a0b3246e1c2398626f8a652c25e"
+          EXPECTED_PARENT = "679dcd589222c2d2f6ab96f2d5949fe44ce5b149"
           WORKFLOW = ".github/workflows/qualify-pr11364-arduino-eight-windows.yml"
           ARDUINO = "crates/zeroclaw-hardware/src/peripherals/arduino_upload.rs"
           MODULE = "peripherals::arduino_upload::tests::"
@@ -354,7 +355,7 @@ jobs:
           def source():
               b = binding()
               parents = git("rev-list", "--parents", "-n", "1", "HEAD").split()
-              require(parents == [b["head"], ANCESTOR], "E_PARENT")
+              require(parents == [b["head"], EXPECTED_PARENT], "E_PARENT")
               require(git("diff-tree", "--no-commit-id", "--name-status", "-r", ANCESTOR, "HEAD") == "A\t" + WORKFLOW, "E_SOURCE_SCOPE")
               require(not git("status", "--porcelain=v1", "--untracked-files=all"), "E_WORKTREE")
               require(git("rev-parse", "HEAD:" + ARDUINO) == "028627cb1907b9aace3cec9f6bb9a9e7200702cb", "E_ARDUINO_BLOB")
@@ -462,7 +463,7 @@ jobs:
           def command_receipt(phase):
               value = load(root() / "private" / (phase + "-commands.json"))
               require(set(value) == {"binding", "commands"} and value["binding"] == binding() and type(value["commands"]) is list and len(value["commands"]) <= 64, "E_COMMAND_SCHEMA")
-              allowed = [LIST, RUN, ["rustc", "-vV"], ["cargo", "-V"], ["cargo", "nextest", "--version"]]
+              allowed = [LIST, RUN, ["rustc", "-vV"], ["cargo", "-V"], ["cargo", "nextest", "-V"]]
               for args in [["rev-list", "--parents", "-n", "1", "HEAD"], ["diff-tree", "--no-commit-id", "--name-status", "-r", ANCESTOR, "HEAD"], ["status", "--porcelain=v1", "--untracked-files=all"], ["rev-parse", "HEAD:" + ARDUINO], ["rev-parse", "HEAD^{tree}"]]:
                   allowed.append(["git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=NUL", "-c", "core.attributesFile=NUL", *args])
               for row in value["commands"]:
@@ -507,7 +508,7 @@ jobs:
                       require(toolpath.parent.resolve() == (Path(os.environ.get("CARGO_HOME", str(Path.home() / ".cargo"))) / "bin").resolve(), "E_NEXTEST_RESOLUTION")
                       compiler = meta(["rustc", "-vV"])
                       cargo = meta(["cargo", "-V"])
-                      version = meta(["cargo", "nextest", "--version"])
+                      version = meta(["cargo", "nextest", "-V"])
                       require(compiler.startswith("rustc 1.98.0 ") and "\nhost: x86_64-pc-windows-msvc\n" in compiler and "\nrelease: 1.98.0\n" in compiler, "E_COMPILER")
                       require(re.fullmatch(r"cargo 1\.98\.0 \([0-9a-f]+ [0-9-]+\)", cargo), "E_COMPILER")
                       require(re.fullmatch(r"cargo-nextest 0\.9\.143(?: .*)?", version), "E_NEXTEST_VERSION")
