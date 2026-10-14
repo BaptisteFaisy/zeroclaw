@@ -6094,7 +6094,9 @@ async fn run_plugin_update(
     }
 
     let mut host = plugin_host_with_configured_security(config)?;
-    let mut noted_displaced = false;
+    // Packages `--all` finds displaced count as skipped: the batch leaves each
+    // for the operator to name, as its note says.
+    let mut displaced_count = 0;
     let targets: Vec<(String, Option<String>)> = if all {
         // A package an interrupted update displaced is not put back by
         // `--all`: only naming it does, so a copy is never restored unasked.
@@ -6108,8 +6110,8 @@ async fn run_plugin_update(
                 "{}",
                 plugin_displaced_note(config, name, registry.as_deref())
             );
-            noted_displaced = true;
         }
+        displaced_count = displaced.len();
         host.list_plugins()
             .into_iter()
             .filter(|info| !displaced.contains(&info.name))
@@ -6126,7 +6128,7 @@ async fn run_plugin_update(
     };
     if targets.is_empty() {
         // When packages are displaced, the notes above already say what to do.
-        if !noted_displaced {
+        if displaced_count == 0 {
             println!("{}", t("cli-plugins-none", "No plugins installed."));
         }
         return Ok(());
@@ -6138,7 +6140,10 @@ async fn run_plugin_update(
     let local = from
         .as_deref()
         .map(|dir| std::path::absolute(dir).unwrap_or_else(|_| std::path::PathBuf::from(dir)));
-    let mut tally = PluginUpdateTally::default();
+    let mut tally = PluginUpdateTally {
+        skipped: displaced_count,
+        ..PluginUpdateTally::default()
+    };
     let mut pending = Vec::with_capacity(targets.len());
     for (name, pin) in &targets {
         if let Some(outcome) = recover_before_update(&mut host, name, all) {
@@ -6212,7 +6217,7 @@ async fn run_plugin_update(
         skipped,
         not_updated,
     } = tally;
-    if targets.len() > 1 {
+    if targets.len() + displaced_count > 1 {
         println!(
             "{}",
             ta(

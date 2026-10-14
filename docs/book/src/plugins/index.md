@@ -810,8 +810,7 @@ refusal prints the same guidance as `plugin install`.
 
 **Results.** Each plugin gets a result: updated, up to date, skipped (with
 `--all`, a package the registry does not list, or one an interrupted update
-displaced while the command ran, which it notes as displaced), needs approval,
-or not updated
+left displaced, which it notes as displaced), needs approval, or not updated
 with the reason and the version that stays installed. One plugin failing does
 not stop the others. The command exits non-zero when any plugin was not updated
 or needs approval, so a script can branch on it.

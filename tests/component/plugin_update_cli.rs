@@ -482,6 +482,57 @@ fn claim_the_way_a_stopped_update_leaves_it(plugins: &Path) -> PathBuf {
     claim
 }
 
+/// `--all` counts a package an interrupted update displaced as skipped, so the
+/// summary covers every package the batch knows of, even when only one other
+/// package is installed, and the displaced copy stays where it is.
+#[tokio::test]
+async fn all_counts_a_displaced_package_as_skipped() {
+    let config_dir = config_dir_with_installed_fixture();
+    let plugins = config_dir.path().join("plugins");
+    let other = plugins.join("other-tool");
+    std::fs::create_dir_all(&other).expect("create the second package");
+    std::fs::write(
+        other.join("manifest.toml"),
+        manifest("1.0.0", "").replace(PACKAGE, "other-tool"),
+    )
+    .expect("write manifest");
+    std::fs::copy(fixture(), other.join("plugin.wasm")).expect("copy the component");
+    let claim = plugins.join(format!(".other-tool.replacing-v1-{}", "0".repeat(32)));
+    std::fs::create_dir(&claim).expect("claim directory");
+    std::fs::write(claim.join("lease"), b"").expect("lease");
+    std::fs::rename(&other, claim.join("package")).expect("claim the package");
+
+    let server = MockServer::start().await;
+    let component = std::fs::read(fixture()).expect("read fixture");
+    serve_registry(
+        &server,
+        "1.0.0",
+        package_archive(&manifest("1.0.0", ""), &component),
+        0,
+    )
+    .await;
+    let registry = format!("{}/registry.json", server.uri());
+
+    let out = run_plugin(
+        config_dir.path(),
+        &["update", "--all", "--registry", &registry],
+    );
+    let text = combined(&out);
+
+    assert!(
+        out.status.success(),
+        "a skipped package does not fail the batch: {text}"
+    );
+    assert!(
+        text.contains("Updated: 0. Up to date: 1. Skipped: 1. Not updated: 0."),
+        "{text}"
+    );
+    assert!(
+        claim.join("package").is_dir() && !other.exists(),
+        "the displaced copy stays where it is: {text}"
+    );
+}
+
 /// The recovery the operator is pointed at works without the registry: a
 /// package an interrupted update displaced is put back even when the registry
 /// cannot be reached, and only then does the unreachable registry fail the
