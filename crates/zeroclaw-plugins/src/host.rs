@@ -381,10 +381,7 @@ impl PluginHost {
             )));
         }
 
-        let source_dir = manifest_path
-            .parent()
-            .ok_or_else(|| PluginError::InvalidManifest("no parent directory".into()))?
-            .to_path_buf();
+        let source_dir = manifest_source_dir(&manifest_path)?;
         let dir = Dir::open_ambient_dir(&source_dir, cap_std::ambient_authority())?;
         let filename = manifest_path
             .file_name()
@@ -597,7 +594,20 @@ impl PluginHost {
                 );
             }
         };
-        let claimed_id = same_file::Handle::from_file(claimed.try_clone()?.into_std_file())?;
+        let claimed_id = match claimed_identity(&claimed) {
+            Ok(id) => id,
+            Err(error) => {
+                drop(claimed);
+                return self.restore_refused(
+                    name,
+                    tx,
+                    kept(
+                        name,
+                        format!("it cannot be listed or cannot be inspected ({error})"),
+                    ),
+                );
+            }
+        };
         let same_generation = selected_id == claimed_id;
         drop(claimed_id);
         drop(selected_id);
@@ -1993,6 +2003,48 @@ fn finish_naming_entry(
 }
 
 /// Why recovery keeps a directory it claimed, worded for the operator.
+/// The directory a manifest path names its package in: its parent, or the
+/// current directory for a bare file name, whose parent is the empty path that
+/// no directory handle opens.
+fn manifest_source_dir(manifest_path: &Path) -> Result<PathBuf, PluginError> {
+    let parent = manifest_path
+        .parent()
+        .ok_or_else(|| PluginError::InvalidManifest("no parent directory".into()))?;
+    Ok(if parent.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        parent.to_path_buf()
+    })
+}
+
+/// The identity of a claimed package directory, through a handle of its own.
+fn claimed_identity(claimed: &Dir) -> std::io::Result<same_file::Handle> {
+    #[cfg(test)]
+    if identity_fault::take() {
+        return Err(std::io::Error::other("injected identity fault"));
+    }
+    same_file::Handle::from_file(claimed.try_clone()?.into_std_file())
+}
+
+/// Test-only fault for [`claimed_identity`], as a process out of file
+/// descriptors would meet it. The slot is thread-local, like [`write_fault`]'s,
+/// so a case arms only its own remove.
+#[cfg(test)]
+mod identity_fault {
+    thread_local! {
+        static ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Make the next identity check on this thread fail. It fires once.
+    pub(super) fn arm() {
+        ARMED.with(|armed| armed.set(true));
+    }
+
+    pub(super) fn take() -> bool {
+        ARMED.with(|armed| armed.replace(false))
+    }
+}
+
 fn kept(name: &str, reason: impl Into<String>) -> PluginError {
     PluginError::UnadmittedPackage {
         name: name.into(),
@@ -3741,6 +3793,58 @@ capabilities = ["tool"]
         let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
         host.remove("nested").unwrap();
         assert!(!dir.exists());
+    }
+
+    /// A remove that cannot take the identity of the package it claimed puts
+    /// the package back and refuses, naming why, rather than failing with the
+    /// package hidden in its claim.
+    #[test]
+    fn remove_puts_back_a_package_whose_claimed_identity_cannot_be_taken() {
+        let plugins = tempdir().unwrap();
+        let dir = plugins.path().join("broken");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(
+            dir.join("manifest.toml"),
+            format!(
+                "name = \"broken\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\nwasm_sha256 = \"{}\"\n",
+                "0".repeat(64)
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.join("plugin.wasm"), b"\0asm").unwrap();
+        let before = package_bytes(&dir);
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+
+        identity_fault::arm();
+        let error = host.remove("broken").unwrap_err();
+        assert!(
+            matches!(&error, PluginError::UnadmittedPackage { reason, .. } if reason.contains("injected identity fault")),
+            "{error}"
+        );
+        assert_eq!(package_bytes(&dir), before);
+        assert_eq!(
+            dir_entries(plugins.path()),
+            [".zeroclaw-package-lock-v1", "broken"]
+        );
+
+        host.remove("broken").unwrap();
+        assert!(!dir.exists());
+    }
+
+    /// A bare manifest file name is a package in the current directory: its
+    /// parent is the empty path, which no directory handle opens.
+    #[test]
+    fn a_bare_manifest_file_name_names_the_current_directory() {
+        assert_eq!(
+            manifest_source_dir(Path::new("manifest.toml")).unwrap(),
+            PathBuf::from(".")
+        );
+        assert_eq!(
+            manifest_source_dir(Path::new("pkg/manifest.toml")).unwrap(),
+            PathBuf::from("pkg")
+        );
+        let current = manifest_source_dir(Path::new("manifest.toml")).unwrap();
+        assert!(Dir::open_ambient_dir(&current, cap_std::ambient_authority()).is_ok());
     }
 
     /// Every installer writes a package under its manifest's name, so a
