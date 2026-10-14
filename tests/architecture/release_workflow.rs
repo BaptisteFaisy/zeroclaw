@@ -1431,7 +1431,7 @@ fn assert_arm64_baseline_wiring(manual: &str) {
     for required in [
         "READ_LIMIT = 4096",
         "JSON_LIMIT = 16384",
-        "deadline = time.monotonic() + 4",
+        "deadline = time.monotonic() + 4\n",
         "child.wait(timeout=1)",
         "stderr=subprocess.DEVNULL",
         "os.O_EXCL | os.O_NOFOLLOW",
@@ -1453,13 +1453,22 @@ fn gnu_arm64_runner_baseline_wiring_refuses_scope_upload_and_budget_mutants() {
             "        if: matrix.target == 'aarch64-unknown-linux-gnu'\n",
             "        if: true\n",
         ),
-        ("        timeout-minutes: 1\n", "        timeout-minutes: 2\n"),
-        ("        timeout-minutes: 2\n", "        timeout-minutes: 3\n"),
+        (
+            "        timeout-minutes: 1\n",
+            "        timeout-minutes: 2\n",
+        ),
+        (
+            "        timeout-minutes: 2\n",
+            "        timeout-minutes: 3\n",
+        ),
         (
             "BASELINE_RUN_ATTEMPT: ${{ github.run_attempt }}",
             "BASELINE_RUN_ATTEMPT: '1'",
         ),
-        ("BASELINE_SOURCE: ${{ github.sha }}", "BASELINE_SOURCE: other"),
+        (
+            "BASELINE_SOURCE: ${{ github.sha }}",
+            "BASELINE_SOURCE: other",
+        ),
         (
             "BASELINE_PROFILE: ${{ inputs.qualification_profile }}",
             "BASELINE_PROFILE: normal",
@@ -1469,15 +1478,24 @@ fn gnu_arm64_runner_baseline_wiring_refuses_scope_upload_and_budget_mutants() {
             "stable-gnu-ubuntu22-archive-aarch64-unknown-linux-gnu",
         ),
         ("/baseline.json\n", "/*\n"),
-        ("          retention-days: 1\n", "          retention-days: 7\n"),
-        ("          if-no-files-found: error\n", "          if-no-files-found: warn\n"),
+        (
+            "          retention-days: 1\n",
+            "          retention-days: 7\n",
+        ),
+        (
+            "          if-no-files-found: error\n",
+            "          if-no-files-found: warn\n",
+        ),
         (
             "        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1\n",
             "        uses: actions/upload-artifact@main\n",
         ),
         ("READ_LIMIT = 4096", "READ_LIMIT = 8192"),
         ("JSON_LIMIT = 16384", "JSON_LIMIT = 32768"),
-        ("deadline = time.monotonic() + 4", "deadline = time.monotonic() + 40"),
+        (
+            "deadline = time.monotonic() + 4",
+            "deadline = time.monotonic() + 40",
+        ),
         ("stderr=subprocess.DEVNULL", "stderr=subprocess.PIPE"),
         ("directory.mkdir(mode=0o700)", "directory.mkdir(mode=0o755)"),
         (
@@ -1511,9 +1529,8 @@ fn gnu_arm64_runner_baseline_wiring_refuses_scope_upload_and_budget_mutants() {
     );
     let mutant = manual.replacen(upload, &unguarded, 1);
     assert!(std::panic::catch_unwind(|| assert_arm64_baseline_wiring(&mutant)).is_err());
-    let upload_step = format!(
-        "      - name: Upload GNU ARM64 runner baseline before build\n{upload}"
-    );
+    let upload_step =
+        format!("      - name: Upload GNU ARM64 runner baseline before build\n{upload}");
     let moved = build.replacen(&upload_step, "", 1);
     let payloads = yaml_block(&moved, "      - name: Build release\n");
     let moved = moved.replacen(payloads, &format!("{payloads}{upload_step}"), 1);
@@ -1741,7 +1758,10 @@ fn gnu_arm64_runner_baseline_fixture_rejects_identity_bounds_and_privacy_mutants
     for (before, after) in [
         ("source != os.environ.get(\"BASELINE_SOURCE\")", "False"),
         ("run != os.environ.get(\"BASELINE_RUN_ID\")", "False"),
-        ("attempt != os.environ.get(\"BASELINE_RUN_ATTEMPT\")", "False"),
+        (
+            "attempt != os.environ.get(\"BASELINE_RUN_ATTEMPT\")",
+            "False",
+        ),
         (
             "if any(os.environ.get(key) != value for key, value in expected.items()):",
             "if False:",
@@ -1750,9 +1770,15 @@ fn gnu_arm64_runner_baseline_fixture_rejects_identity_bounds_and_privacy_mutants
         ("not re.fullmatch(r\"[0-9a-f]{40}\\n?\", tree)", "False"),
         ("if len(data) > JSON_LIMIT:", "if False:"),
         ("handle.read(READ_LIMIT)", "handle.read()"),
-        ("open(path, \"rb\", buffering=0)", "open(path, \"rb\", buffering=8192)"),
+        (
+            "open(path, \"rb\", buffering=0)",
+            "open(path, \"rb\", buffering=8192)",
+        ),
         ("if len(data) >= READ_LIMIT:", "if False:"),
-        ("deadline = time.monotonic() + 4", "deadline = time.monotonic() + 40"),
+        (
+            "deadline = time.monotonic() + 4",
+            "deadline = time.monotonic() + 40",
+        ),
         ("stderr=subprocess.DEVNULL", "stderr=subprocess.PIPE"),
         (
             "    data = (json.dumps(report,",
@@ -1768,7 +1794,12 @@ fn gnu_arm64_runner_baseline_fixture_rejects_identity_bounds_and_privacy_mutants
             "mutation must reach actual body: {before}"
         );
         let observed = observe_arm64_baseline_fixture(&source.replacen(before, after, 1));
-        assert_eq!(observed.status, Some(91), "{before}: {}", observed.diagnostics);
+        assert_eq!(
+            observed.status,
+            Some(91),
+            "{before}: {}",
+            observed.diagnostics
+        );
     }
 }
 
