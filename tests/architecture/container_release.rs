@@ -783,8 +783,7 @@ fn vendor_patch_is_staged_for_prefetch(builder: &str) -> bool {
         if command == "COPY vendor/ vendor/" {
             staged = true;
         }
-        if command.starts_with("rm -rf ")
-            && command.split_whitespace().any(|word| word == "vendor")
+        if command.starts_with("rm -rf ") && command.split_whitespace().any(|word| word == "vendor")
         {
             staged = false;
         }
@@ -795,8 +794,8 @@ fn vendor_patch_is_staged_for_prefetch(builder: &str) -> bool {
 #[test]
 fn source_containerfiles_stage_canonical_path_patches_during_prefetch() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let manifest: toml::Value = toml::from_str(&repository_file("Cargo.toml"))
-        .expect("root manifest must be valid TOML");
+    let manifest: toml::Value =
+        toml::from_str(&repository_file("Cargo.toml")).expect("root manifest must be valid TOML");
     let patches = manifest["patch"]["crates-io"]
         .as_table()
         .expect("root manifest must declare its path patch");
@@ -804,7 +803,10 @@ fn source_containerfiles_stage_canonical_path_patches_during_prefetch() {
         .values()
         .filter_map(|patch| patch.get("path").and_then(toml::Value::as_str))
         .collect();
-    assert!(!paths.is_empty(), "fixture must exercise a local path patch");
+    assert!(
+        !paths.is_empty(),
+        "fixture must exercise a local path patch"
+    );
     for path in paths {
         assert!(root.join(path).join("Cargo.toml").is_file());
         assert!(path.starts_with("vendor/"));
@@ -833,7 +835,9 @@ fn source_containerfiles_stage_canonical_path_patches_during_prefetch() {
 fn vendor_patch_prefetch_guard_rejects_missing_late_and_removed_inputs() {
     let copy = "COPY vendor/ vendor/\n";
     let build = "RUN cargo build --release --locked -p zeroclaw\n";
-    assert!(vendor_patch_is_staged_for_prefetch(&format!("{copy}{build}")));
+    assert!(vendor_patch_is_staged_for_prefetch(&format!(
+        "{copy}{build}"
+    )));
     for invalid in [
         build.to_string(),
         format!("{build}{copy}"),
