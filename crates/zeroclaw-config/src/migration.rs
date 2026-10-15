@@ -136,6 +136,15 @@ pub fn generate(target_version: u32, opts: &GenerateOptions<'_>) -> Result<Strin
     };
 
     let mut value = value;
+    // Generation creates a new installation, even when the requested schema
+    // is historical. Persist its selection so legacy-omission migration does
+    // not reinterpret this new document as an existing full-tool setup.
+    let tools = toml::Value::try_from(crate::builtin_tools::BuiltinToolsConfig::default())
+        .context("failed to serialize default tool selection")?;
+    value
+        .as_table_mut()
+        .context("generated config root is not a TOML table")?
+        .insert("tools".to_string(), tools);
     if opts.encrypt_secrets {
         let store_dir = opts.secret_store_dir.context(
             "--encrypt requires a secret-store directory \
