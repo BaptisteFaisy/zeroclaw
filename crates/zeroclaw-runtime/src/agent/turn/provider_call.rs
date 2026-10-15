@@ -4,9 +4,9 @@
 use super::context::TurnCtx;
 use super::events::{ProgressEvent, StreamDelta, send_progress, thinking_status_text};
 use super::outcome::{
-    StreamCancelledAfterOutput, StreamCancelledWithUsage, StreamErrorWithUsage,
-    StreamInterruptedAfterOutput, StreamPreExecutedToolsWithoutFinalResponse,
-    StreamSemanticEmptyCompletion, ToolLoopCancelled, is_tool_loop_cancelled,
+    StreamCancelledAfterOutput, StreamCancelledWithUsage, StreamInterruptedAfterOutput,
+    StreamPreExecutedToolsWithoutFinalResponse, StreamSemanticEmptyCompletion, ToolLoopCancelled,
+    is_tool_loop_cancelled,
 };
 use super::redact::scrub_credentials;
 use super::stream_consume::{
@@ -251,6 +251,7 @@ pub(crate) fn enforce_tool_loop_budget() -> Result<()> {
 /// with non-streaming fallback, or plain non-streaming chat with optional
 /// per-step timeout and cancel select. See [`ProviderCallOutcome`] for the
 /// cancel asymmetry this function must preserve.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_provider(
     ctx: &TurnCtx<'_>,
     active_model_provider: &dyn ModelProvider,
@@ -262,6 +263,7 @@ pub(crate) async fn call_provider(
     should_consume_provider_stream: bool,
     policy: zeroclaw_api::model_provider::ToolRoundPolicy,
     iteration: usize,
+    guard_tools: Option<&[ToolSpec]>,
 ) -> Result<ProviderCallOutcome> {
     let mut streamed_live_deltas = false;
     let mut streamed_protocol_suppressed = false;
@@ -288,6 +290,7 @@ pub(crate) async fn call_provider(
                         ctx.strict_tool_parsing,
                         ctx.draft_reasoning,
                         policy,
+                        guard_tools,
                     )
                     .await
                     {
@@ -354,33 +357,20 @@ pub(crate) async fn call_provider(
                             (Err(stream_err), false, false, String::new(), false)
                         }
                         Err(stream_err) => {
-                            let streamed_refusal = stream_err
-                                .downcast_ref::<StreamErrorWithUsage>()
-                                .and_then(|error| match &error.source {
-                                    zeroclaw_api::model_provider::StreamError::ModelRefusal(
-                                        refusal,
-                                    ) => Some((**refusal).clone()),
-                                    _ => None,
-                                })
-                                .or_else(|| {
-                                    stream_err.chain().find_map(|cause| {
-                                        if let Some(
-                                            zeroclaw_api::model_provider::StreamError::ModelRefusal(
-                                                refusal,
-                                            ),
-                                        ) = cause.downcast_ref::<
-                                            zeroclaw_api::model_provider::StreamError,
-                                        >() {
-                                            Some((**refusal).clone())
-                                        } else {
-                                            cause
-                                                .downcast_ref::<
-                                                    zeroclaw_api::model_provider::ModelRefusalError,
-                                                >()
-                                                .cloned()
-                                        }
-                                    })
-                                });
+                            let streamed_refusal = stream_err.chain().find_map(|cause| {
+                                if let Some(
+                                    zeroclaw_api::model_provider::StreamError::ModelRefusal(refusal),
+                                ) = cause.downcast_ref::<zeroclaw_api::model_provider::StreamError>()
+                                {
+                                    Some((**refusal).clone())
+                                } else {
+                                    cause
+                                        .downcast_ref::<
+                                            zeroclaw_api::model_provider::ModelRefusalError,
+                                        >()
+                                        .cloned()
+                                }
+                            });
                             if let Some(usage) = streamed_refusal
                                 .as_ref()
                                 .and_then(|refusal| refusal.usage.as_deref().cloned())
@@ -392,13 +382,8 @@ pub(crate) async fn call_provider(
                             {
                                 scope.record_stream_semantic_rejection_usage(usage);
                             } else if let Some(usage) = stream_err
-                                .downcast_ref::<StreamErrorWithUsage>()
-                                .and_then(|error| error.usage.clone())
-                                .or_else(|| {
-                                    stream_err
-                                        .downcast_ref::<StreamProviderFailure>()
-                                        .and_then(StreamProviderFailure::usage)
-                                })
+                                .downcast_ref::<StreamProviderFailure>()
+                                .and_then(StreamProviderFailure::usage)
                             {
                                 scope.record_stream_interruption_usage(usage);
                             }
@@ -410,16 +395,8 @@ pub(crate) async fn call_provider(
                             }
                             scope.record_stream_recovery_failure(&stream_err);
                             let terminal_stream_error = stream_err
-                                .downcast_ref::<StreamErrorWithUsage>()
-                                .is_some_and(|error| {
-                                    matches!(
-                                        &error.source,
-                                        zeroclaw_providers::traits::StreamError::Terminal(_)
-                                    )
-                                })
-                                || stream_err
-                                    .downcast_ref::<StreamProviderFailure>()
-                                    .is_some_and(StreamProviderFailure::is_terminal);
+                                .downcast_ref::<StreamProviderFailure>()
+                                .is_some_and(StreamProviderFailure::is_terminal);
                             if terminal_stream_error {
                                 ::zeroclaw_log::record!(
                                     WARN,
@@ -1317,6 +1294,7 @@ mod streaming_fallback_tests {
                 false,
                 zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                 0,
+                None,
             );
             let cancel = async {
                 provider.recovery_started.notified().await;
@@ -1369,6 +1347,7 @@ mod streaming_fallback_tests {
                 false,
                 zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                 0,
+                None,
             ),
         )
         .await
@@ -1939,6 +1918,7 @@ mod streaming_fallback_tests {
                         true,
                         policy,
                         0,
+                        None,
                     ),
                 ),
             )
@@ -2049,6 +2029,7 @@ mod streaming_fallback_tests {
             true,
             zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
             0,
+            None,
         )
         .await
         .expect("stream fallback remains a provider-call outcome");
@@ -2111,6 +2092,7 @@ mod streaming_fallback_tests {
             true,
             zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
             0,
+            None,
         )
         .await
         .expect("stream interruption remains a provider-call outcome")
@@ -2254,6 +2236,7 @@ mod streaming_fallback_tests {
                 true,
                 zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                 0,
+                None,
             )
             .await
             .expect("stream failure is returned as a provider-call outcome");
@@ -2384,6 +2367,7 @@ mod streaming_fallback_tests {
             false,
             zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
             0,
+            None,
         )
         .await
         .expect("provider call returns its outcome");
@@ -2473,6 +2457,7 @@ mod streaming_fallback_tests {
                 true,
                 zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                 0,
+                None,
             )
             .await
             .expect("pre-output refusal is recovered by the next candidate");
@@ -2584,6 +2569,7 @@ mod streaming_fallback_tests {
             true,
             zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
             0,
+            None,
         )
         .await
         .expect("dispatch returns the provider outcome")
@@ -2662,6 +2648,7 @@ mod streaming_fallback_tests {
             false,
             zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
             0,
+            None,
         )
         .await
         .expect("cancellation remains a provider-call outcome");
@@ -2741,6 +2728,7 @@ mod streaming_fallback_tests {
             false,
             zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
             0,
+            None,
         )
         .await
         .expect("timeout remains a provider-call outcome");
@@ -2874,6 +2862,7 @@ mod streaming_fallback_tests {
                     streaming,
                     policy,
                     0,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -3078,6 +3067,7 @@ mod streaming_fallback_tests {
             true,
             zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
             0,
+            None,
         );
         let cancel = async {
             provider.recovery_started.notified().await;
@@ -3136,6 +3126,7 @@ mod streaming_fallback_tests {
             true,
             zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
             0,
+            None,
         )
         .await
         .expect("provider call completes");
@@ -3189,6 +3180,7 @@ mod streaming_fallback_tests {
                 true,
                 zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                 0,
+                None,
             )
             .await
             .expect("provider call completes");
@@ -3309,6 +3301,7 @@ mod streaming_fallback_tests {
                 streaming,
                 zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                 0,
+                None,
             )
             .await
             .expect("provider call completes");
@@ -3366,6 +3359,7 @@ mod streaming_fallback_tests {
                 true,
                 zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                 0,
+                None,
             )
             .await
             .expect("provider call completes");
@@ -3530,6 +3524,7 @@ mod streaming_fallback_tests {
                         true,
                         zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                         0,
+                        None,
                     ),
                 ),
             )
@@ -3643,6 +3638,7 @@ mod streaming_fallback_tests {
                         true,
                         zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                         0,
+                        None,
                     ),
                 ),
             )
@@ -3909,6 +3905,7 @@ mod streaming_fallback_tests {
                         true,
                         zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                         0,
+                        None,
                     ),
                 ),
             )
@@ -3993,6 +3990,7 @@ mod streaming_fallback_tests {
                         true,
                         zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                         0,
+                        None,
                     ),
                 ),
             )
