@@ -27217,6 +27217,7 @@ type = "integer"
     #[test]
     #[cfg(feature = "plugins-wasm")]
     fn an_interrupted_update_points_back_at_its_own_source() {
+        use crate::plugins::egress_ceremony::ShellDialect;
         use crate::plugins::update::{UpdateSource, update_command};
 
         let command = update_command(
@@ -27243,9 +27244,10 @@ type = "integer"
             ) && lines[0].contains(&command),
             "{lines:#?}"
         );
+        let quote = |raw: &str| ShellDialect::host().quote_literal(raw);
         assert!(
-            command.contains("--config-dir '/cfg'")
-                && command.contains("--from '/work/weather-plugin'"),
+            command.contains(&format!("--config-dir {}", quote("/cfg")))
+                && command.contains(&format!("--from {}", quote("/work/weather-plugin"))),
             "{command}"
         );
     }

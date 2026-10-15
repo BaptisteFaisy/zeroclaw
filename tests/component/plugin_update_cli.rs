@@ -634,6 +634,8 @@ fn all_points_at_a_displaced_package_instead_of_putting_it_back() {
         .file_name()
         .and_then(|name| name.to_str())
         .expect("utf-8 temp dir name");
+    // The binary quotes the name for the shell of the host it runs on.
+    let target = zeroclaw::plugins::egress_ceremony::ShellDialect::host().quote_literal(PACKAGE);
     // The note's two commands, the ones in backticks, when `text` has it.
     let commands = |text: &str| -> Option<(String, String)> {
         text.lines().find_map(|line| {
@@ -646,7 +648,7 @@ fn all_points_at_a_displaced_package_instead_of_putting_it_back() {
                 .all(|command| {
                     command.contains("--config-dir")
                         && command.contains(config_dir_name)
-                        && command.contains(&format!("plugin update '{PACKAGE}'"))
+                        && command.contains(&format!("plugin update {target}"))
                 })
                 .then(|| (registry_command.to_string(), local_command.to_string()))
         })
