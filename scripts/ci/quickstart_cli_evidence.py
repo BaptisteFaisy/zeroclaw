@@ -1427,6 +1427,7 @@ class Capture:
                                                 "window_pixels": pixels}, ready=True)
         completed_frames = 0
         while not (directory / "bridge-result.json.ready").exists():
+            cancellation_checkpoint()
             require(time.monotonic() < deadline and server.poll() is None, "case_timeout")
             request_pathname = directory / ("frame-request-" + str(completed_frames) + ".json")
             if request_pathname.with_name(request_pathname.name + ".ready").exists():
@@ -1436,6 +1437,7 @@ class Capture:
                            {"done": True}, ready=True)
                 completed_frames += 1
             time.sleep(0.02)
+        cancellation_checkpoint()
         result = read_json(directory / "bridge-result.json")
         validate_bridge(result, binding)
         child_terminal = read_json(directory / "child-terminal.json")

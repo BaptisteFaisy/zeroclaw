@@ -179,11 +179,123 @@ def bridge_control(directory):
         yield bridge, {"close": close, "restore": restore, "flags": flags}
 
 
+@contextlib.contextmanager
+def capture_case_wait_control(directory):
+    """Actual Capture.case wait with controlled OS/validation boundaries, not capture proof."""
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(mock.patch.object(evidence, "PENDING_CANCELLATION", None))
+        capture = object.__new__(evidence.Capture)
+        capture.private = directory / "private"
+        capture.private.mkdir(mode=0o700)
+        capture.context = {key: value for key, value in binding().items() if key in
+                           ("run_id", "attempt", "job", "auxiliary_sha", "source_sha", "source_tree")}
+        capture.tokens, capture.started_cases, capture.actions = [], [], []
+        capture.slices, capture.cases = [], []
+        capture.binary, capture.wasm = directory / "unused-binary", b"synthetic-unit-component"
+        capture.binary_hash = evidence.sha(b"synthetic-unit-binary")
+        capture.display, capture.gui_env = ":controlled-unit", {}
+        capture.capture_frame = mock.Mock()
+        server, terminal = mock.Mock(pid=302), mock.Mock(pid=301)
+        server.poll.return_value = terminal.poll.return_value = None
+        capture.manager = mock.Mock(deadline=1000)
+        capture.manager.spawn.side_effect = [server, terminal]
+        capture.manager.run.side_effect = [b"42\n", b"301\n", b"WIDTH=800\nHEIGHT=480\n"]
+        state = types.SimpleNamespace(clock=100.0, on_window=None, on_sleep=None, events=[])
+        raw = b"synthetic case wait\n"
+        result = {"cli_pid": 304, "parent_pid": 305, "observed_sha256": evidence.sha(raw),
+                  "events": [], "exit": 0, "cleanup": cleanup_receipt(304, 305)}
+        values = {"bridge-result.json": result,
+                  "child-terminal.json": {"pid": 304, "parent_pid": 305},
+                  "server-counts.json": {"index": 1, "archive": 1, "unexpected": 0}}
+        def read(path):
+            state.events.append("read-" + path.name)
+            return copy.deepcopy(values[path.name])
+        real_write = evidence.write_json
+        def write(path, *args, **kwargs):
+            value = real_write(path, *args, **kwargs)
+            if path.name == "window.json":
+                state.events.append("window")
+                evidence.private_write(path.parent / "output.private", raw)
+                if state.on_window is not None:
+                    state.on_window(path.parent)
+            return value
+        def sleep(seconds):
+            state.events.append("sleep")
+            if state.on_sleep is None:
+                raise AssertionError("unexpected wait without a controlled disposition")
+            state.on_sleep(capture.private / "C")
+        stack.enter_context(mock.patch.object(evidence.time, "monotonic", side_effect=lambda: state.clock))
+        stack.enter_context(mock.patch.object(evidence.time, "sleep", side_effect=sleep))
+        stack.enter_context(mock.patch.object(evidence, "write_json", side_effect=write))
+        state.read = stack.enter_context(mock.patch.object(evidence, "read_json", side_effect=read))
+        stack.enter_context(mock.patch.object(evidence, "wait_file", return_value={
+            "pid": 302, "port": 12345, "index_sha256": "d" * 64}))
+        state.bridge = stack.enter_context(mock.patch.object(evidence, "validate_bridge"))
+        stack.enter_context(mock.patch.object(evidence, "validate_terminal"))
+        stack.enter_context(mock.patch.object(evidence, "validate_case", return_value={"unit_wait_only": True}))
+        state.stop = stack.enter_context(mock.patch.object(evidence, "stop_process", side_effect=lambda child:
+            cleanup_receipt(child.pid, 111, "registry" if child is server else "terminal")))
+        yield capture, state, server, terminal
+
+
 class CaptureControls(unittest.TestCase):
     def setUp(self):
         pending = mock.patch.object(evidence, "PENDING_CANCELLATION", None)
         pending.start()
         self.addCleanup(pending.stop)
+
+    def test_capture_case_no_frame_wait_observes_cancellation_before_timeout(self):
+        with tempfile.TemporaryDirectory() as directory, capture_case_wait_control(Path(directory)) as controlled:
+            capture, state, _server, _terminal = controlled
+            def cancel(_case_directory):
+                evidence.interrupted(evidence.signal.SIGTERM, None)
+                state.clock = 221.0  # Old loop reaches case_timeout instead of observing cancellation.
+            state.on_sleep = cancel
+            with self.assertRaisesRegex(evidence.Refusal, "^interrupted$"):
+                capture.case("C")
+            self.assertEqual(state.events, ["window", "sleep"])
+            state.read.assert_not_called()
+            state.bridge.assert_not_called()
+            capture.capture_frame.assert_not_called()
+            self.assertEqual(capture.cases, [])
+
+    def test_capture_case_ready_never_masks_pending_cancellation(self):
+        for ready_at_window in (True, False):
+            with self.subTest(ready_at_window=ready_at_window), tempfile.TemporaryDirectory() as directory, \
+                    capture_case_wait_control(Path(directory)) as controlled:
+                capture, state, _server, _terminal = controlled
+                def ready_and_cancel(case_directory):
+                    evidence.private_write(case_directory / "bridge-result.json.ready", b"")
+                    evidence.interrupted(evidence.signal.SIGINT, None)
+                if ready_at_window:
+                    state.on_window = ready_and_cancel
+                else:
+                    state.on_sleep = ready_and_cancel
+                with self.assertRaisesRegex(evidence.Refusal, "^interrupted$"):
+                    capture.case("C")
+                self.assertEqual(state.events, ["window"] if ready_at_window else ["window", "sleep"])
+                state.read.assert_not_called()
+                state.bridge.assert_not_called()
+                self.assertEqual(capture.cases, [])
+
+    def test_capture_case_ready_without_cancellation_consumes_result(self):
+        for ready_at_window in (True, False):
+            with self.subTest(ready_at_window=ready_at_window), tempfile.TemporaryDirectory() as directory, \
+                    capture_case_wait_control(Path(directory)) as controlled:
+                capture, state, server, terminal = controlled
+                def ready(case_directory):
+                    evidence.private_write(case_directory / "bridge-result.json.ready", b"")
+                if ready_at_window:
+                    state.on_window = ready
+                else:
+                    state.on_sleep = ready
+                self.assertIsNone(capture.case("C"))
+                self.assertEqual(state.events[-3:], ["read-bridge-result.json", "read-child-terminal.json",
+                                                     "read-server-counts.json"])
+                state.bridge.assert_called_once()
+                self.assertEqual(len(capture.cases), 1)
+                self.assertEqual(capture.cases[0]["binding"]["case"], "C")
+                self.assertEqual(state.stop.call_args_list, [mock.call(server), mock.call(terminal)])
 
     def test_exact_selected_empty_value_is_the_only_positive_mode(self):
         config, text, events = admitted_fixture()
