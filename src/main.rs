@@ -26409,7 +26409,7 @@ hosts = ["api.example.com", "api2.example.com"]
             std::path::Path::new("/tmp/profile with spaces"),
             "weather",
             UpdateSource::Registry {
-                version: Some("2.0.0"),
+                version: Some("2.0.0@rc.1"),
                 registry: Some("https://registry.example.test/index.json"),
             },
             &increase,
@@ -26426,6 +26426,23 @@ hosts = ["api.example.com", "api2.example.com"]
         let cli = Cli::try_parse_from(argv.split_terminator('\0'))
             .expect("the emitted command must parse");
         assert_eq!(cli.config_dir.as_deref(), Some("/tmp/profile with spaces"));
+        let Commands::Plugin {
+            plugin_command: PluginCommands::Update { plugins, .. },
+        } = &cli.command
+        else {
+            panic!("expected plugin update");
+        };
+        // The retry pins the version it was offered, `@` and all.
+        assert_eq!(
+            plugins
+                .iter()
+                .map(|target| zeroclaw::plugins::registry::parse_plugin_spec(target).unwrap())
+                .collect::<Vec<_>>(),
+            [zeroclaw::plugins::registry::PluginSpec {
+                name: "weather".to_string(),
+                version: Some("2.0.0@rc.1".to_string()),
+            }]
+        );
         let allowed = parsed_update_allow(cli);
         assert_eq!(
             allowed,
