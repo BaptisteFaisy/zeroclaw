@@ -6091,7 +6091,7 @@ async fn run_plugin_update(
     {
         bail!(t(
             "cli-plugin-update-usage-allow",
-            "--allow applies to exactly one plugin: name that plugin alone, pinned to the version you approve."
+            "--allow and --allow-token apply to exactly one plugin: name that plugin alone, pinned to the version you approve."
         ));
     }
     if let Some(item) = crate::plugins::update::malformed_allow_item(&allow) {
@@ -6099,7 +6099,7 @@ async fn run_plugin_update(
             "cli-plugin-update-usage-allow-item",
             &[("item", item)],
             format!(
-                "'{item}' is not an --allow item: use permission:<name>, capability:<name>, provides:<id>, or publisher:<key>."
+                "'{item}' is not an --allow or --allow-token item: use permission:<name>, capability:<name>, provides:<id>, or publisher:<key>."
             ),
         ));
     }

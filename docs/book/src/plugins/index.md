@@ -785,13 +785,17 @@ command that accepts exactly that, pinned to the version you reviewed:
 ```text
 'my-plugin' 0.2.0 requests authority the installed version does not have:
   + permission:http_client
-Nothing was changed. To accept it and update, run: zeroclaw --config-dir '/home/user/.zeroclaw' plugin update 'my-plugin@0.2.0' --allow 'permission:http_client'
+Nothing was changed. To accept it and update, run: zeroclaw --config-dir '/home/user/.zeroclaw' plugin update 'my-plugin@0.2.0' --allow-token 'permission:http_client'
 ```
 
-`--allow` takes `permission:<name>`, `capability:<name>`, `provides:<id>`, and
-`publisher:<key>` (`publisher:unsigned` for a package that names no key). It
-applies to one plugin at a time, and for a registry update that plugin must be
-pinned as `name@version`, so what you accept is the version you reviewed.
+`--allow-token` takes one complete item per flag and can be repeated:
+`permission:<name>`, `capability:<name>`, `provides:<id>`, or
+`publisher:<key>` (`publisher:unsigned` for a package that names no key).
+`--allow` takes the same items as one comma-separated list. The printed command
+uses `--allow-token`, so an item whose value holds a comma, such as a
+`provides` id, reaches the command whole. Either flag applies to one plugin at
+a time, and for a registry update that plugin must be pinned as
+`name@version`, so what you accept is the version you reviewed.
 Removing the plugin and installing the new
 version is the other way to accept it. Every value in the printed command is
 quoted for your shell, following the rules described under

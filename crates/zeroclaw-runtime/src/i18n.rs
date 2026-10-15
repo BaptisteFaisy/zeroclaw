@@ -1510,13 +1510,18 @@ mod tests {
             ("cli-plugin-about", &[], &["WASM"]),
             ("cli-plugin-update-about", &[], &[]),
             ("cli-plugin-update-usage-from", &[], &["--from"]),
-            ("cli-plugin-update-usage-allow", &[], &["--allow"]),
+            (
+                "cli-plugin-update-usage-allow",
+                &[],
+                &["--allow", "--allow-token"],
+            ),
             (
                 "cli-plugin-update-usage-allow-item",
                 &[("item", "grant:x")],
                 &[
                     "grant:x",
                     "--allow",
+                    "--allow-token",
                     "permission:<name>",
                     "capability:<name>",
                     "provides:<id>",
