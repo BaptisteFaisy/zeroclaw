@@ -72,7 +72,7 @@ jobs:
           import urllib.request
 
           ANCESTOR = "6b98ff79ba9c7a0b3246e1c2398626f8a652c25e"
-          EXPECTED_PARENT = "679dcd589222c2d2f6ab96f2d5949fe44ce5b149"
+          EXPECTED_PARENT = "de4e14f4ca752b34804911e293d018095969d76f"
           WORKFLOW = ".github/workflows/qualify-pr11364-arduino-eight-windows.yml"
           ARDUINO = "crates/zeroclaw-hardware/src/peripherals/arduino_upload.rs"
           MODULE = "peripherals::arduino_upload::tests::"
@@ -92,7 +92,8 @@ jobs:
           LIST = ["cargo", "nextest", "list", *COMMON, "--message-format", "json"]
           RUN = ["cargo", "nextest", "run", *COMMON, "--no-fail-fast", "--no-tests",
                  "fail", "--retries", "0", "--status-level", "pass",
-                 "--final-status-level", "fail", "--color", "never"]
+                 "--final-status-level", "fail", "--color", "never",
+                 "--failure-output", "never", "--success-output", "never"]
           SHA = re.compile(r"[0-9a-f]{40}")
           HEX = re.compile(r"[0-9a-f]{64}")
           COMMANDS = []
@@ -131,6 +132,605 @@ jobs:
               with path.open("xb") as f:
                   f.write(data)
 
+          # Pure, finite failure diagnostics. No raw-file reads or native calls.
+          DIAGNOSTIC_NAMES = (
+              "peripherals::arduino_upload::tests::fake_cli_success_runs_all_stages_and_cleans_workspace",
+              "peripherals::arduino_upload::tests::compile_failure_reports_stderr_and_cleans_workspace",
+              "peripherals::arduino_upload::tests::failed_preflight_does_not_compile_or_upload",
+              "peripherals::arduino_upload::tests::non_not_found_spawn_error_keeps_its_cause",
+              "peripherals::arduino_upload::tests::compile_timeout_kills_reaps_and_cleans_workspace",
+              "peripherals::arduino_upload::tests::preflight_timeout_reports_its_stage",
+              "peripherals::arduino_upload::tests::upload_timeout_reports_its_stage_and_cleans_workspace",
+              "peripherals::arduino_upload::tests::upload_failure_reports_stderr_and_cleans_workspace",
+          )
+
+          def diagnostic_context(src, selected, platform_data):
+              return (
+                  tuple(src["binding"][key] for key in
+                        ("head", "base", "merge", "workflow", "repository", "pr", "run_id", "attempt")),
+                  (src["tree"], EXPECTED_PARENT, src["arduino_blob"]),
+                  DIAGNOSTIC_NAMES, selected["excluded_before_run"],
+                  (selected["executable"]["sha256"], selected["executable"]["bytes"],
+                   platform_data["nextest_executable_sha256"]),
+              )
+
+          def project_named_failure(accepted, rc_value, context):
+              try:
+                  if (type(accepted) is not tuple or len(accepted) != 2
+                          or any(type(x) is not bytes for x in accepted)
+                          or accepted[0] or not 0 < len(accepted[1]) <= 2097152
+                          or type(rc_value) is not int or not 0 < rc_value <= 4294967295):
+                      return None
+                  bt, st, names, excluded, executable = context
+                  keys = ("head", "base", "merge", "workflow", "repository", "pr", "run_id", "attempt")
+                  b = dict(zip(keys, bt))
+                  if (type(context) is not tuple or len(context) != 5 or len(bt) != 8
+                          or names != DIAGNOSTIC_NAMES or type(excluded) is not int
+                          or not 0 <= excluded <= 2097152 or len(st) != 3 or len(executable) != 3
+                          or any(type(b[k]) is not str or not SHA.fullmatch(b[k]) for k in keys[:4])
+                          or b["repository"] != "zeroclaw-labs/zeroclaw" or type(b["pr"]) is not int or b["pr"] != 11364
+                          or any(type(b[k]) is not str or not re.fullmatch(r"[1-9][0-9]{0,19}", b[k]) for k in keys[-2:])
+                          or not SHA.fullmatch(st[0]) or st[1] != EXPECTED_PARENT
+                          or st[2] != "028627cb1907b9aace3cec9f6bb9a9e7200702cb"
+                          or not HEX.fullmatch(executable[0]) or not HEX.fullmatch(executable[2])
+                          or type(executable[1]) is not int or not 0 < executable[1] <= 268435456):
+                      return None
+                  text = accepted[1].decode("utf-8")
+                  if not text.endswith("\n") or any(x in text for x in ["\x00", "\x1b", "\ufeff"]):
+                      return None
+                  text = text.replace("\r\n", "\n")
+                  if any(ord(x) < 32 and x != "\n" for x in text):
+                      return None
+                  lines = [x.strip(" ") for x in text.split("\n") if x.strip(" ")]
+                  i = 0
+                  duration = r"[0-9]{1,3}\.[0-9]{3}"
+                  finished = re.fullmatch(r"Finished `test` profile \[unoptimized \+ debuginfo\] target\(s\) in ([0-9]{1,3}\.[0-9]{2})s", lines[i])
+                  if finished:
+                      if float(finished[1]) > 300:
+                          return None
+                      i += 1
+                  bar = lines[i]; i += 1
+                  if bar not in ["------------", "────────────"]:
+                      return None
+                  banner = re.fullmatch(r"Nextest run ID ([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}) with nextest profile: default", lines[i])
+                  i += 1
+                  suffix = "" if excluded == 0 else " (" + str(excluded) + (" test" if excluded == 1 else " tests") + " skipped)"
+                  if banner is None or lines[i] != "Starting 8 tests across 1 binary" + suffix:
+                      return None
+                  i += 1
+                  terminal, ordinals, seen, slow = [], set(), set(), {}
+                  pattern = r"(PASS|FAIL|TIMEOUT|XFAIL) \[ *(" + duration + r")s\] \( *([1-8])/8\) zeroclaw-hardware ([a-z_:]+)"
+                  while len(terminal) < 8:
+                      line = lines[i]; i += 1
+                      m = re.fullmatch(pattern, line)
+                      if m:
+                          status, elapsed, ordinal, name = m.groups()
+                          if name not in names or name in seen or int(ordinal) in ordinals or float(elapsed) > 300:
+                              return None
+                          seen.add(name); ordinals.add(int(ordinal))
+                          terminal.append((int(ordinal), name, status, elapsed))
+                          continue
+                      progress = re.fullmatch(r"(SLOW|TERMINATING) \[> *(" + duration + r")s\] \((?:---|───)\) zeroclaw-hardware ([a-z_:]+)", line)
+                      if progress:
+                          _, elapsed, name = progress.groups()
+                          value = float(elapsed)
+                          if name not in names or name in seen or value > 300 or value < slow.get(name, 0):
+                              return None
+                          slow[name] = value
+                          continue
+                      return None
+                  if seen != set(names) or ordinals != set(range(1, 9)) or lines[i] != bar:
+                      return None
+                  i += 1
+                  histogram = {status: sum(row[2] == status for row in terminal) for status in ["PASS", "FAIL", "TIMEOUT", "XFAIL"]}
+                  if histogram["PASS"] == 8:
+                      return None
+                  summary = str(histogram["PASS"]) + " passed, "
+                  for status, label in [("FAIL", "failed"), ("XFAIL", "exec failed"), ("TIMEOUT", "timed out")]:
+                      if histogram[status]:
+                          summary += str(histogram[status]) + " " + label + ", "
+                  summary += str(excluded) + " skipped"
+                  m = re.fullmatch(r"Summary \[ *(" + duration + r")s\] 8 tests run: " + re.escape(summary), lines[i])
+                  i += 1
+                  if m is None or float(m[1]) > 300:
+                      return None
+                  echoes = []
+                  for row in sorted((x for x in terminal if x[2] != "PASS"), key=lambda x: x[0]):
+                      m = re.fullmatch(pattern, lines[i]); i += 1
+                      if m is None or (int(m[3]), m[4], m[1], m[2]) != row:
+                          return None
+                      echoes.append(row[0])
+                  if lines[i:] != ["error: test run failed"]:
+                      return None
+                  return {
+                      "schema": 1, "kind": "EXACT_RUN_COMPLETE_NAMED_FAILURE", "binding": b,
+                      "association": {"source_tree": st[0], "expected_parent": st[1], "arduino_blob": st[2],
+                                      "selected_executable_sha256": executable[0], "selected_executable_bytes": executable[1],
+                                      "nextest_executable_sha256": executable[2]},
+                      "selection": {"selected": list(names), "selected_ignored": 0,
+                                    "binary_id": "zeroclaw-hardware", "excluded_before_run": excluded},
+                      "capture": {k: True for k in ["complete", "closed_owned_job_and_pipes", "cleanup_validated", "stdout_empty", "exact_RUN"]},
+                      "reporter": {"version": "0.9.143", "profile": "default", "status_level": "pass", "final_status_level": "fail",
+                                   "failure_output": "never", "success_output": "never", "retries": 0,
+                                   "nextest_run_id": banner[1], "summary_complete": True, "final_echoes_complete": True, "footer": "TEST_RUN_FAILED"},
+                      "exit_class": "NONZERO",
+                      "terminal": [{"ordinal": x[0], "name": x[1], "status": x[2]} for x in terminal],
+                      "final_echo_ordinals": echoes,
+                      "counts": {"run": 8, "passed": histogram["PASS"], "failed": histogram["FAIL"],
+                                 "timed_out": histogram["TIMEOUT"], "exec_failed": histogram["XFAIL"],
+                                 "selected_skipped": 0, "excluded_before_run": excluded},
+                  }
+              except Exception:
+                  return None
+
+          def maybe_write_named_failure(accepted, rc_value, context, open_decision):
+              try:
+                  decision = project_named_failure(accepted, rc_value, context)
+                  if decision is None:
+                      return False
+                  data = (json.dumps(decision, sort_keys=True) + "\n").encode()
+                  if len(data) > 16384:
+                      return False
+                  with open_decision() as stream:
+                      if stream.write(data) != len(data):
+                          return False
+                      stream.flush()
+                  # Only True return: full write, flush AND close returned.
+                  return True
+              except Exception:
+                  return False
+
+          def commit_named_failure(accepted, rc_value, context, state, open_decision):
+              committed = False
+              try:
+                  committed = maybe_write_named_failure(accepted, rc_value, context, open_decision)
+              except Exception:
+                  pass
+              state["named_failure_committed"] = (committed is True)
+
+          def phase_receipt_payload(phase, current_binding, commands, state):
+              value = {"binding": current_binding, "commands": commands}
+              if phase == "test":
+                  require(type(state) is dict and set(state) == {"named_failure_committed"}
+                          and type(state["named_failure_committed"]) is bool, "E_COMMAND_SCHEMA")
+                  value["named_failure_committed"] = state["named_failure_committed"]
+              return value
+
+          def public_command_phase(value, phase, current_binding, allowed):
+              keys = {"binding", "commands", "named_failure_committed"} if phase == "test" else {"binding", "commands"}
+              require(set(value) == keys and value["binding"] == current_binding
+                      and type(value["commands"]) is list and len(value["commands"]) <= 64, "E_COMMAND_SCHEMA")
+              if phase == "test":
+                  require(type(value["named_failure_committed"]) is bool
+                          and value["named_failure_committed"] is False, "E_COMMAND_SCHEMA")
+              for row in value["commands"]:
+                  require(set(row) == {"argv", "exit", "elapsed_seconds", "stdout_bytes", "stderr_bytes", "stdout_sha256", "stderr_sha256", "owned_job_empty"} and row["argv"] in allowed and type(row["exit"]) is int and row["exit"] == 0 and row["owned_job_empty"] is True, "E_COMMAND_SCHEMA")
+                  require(type(row["elapsed_seconds"]) in [int, float] and 0 <= row["elapsed_seconds"] <= 2705 and all(type(row[x]) is int and 0 <= row[x] <= 16777216 for x in ["stdout_bytes", "stderr_bytes"]) and all(HEX.fullmatch(row[x]) for x in ["stdout_sha256", "stderr_sha256"]), "E_COMMAND_SCHEMA")
+              return {"binding": value["binding"], "commands": value["commands"]}
+
+          def validated_named_failure(decision, phase, src, selected, platform_data, expected_binding, states, run_argv, list_argv):
+              # Defined independently in the finalizer; Prepare has identical bytes for
+              # isolated synthetic tests. No harness import, command or raw capture read.
+              try:
+                  def check(ok):
+                      if not ok:
+                          raise ValueError("E_NAMED_DIAGNOSTIC")
+                  def obj(value, keys):
+                      check(type(value) is dict and set(value) == set(keys))
+                  def integer(value, low, high):
+                      check(type(value) is int and low <= value <= high)
+                  def sha(value, length):
+                      check(type(value) is str and re.fullmatch(r"[0-9a-f]{" + str(length) + "}", value) is not None)
+                  names = (
+                      "peripherals::arduino_upload::tests::fake_cli_success_runs_all_stages_and_cleans_workspace",
+                      "peripherals::arduino_upload::tests::compile_failure_reports_stderr_and_cleans_workspace",
+                      "peripherals::arduino_upload::tests::failed_preflight_does_not_compile_or_upload",
+                      "peripherals::arduino_upload::tests::non_not_found_spawn_error_keeps_its_cause",
+                      "peripherals::arduino_upload::tests::compile_timeout_kills_reaps_and_cleans_workspace",
+                      "peripherals::arduino_upload::tests::preflight_timeout_reports_its_stage",
+                      "peripherals::arduino_upload::tests::upload_timeout_reports_its_stage_and_cleans_workspace",
+                      "peripherals::arduino_upload::tests::upload_failure_reports_stderr_and_cleans_workspace",
+                  )
+                  body_hashes = (
+                      "62b62dfa8bc12e71ec3b3b619a4345e4eeea4a42f15cf5d7845efffde66cc617",
+                      "db0ac02938f9a8c42bf8c43ffad607a7d39ee5e12a1598dc89e97b0625e8d919",
+                      "00e027eb758c1a368438d7bfdf3caccc49e2f8d7563e9e0e4897c9e0fcbf8d01",
+                      "bc5b7e764405431f8716836e30b8656ce61675b87ec9ae46db4b9d58de7d9bae",
+                      "19bdda3fd1d53f31dc640225cbc93c9ff5a20526f48bf217b0266488dfb2d6d3",
+                      "95d3424e1e34de1698ae1e4e6c4012c9f0bfed861323793d521356e6cadd8440",
+                      "9a606dc331ea2dcc999d80b83cab543f6b89136b58521dd6f46558c628d5bdb5",
+                      "304b88c801345474c8d39e4f01cf8ea9b4d511078db855d1b8c9747250185b3e",
+                  )
+                  parent = "de4e14f4ca752b34804911e293d018095969d76f"
+                  arduino = "crates/zeroclaw-hardware/src/peripherals/arduino_upload.rs"
+                  workflow = ".github/workflows/qualify-pr11364-arduino-eight-windows.yml"
+                  binding_keys = ["head", "base", "merge", "workflow", "repository", "pr", "run_id", "attempt"]
+                  obj(expected_binding, binding_keys)
+                  for key in binding_keys[:4]:
+                      sha(expected_binding[key], 40)
+                  check(expected_binding["repository"] == "zeroclaw-labs/zeroclaw")
+                  check(type(expected_binding["pr"]) is int and expected_binding["pr"] == 11364)
+                  for key in ["run_id", "attempt"]:
+                      check(type(expected_binding[key]) is str and re.fullmatch(r"[1-9][0-9]{0,19}", expected_binding[key]) is not None)
+                  step_keys = ["PREPARE_OUTCOME", "TOOLCHAIN_OUTCOME", "CACHE_OUTCOME", "SETUP_OUTCOME", "LIST_OUTCOME", "TEST_OUTCOME"]
+                  obj(states, step_keys)
+                  check(all(states[key] == "success" for key in step_keys[:-1]) and states["TEST_OUTCOME"] == "failure")
+                  obj(phase, ["binding", "commands", "named_failure_committed"])
+                  check(phase["binding"] == expected_binding and phase["named_failure_committed"] is True)
+                  obj(src, ["binding", "tree", "parents", "file_sha256", "arduino_blob", "body_hash_basis", "body_sha256", "merge_base_workflow_fields"])
+                  check(src["binding"] == expected_binding and src["parents"] == [parent])
+                  sha(src["tree"], 40)
+                  check(src["arduino_blob"] == "028627cb1907b9aace3cec9f6bb9a9e7200702cb")
+                  check(src["body_sha256"] == dict(zip(names, body_hashes)))
+                  check(src["body_hash_basis"] == "Pinned inventory bound by complete unchanged Arduino bytes, not a new Rust AST extraction")
+                  check(src["merge_base_workflow_fields"] == "Official event descriptors, distinct from the explicitly checked-out head")
+                  hashes = src["file_sha256"]
+                  obj(hashes, [arduino, workflow, "Cargo.lock", "Cargo.toml", "crates/zeroclaw-hardware/Cargo.toml"])
+                  expected_hashes = {
+                      arduino: "56d246bdd3103249d6b8b7eba9294e40ebd025e3d716d3b8eb8424d9435323dc",
+                      "Cargo.lock": "4294db86b3307b07bfb67f1c10b3bd686069c6b2b2dbfae39af54c58846410ad",
+                      "Cargo.toml": "4c955ec6672a3a255f4962a21c821e468e89424cd9b4937660f0f40a898745ba",
+                      "crates/zeroclaw-hardware/Cargo.toml": "7f8d1fd77e33cff1deb4b2fc81d8e8eec485bf0d78b1a36ef7dfba09b5fcf466",
+                  }
+                  check(all(hashes[key] == value for key, value in expected_hashes.items()))
+                  sha(hashes[workflow], 64)
+                  obj(selected, ["binding", "selected", "selected_ignored", "excluded_before_run", "excluded_reasons", "list_sha256", "executable"])
+                  check(selected["binding"] == expected_binding and selected["selected"] == sorted(names))
+                  integer(selected["selected_ignored"], 0, 0)
+                  integer(selected["excluded_before_run"], 0, 2097152)
+                  obj(selected["excluded_reasons"], ["expression", "ignored"])
+                  for value in selected["excluded_reasons"].values():
+                      integer(value, 0, 2097152)
+                  check(sum(selected["excluded_reasons"].values()) == selected["excluded_before_run"])
+                  sha(selected["list_sha256"], 64)
+                  executable = selected["executable"]
+                  obj(executable, ["sha256", "bytes", "relative_path"])
+                  sha(executable["sha256"], 64)
+                  integer(executable["bytes"], 1, 268435456)
+                  check(type(executable["relative_path"]) is str and re.fullmatch(r"target/(?:x86_64-pc-windows-msvc/)?debug/deps/zeroclaw_hardware-[0-9a-f]{16}\.exe", executable["relative_path"]) is not None)
+                  obj(platform_data, ["binding", "runner_label", "image", "compiler", "cargo", "nextest", "nextest_executable_sha256", "cache"])
+                  check(platform_data["binding"] == expected_binding and platform_data["runner_label"] == "windows-latest")
+                  obj(platform_data["image"], ["ImageOS", "ImageVersion", "RUNNER_OS", "RUNNER_ARCH"])
+                  check(all(type(x) is str and re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", x) is not None for x in platform_data["image"].values()))
+                  check(platform_data["image"]["RUNNER_OS"] == "Windows" and platform_data["image"]["RUNNER_ARCH"] == "X64")
+                  check(re.fullmatch(r"rustc 1\.98\.0 \([0-9a-f]{7,40} [0-9]{4}-[0-9]{2}-[0-9]{2}\)\nbinary: rustc\ncommit-hash: [0-9a-f]{40}\ncommit-date: [0-9]{4}-[0-9]{2}-[0-9]{2}\nhost: x86_64-pc-windows-msvc\nrelease: 1\.98\.0\nLLVM version: [0-9.]+", platform_data["compiler"]) is not None)
+                  check(re.fullmatch(r"cargo 1\.98\.0 \([0-9a-f]{7,40} [0-9]{4}-[0-9]{2}-[0-9]{2}\)", platform_data["cargo"]) is not None)
+                  check(re.fullmatch(r"cargo-nextest 0\.9\.143(?: \([0-9a-f]{7,40} [0-9]{4}-[0-9]{2}-[0-9]{2}\))?", platform_data["nextest"]) is not None)
+                  sha(platform_data["nextest_executable_sha256"], 64)
+                  cache = platform_data["cache"]
+                  obj(cache, ["action", "shared_key", "save", "exact_match_output", "key_and_restore_source"])
+                  check(cache["action"] == "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6" and cache["shared_key"] == "platform-test" and cache["save"] is False and cache["exact_match_output"] in ["true", "false"])
+                  check(cache["key_and_restore_source"] == "Independent official Restore-only Rust cache step log readback required; false alone does not distinguish fallback from miss")
+                  allowed = [run_argv, list_argv, ["rustc", "-vV"], ["cargo", "-V"], ["cargo", "nextest", "-V"]]
+                  for args in [["rev-list", "--parents", "-n", "1", "HEAD"], ["diff-tree", "--no-commit-id", "--name-status", "-r", "6b98ff79ba9c7a0b3246e1c2398626f8a652c25e", "HEAD"], ["status", "--porcelain=v1", "--untracked-files=all"], ["rev-parse", "HEAD:" + arduino], ["rev-parse", "HEAD^{tree}"]]:
+                      allowed.append(["git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=NUL", "-c", "core.attributesFile=NUL", *args])
+                  check(type(phase["commands"]) is list and len(phase["commands"]) <= 64)
+                  runs = []
+                  for row in phase["commands"]:
+                      obj(row, ["argv", "exit", "elapsed_seconds", "stdout_bytes", "stderr_bytes", "stdout_sha256", "stderr_sha256", "owned_job_empty"])
+                      check(row["argv"] in allowed and row["owned_job_empty"] is True)
+                      check(type(row["elapsed_seconds"]) in [int, float] and 0 <= row["elapsed_seconds"] <= 2705)
+                      for key in ["stdout_bytes", "stderr_bytes"]:
+                          integer(row[key], 0, 16777216)
+                      for key in ["stdout_sha256", "stderr_sha256"]:
+                          sha(row[key], 64)
+                      if row["argv"] == run_argv:
+                          integer(row["exit"], 1, 4294967295)
+                          check(row["stdout_bytes"] == 0 and row["stderr_bytes"] <= 2097152)
+                          runs.append(row)
+                      else:
+                          integer(row["exit"], 0, 0)
+                  check(len(runs) == 1)
+                  obj(decision, ["schema", "kind", "binding", "association", "selection", "capture", "reporter", "exit_class", "terminal", "final_echo_ordinals", "counts"])
+                  integer(decision["schema"], 1, 1)
+                  check(decision["kind"] == "EXACT_RUN_COMPLETE_NAMED_FAILURE" and decision["binding"] == expected_binding and decision["exit_class"] == "NONZERO")
+                  check(len((json.dumps(decision, sort_keys=True) + "\n").encode()) <= 16384)
+                  assoc = decision["association"]
+                  obj(assoc, ["source_tree", "expected_parent", "arduino_blob", "selected_executable_sha256", "selected_executable_bytes", "nextest_executable_sha256"])
+                  check(assoc == {"source_tree": src["tree"], "expected_parent": parent, "arduino_blob": src["arduino_blob"],
+                                  "selected_executable_sha256": executable["sha256"], "selected_executable_bytes": executable["bytes"],
+                                  "nextest_executable_sha256": platform_data["nextest_executable_sha256"]})
+                  integer(assoc["selected_executable_bytes"], 1, 268435456)
+                  dsel = decision["selection"]
+                  obj(dsel, ["selected", "selected_ignored", "binary_id", "excluded_before_run"])
+                  check(dsel["selected"] == list(names) and dsel["binary_id"] == "zeroclaw-hardware")
+                  integer(dsel["selected_ignored"], 0, 0)
+                  integer(dsel["excluded_before_run"], 0, 2097152)
+                  check(dsel["excluded_before_run"] == selected["excluded_before_run"])
+                  obj(decision["capture"], ["complete", "closed_owned_job_and_pipes", "cleanup_validated", "stdout_empty", "exact_RUN"])
+                  check(all(x is True for x in decision["capture"].values()))
+                  reporter = decision["reporter"]
+                  obj(reporter, ["version", "profile", "status_level", "final_status_level", "failure_output", "success_output", "retries", "nextest_run_id", "summary_complete", "final_echoes_complete", "footer"])
+                  check(all(reporter[key] == value for key, value in {"version": "0.9.143", "profile": "default", "status_level": "pass", "final_status_level": "fail", "failure_output": "never", "success_output": "never", "footer": "TEST_RUN_FAILED"}.items()))
+                  integer(reporter["retries"], 0, 0)
+                  check(reporter["summary_complete"] is True and reporter["final_echoes_complete"] is True)
+                  check(type(reporter["nextest_run_id"]) is str and re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", reporter["nextest_run_id"]) is not None)
+                  terminal = decision["terminal"]
+                  check(type(terminal) is list and len(terminal) == 8)
+                  by_name, ordinals = {}, []
+                  for row in terminal:
+                      obj(row, ["ordinal", "name", "status"])
+                      integer(row["ordinal"], 1, 8)
+                      check(row["name"] in names and row["name"] not in by_name and row["status"] in ["PASS", "FAIL", "TIMEOUT", "XFAIL"])
+                      by_name[row["name"]] = row["status"]; ordinals.append(row["ordinal"])
+                  check(set(by_name) == set(names) and sorted(ordinals) == list(range(1, 9)))
+                  failed_ordinals = sorted(row["ordinal"] for row in terminal if row["status"] != "PASS")
+                  check(failed_ordinals and type(decision["final_echo_ordinals"]) is list
+                        and all(type(x) is int for x in decision["final_echo_ordinals"])
+                        and decision["final_echo_ordinals"] == failed_ordinals)
+                  counts = decision["counts"]
+                  obj(counts, ["run", "passed", "failed", "timed_out", "exec_failed", "selected_skipped", "excluded_before_run"])
+                  for key in ["run", "passed", "failed", "timed_out", "exec_failed", "selected_skipped"]:
+                      integer(counts[key], 0, 8)
+                  integer(counts["excluded_before_run"], 0, 2097152)
+                  check(counts == {"run": 8, "passed": sum(x == "PASS" for x in by_name.values()),
+                                   "failed": sum(x == "FAIL" for x in by_name.values()),
+                                   "timed_out": sum(x == "TIMEOUT" for x in by_name.values()),
+                                   "exec_failed": sum(x == "XFAIL" for x in by_name.values()),
+                                   "selected_skipped": 0, "excluded_before_run": selected["excluded_before_run"]})
+                  result = {"schema": 1, "kind": "EXACT_EIGHT_TERMINAL_RESULTS", "exit_class": "NONZERO",
+                            "results": [{"name": name, "status": by_name[name]} for name in names], "counts": dict(counts)}
+                  check(len((json.dumps(result, sort_keys=True) + "\n").encode()) <= 4096)
+                  return result
+              except Exception:
+                  return None
+
+          def bounded_failure_object(minimum, diagnostic):
+              # This pure composition is used in the separate finalizer and synthetic tests.
+              if diagnostic is not None:
+                  candidate = {**minimum, "diagnostic": diagnostic}
+                  if len((json.dumps(candidate, sort_keys=True) + "\n").encode()) <= 4096:
+                      return candidate
+              return minimum
+          def optional_named_failure(read_receipt, expected_binding, states, run_argv, list_argv):
+              # Only fixed typed receipts; read_receipt cannot be used for raw captures.
+              try:
+                  def unique(items):
+                      value = {}
+                      for key, item in items:
+                          if key in value:
+                              raise ValueError("E_JSON_DUPLICATE")
+                          value[key] = item
+                      return value
+                  def typed(name, cap):
+                      data = read_receipt(name, cap)
+                      if type(data) is not bytes or len(data) > cap:
+                          raise ValueError("E_FILE_CAP")
+                      return json.loads(data.decode("utf-8"), object_pairs_hook=unique)
+                  phase = typed("test-commands.json", 65536)
+                  if (type(phase) is not dict or set(phase) != {"binding", "commands", "named_failure_committed"}
+                          or phase["binding"] != expected_binding or phase["named_failure_committed"] is not True):
+                      return None
+                  return validated_named_failure(
+                      typed("named-failure-decision.json", 16384), phase,
+                      typed("source.json", 65536), typed("selection.json", 65536),
+                      typed("platform.json", 65536), expected_binding, states, run_argv, list_argv)
+              except Exception:
+                  return None
+
+          def diagnostic_selftests():
+              # Synthetic-only, in-memory inputs and writer. No globals are
+              # changed, no proof path/receipt/file or native child is touched.
+              from copy import deepcopy
+              saved = (tuple(COMMANDS), tuple(EXPECTED), EXPECTED_PARENT, DEADLINE)
+              b = dict(zip(("head", "base", "merge", "workflow", "repository", "pr", "run_id", "attempt"),
+                           ("1" * 40, "2" * 40, "3" * 40, "4" * 40, "zeroclaw-labs/zeroclaw", 11364, "1", "1")))
+              src = {"binding": b, "tree": "5" * 40, "parents": [EXPECTED_PARENT],
+                     "arduino_blob": "028627cb1907b9aace3cec9f6bb9a9e7200702cb",
+                     "body_hash_basis": "Pinned inventory bound by complete unchanged Arduino bytes, not a new Rust AST extraction",
+                     "body_sha256": dict(zip(DIAGNOSTIC_NAMES, BODY_HASHES)),
+                     "merge_base_workflow_fields": "Official event descriptors, distinct from the explicitly checked-out head",
+                     "file_sha256": {
+                         ARDUINO: "56d246bdd3103249d6b8b7eba9294e40ebd025e3d716d3b8eb8424d9435323dc",
+                         WORKFLOW: "6" * 64,
+                         "Cargo.lock": "4294db86b3307b07bfb67f1c10b3bd686069c6b2b2dbfae39af54c58846410ad",
+                         "Cargo.toml": "4c955ec6672a3a255f4962a21c821e468e89424cd9b4937660f0f40a898745ba",
+                         "crates/zeroclaw-hardware/Cargo.toml": "7f8d1fd77e33cff1deb4b2fc81d8e8eec485bf0d78b1a36ef7dfba09b5fcf466"}}
+              sel = {"binding": b, "selected": sorted(DIAGNOSTIC_NAMES), "selected_ignored": 0,
+                     "excluded_before_run": 2, "excluded_reasons": {"expression": 2, "ignored": 0},
+                     "list_sha256": "7" * 64, "executable": {"sha256": "8" * 64, "bytes": 100,
+                     "relative_path": "target/debug/deps/zeroclaw_hardware-aaaaaaaaaaaaaaaa.exe"}}
+              pdata = {"binding": b, "runner_label": "windows-latest",
+                       "image": {"ImageOS": "win25", "ImageVersion": "20261014.1", "RUNNER_OS": "Windows", "RUNNER_ARCH": "X64"},
+                       "compiler": "rustc 1.98.0 (aaaaaaa 2026-01-01)\nbinary: rustc\ncommit-hash: " + "a" * 40 + "\ncommit-date: 2026-01-01\nhost: x86_64-pc-windows-msvc\nrelease: 1.98.0\nLLVM version: 22.0.0",
+                       "cargo": "cargo 1.98.0 (aaaaaaa 2026-01-01)", "nextest": "cargo-nextest 0.9.143",
+                       "nextest_executable_sha256": "9" * 64,
+                       "cache": {"action": "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
+                                 "shared_key": "platform-test", "save": False, "exact_match_output": "false",
+                                 "key_and_restore_source": "Independent official Restore-only Rust cache step log readback required; false alone does not distinguish fallback from miss"}}
+              ctx = diagnostic_context(src, sel, pdata)
+              states = {key: "success" for key in ["PREPARE_OUTCOME", "TOOLCHAIN_OUTCOME", "CACHE_OUTCOME", "SETUP_OUTCOME", "LIST_OUTCOME"]}
+              states["TEST_OUTCOME"] = "failure"
+              minimum = {"schema": 1, "repository": "zeroclaw-labs/zeroclaw", "pr": 11364, "head": b["head"],
+                         "run_id": "1", "attempt": "1", "code": "E_QUALIFICATION_INCOMPLETE",
+                         "eight_pass_verified": False, "step_outcomes": states}
+              def transcript(statuses):
+                  rows = [status + " [   1.000s] (" + str(i + 1) + "/8) zeroclaw-hardware " + name
+                          for i, (name, status) in enumerate(zip(DIAGNOSTIC_NAMES, statuses))]
+                  text = ["------------", "Nextest run ID 00000000-0000-0000-0000-000000000000 with nextest profile: default",
+                          "Starting 8 tests across 1 binary (2 tests skipped)", *rows, "------------"]
+                  summary = str(statuses.count("PASS")) + " passed, "
+                  for status, label in [("FAIL", "failed"), ("XFAIL", "exec failed"), ("TIMEOUT", "timed out")]:
+                      if status in statuses:
+                          summary += str(statuses.count(status)) + " " + label + ", "
+                  text += ["Summary [   8.000s] 8 tests run: " + summary + "2 skipped"]
+                  text += [row for row, status in zip(rows, statuses) if status != "PASS"]
+                  text += ["error: test run failed"]
+                  return ("\n".join(text) + "\n").encode()
+              raw = transcript(["FAIL"] + ["PASS"] * 7)
+              def row(exit_code):
+                  return {"argv": RUN, "exit": exit_code, "elapsed_seconds": 1.0, "stdout_bytes": 0,
+                          "stderr_bytes": len(raw), "stdout_sha256": "a" * 64, "stderr_sha256": "b" * 64, "owned_job_empty": True}
+              def reader(decision, phase, read_fault=False):
+                  objects = {"source.json": src, "selection.json": sel, "platform.json": pdata,
+                             "named-failure-decision.json": decision, "test-commands.json": phase}
+                  seen = []
+                  def get(name, cap):
+                      seen.append(name)
+                      if read_fault and name == "named-failure-decision.json":
+                          raise OSError("synthetic")
+                      data = (json.dumps(objects[name], sort_keys=True) + "\n").encode()
+                      require(len(data) <= cap, "E_DIAGNOSTIC_SELFTEST")
+                      return data
+                  return get, seen
+              class MemoryWriter:
+                  def __init__(self, fault=None):
+                      self.data = b""; self.fault = fault; self.events = []
+                  def __enter__(self):
+                      return self
+                  def write(self, data):
+                      self.events.append("write"); self.data = data
+                      if self.fault == "write":
+                          raise OSError("synthetic")
+                      return len(data) - 1 if self.fault == "short" else len(data)
+                  def flush(self):
+                      self.events.append("flush")
+                      if self.fault == "flush":
+                          raise OSError("synthetic")
+                  def __exit__(self, kind, value, traceback):
+                      self.events.append("close")
+                      if self.fault == "close":
+                          raise OSError("synthetic")
+                      return False
+              checks = []
+              def case(name, ok):
+                  require(ok, "E_DIAGNOSTIC_SELFTEST")
+                  checks.append(name)
+              # Actual pure producer/state code, old refusal, and same receipt
+              # builder as main finally; no mock of the producer/final validator.
+              for fault in [None, "write", "short", "flush", "close"]:
+                  state = {"named_failure_committed": False}
+                  writer = MemoryWriter(fault)
+                  refused = False
+                  try:
+                      commit_named_failure((b"", raw), 1, ctx, state, lambda: writer)
+                      require(False, "E_COMMAND_EXIT")
+                  except Refusal as error:
+                      refused = str(error) == "E_COMMAND_EXIT"
+                  finally:
+                      phase = phase_receipt_payload("test", b, [row(1)], state)
+                  decision = json.loads(writer.data)
+                  get, seen = reader(decision, phase)
+                  diagnostic = optional_named_failure(get, b, states, RUN, LIST)
+                  candidate = bounded_failure_object(minimum, diagnostic)
+                  if fault is None:
+                      case("closed_write_positive", state["named_failure_committed"] is True
+                           and writer.events == ["write", "flush", "close"] and diagnostic is not None
+                           and candidate["eight_pass_verified"] is False and refused)
+                  else:
+                      case("DTO_" + fault + "_refuses", state["named_failure_committed"] is False
+                           and diagnostic is None and candidate == minimum and refused
+                           and "named-failure-decision.json" not in seen)
+              good = project_named_failure((b"", raw), 1, ctx)
+              phase = phase_receipt_payload("test", b, [row(1)], {"named_failure_committed": True})
+              case("positive_finite_DTO", good is not None)
+              # Exercise the existing phase serializer with an isolated
+              # in-memory Path-like writer, not an actual proof file.
+              class MemoryPath:
+                  def __init__(self, writer):
+                      self.writer = writer
+                  def open(self, mode):
+                      require(mode == "xb", "E_DIAGNOSTIC_SELFTEST")
+                      return self.writer
+              for marker in [False, True]:
+                  left = MemoryWriter("close")
+                  stored = phase_receipt_payload("test", b, [row(1)], {"named_failure_committed": marker})
+                  phase_fault = False
+                  try:
+                      put(MemoryPath(left), stored)
+                  except OSError:
+                      phase_fault = True
+                  readable = json.loads(left.data)
+                  get, _ = reader(good, readable)
+                  projected = optional_named_failure(get, b, states, RUN, LIST)
+                  case("phase_close_fault_" + str(marker), phase_fault
+                       and (projected is not None) == marker)
+              # True describes the earlier closed DTO, not carrier close.
+              get, _ = reader(good, None)
+              case("phase_receipt_absent", optional_named_failure(get, b, states, RUN, LIST) is None)
+              for name, bad in [
+                  ("unknown_payload_after_footer", raw + b"UNKNOWN\n"),
+                  ("unknown_payload_before_status", raw.replace(b"FAIL [", b"UNKNOWN\nFAIL [", 1)),
+                  ("truncated_footer", raw[:-1]),
+                  ("invalid_utf8", raw + b"\xff"),
+                  ("bare_CR", raw + b"\r"),
+                  ("escape", raw + b"\x1b"),
+                  ("duplicate_name", raw.replace(DIAGNOSTIC_NAMES[1].encode(), DIAGNOSTIC_NAMES[0].encode())),
+                  ("foreign_name", raw.replace(DIAGNOSTIC_NAMES[0].encode(), b"other::test")),
+                  ("missing_final_echo", raw[:raw.rfind(b"FAIL [")] + b"error: test run failed\n"),
+                  ("inconsistent_summary", raw.replace(b"7 passed", b"6 passed")),
+                  ("retry_variant", raw.replace(b"FAIL [", b"TRY 2 FAIL [", 1)),
+                  ("unknown_footer", raw.replace(b"error: test run failed", b"error: UNKNOWN")),
+              ]:
+                  case(name, project_named_failure((b"", bad), 1, ctx) is None)
+              case("nonempty_stdout", project_named_failure((b"UNKNOWN", raw), 1, ctx) is None)
+              case("ZERO_not_diagnostic", project_named_failure((b"", raw), 0, ctx) is None)
+              case("nonzero_eight_PASS_refuses", project_named_failure((b"", transcript(["PASS"] * 8)), 1, ctx) is None)
+              case("TIMEOUT_XFAIL_are_failures", project_named_failure((b"", transcript(["TIMEOUT", "XFAIL"] + ["PASS"] * 6)), 1, ctx) is not None)
+              for marker in [False, None, 0, 1, "true"]:
+                  changed = deepcopy(phase); changed["named_failure_committed"] = marker
+                  get, _ = reader(good, changed)
+                  case("marker_" + repr(marker), optional_named_failure(get, b, states, RUN, LIST) is None)
+              changed = deepcopy(phase); del changed["named_failure_committed"]
+              get, _ = reader(good, changed)
+              case("missing_marker", optional_named_failure(get, b, states, RUN, LIST) is None)
+              changed = deepcopy(phase); changed["binding"]["attempt"] = "2"
+              get, _ = reader(good, changed)
+              case("stale_phase", optional_named_failure(get, b, states, RUN, LIST) is None)
+              changed = deepcopy(good); changed["counts"]["passed"] = 6
+              get, _ = reader(changed, phase)
+              case("DTO_reverify_fault", optional_named_failure(get, b, states, RUN, LIST) is None)
+              get, _ = reader(good, phase, True)
+              case("DTO_read_fault", optional_named_failure(get, b, states, RUN, LIST) is None)
+              for label, mutate in [
+                  ("unknown_DTO_ready_bit", lambda d, p: d.update(ready=True)),
+                  ("duplicate_terminal", lambda d, p: d["terminal"].__setitem__(1, deepcopy(d["terminal"][0]))),
+                  ("bool_count", lambda d, p: d["counts"].__setitem__("passed", True)),
+                  ("source_association", lambda d, p: d["association"].__setitem__("source_tree", "0" * 40)),
+                  ("executable_association", lambda d, p: d["association"].__setitem__("selected_executable_sha256", "0" * 64)),
+                  ("RUN_exit_zero", lambda d, p: p["commands"][0].__setitem__("exit", 0)),
+                  ("RUN_owned_false", lambda d, p: p["commands"][0].__setitem__("owned_job_empty", False)),
+                  ("extra_RUN", lambda d, p: p["commands"].append(deepcopy(p["commands"][0]))),
+                  ("null_RUN_exit", lambda d, p: p["commands"][0].__setitem__("exit", None)),
+              ]:
+                  changed_d, changed_p = deepcopy(good), deepcopy(phase)
+                  mutate(changed_d, changed_p)
+                  get, _ = reader(changed_d, changed_p)
+                  case(label, optional_named_failure(get, b, states, RUN, LIST) is None)
+              get, _ = reader(good, phase)
+              case("skipped_prerequisite", optional_named_failure(get, b, {**states, "LIST_OUTCOME": "skipped"}, RUN, LIST) is None)
+              get, _ = reader(good, phase)
+              case("success_step_no_failure_diagnostic", optional_named_failure(get, b, {**states, "TEST_OUTCOME": "success"}, RUN, LIST) is None)
+              def duplicate_receipt(name, cap):
+                  if name == "test-commands.json":
+                      return b'{"binding":{},"named_failure_committed":true,"named_failure_committed":true,"commands":[]}'
+                  raise OSError("synthetic")
+              case("duplicate_JSON_key", optional_named_failure(duplicate_receipt, b, states, RUN, LIST) is None)
+              def oversized_receipt(name, cap):
+                  return b"x" * (cap + 1)
+              case("typed_receipt_cap", optional_named_failure(oversized_receipt, b, states, RUN, LIST) is None)
+              for phase_name in ["prepare", "setup", "list", "verify"]:
+                  stored = phase_receipt_payload(phase_name, b, [], None)
+                  case(phase_name + "_schema_unchanged", set(stored) == {"binding", "commands"})
+              success = phase_receipt_payload("test", b, [row(0)], {"named_failure_committed": False})
+              exported = public_command_phase(success, "test", b, [RUN])
+              case("private_marker_stripped", set(exported) == {"binding", "commands"} and success["named_failure_committed"] is False)
+              try:
+                  public_command_phase(phase, "test", b, [RUN])
+                  ok = False
+              except Refusal:
+                  ok = True
+              case("success_reader_rejects_nonzero_true", ok)
+              get, _ = reader(good, phase)
+              diagnostic = optional_named_failure(get, b, states, RUN, LIST)
+              case("nested_and_whole_cap", len((json.dumps(bounded_failure_object(minimum, diagnostic), sort_keys=True) + "\n").encode()) <= 4096)
+              case("whole_cap_fallback", bounded_failure_object({**minimum, "padding": "x" * 4090}, diagnostic).get("diagnostic") is None)
+              case("proof_globals_unchanged", saved == (tuple(COMMANDS), tuple(EXPECTED), EXPECTED_PARENT, DEADLINE))
+              # These are synthetic parser/IO/state checks, not the eight native tests.
+              for name in checks:
+                  print("PR11364_SYNTHETIC_PASS " + name)
+              print("PR11364_SYNTHETIC_COUNT " + str(len(checks)))
+
           def binding():
               require(os.name == "nt" and platform.machine() == "AMD64", "E_PLATFORM")
               for key in ["GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT"]:
@@ -154,7 +754,8 @@ jobs:
           # Windows 10+ JOB_LIST assigns membership atomically in CreateProcess.
           # Only lifetime/handle ownership is controlled: no CPU, memory, priority,
           # affinity, feature, concurrency or production timeout override.
-          def execute(argv, seconds, caps):
+          def execute(argv, seconds, caps, *, named_failure_context=None,
+                      named_failure_state=None, named_failure_writer=None):
               k = c.WinDLL("kernel32", use_last_error=True)
               H, D, P, Z = w.HANDLE, w.DWORD, c.c_void_p, c.c_size_t
               class SA(c.Structure):
@@ -342,6 +943,10 @@ jobs:
                                   f.write(data[index])
                       require(not cleanup_fault, "E_CLEANUP_INCOMPLETE")
               require(cleanup_ok and accepted_data == complete_capture(), "E_CAPTURE_INCOMPLETE")
+              if (argv == RUN and rc_value != 0 and named_failure_context is not None
+                      and named_failure_state is not None and named_failure_writer is not None):
+                  commit_named_failure(tuple(accepted_data), rc_value, named_failure_context,
+                                       named_failure_state, named_failure_writer)
               require(rc_value == 0, "E_COMMAND_EXIT")
               return accepted_data
 
@@ -462,22 +1067,20 @@ jobs:
 
           def command_receipt(phase):
               value = load(root() / "private" / (phase + "-commands.json"))
-              require(set(value) == {"binding", "commands"} and value["binding"] == binding() and type(value["commands"]) is list and len(value["commands"]) <= 64, "E_COMMAND_SCHEMA")
               allowed = [LIST, RUN, ["rustc", "-vV"], ["cargo", "-V"], ["cargo", "nextest", "-V"]]
               for args in [["rev-list", "--parents", "-n", "1", "HEAD"], ["diff-tree", "--no-commit-id", "--name-status", "-r", ANCESTOR, "HEAD"], ["status", "--porcelain=v1", "--untracked-files=all"], ["rev-parse", "HEAD:" + ARDUINO], ["rev-parse", "HEAD^{tree}"]]:
                   allowed.append(["git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=NUL", "-c", "core.attributesFile=NUL", *args])
-              for row in value["commands"]:
-                  require(set(row) == {"argv", "exit", "elapsed_seconds", "stdout_bytes", "stderr_bytes", "stdout_sha256", "stderr_sha256", "owned_job_empty"} and row["argv"] in allowed and type(row["exit"]) is int and row["exit"] == 0 and row["owned_job_empty"] is True, "E_COMMAND_SCHEMA")
-                  require(type(row["elapsed_seconds"]) in [int, float] and 0 <= row["elapsed_seconds"] <= 2705 and all(type(row[x]) is int and 0 <= row[x] <= 16777216 for x in ["stdout_bytes", "stderr_bytes"]) and all(HEX.fullmatch(row[x]) for x in ["stdout_sha256", "stderr_sha256"]), "E_COMMAND_SCHEMA")
-              return value
+              return public_command_phase(value, phase, binding(), allowed)
 
           def main(phase):
+              named_failure_state = {"named_failure_committed": False} if phase == "test" else None
               global DEADLINE
               DEADLINE = time.monotonic() + {"prepare": 100, "setup": 100, "list": 2690, "test": 290, "verify": 100}[phase]
               os.environ.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="NUL", GIT_CONFIG_SYSTEM="NUL", GIT_ATTR_NOSYSTEM="1", GIT_TERMINAL_PROMPT="0")
               r = root()
               try:
                   if phase == "prepare":
+                      diagnostic_selftests()
                       r.mkdir(); (r / "private").mkdir()
                       shutil.copyfile(__file__, r / "harness.py")
                       put(r / "private/source.json", source())
@@ -528,12 +1131,17 @@ jobs:
                       (r / "private/build.log").write_bytes(err)
                       put(r / "private/selection.json", selection())
                   elif phase == "test":
-                      require(source() == load(r / "private/source.json"), "E_SOURCE_DRIFT")
-                      platform_receipt()
-                      require(selection() == load(r / "private/selection.json"), "E_SELECTION_DRIFT")
+                      src = source()
+                      require(src == load(r / "private/source.json"), "E_SOURCE_DRIFT")
+                      pdata = platform_receipt()
+                      selected = selection()
+                      require(selected == load(r / "private/selection.json"), "E_SELECTION_DRIFT")
                       # Two pipes are merged only after bounded capture. Nextest's
                       # human reporter is stderr; stdout must be empty on success.
-                      out, err = execute(RUN, 300, (2097152, 2097152))
+                      out, err = execute(RUN, 300, (2097152, 2097152),
+                                         named_failure_context=diagnostic_context(src, selected, pdata),
+                                         named_failure_state=named_failure_state,
+                                         named_failure_writer=lambda: (r / "private/named-failure-decision.json").open("xb"))
                       require(not out and len(err) <= 2097152, "E_TEST_STDOUT")
                       (r / "private/test.log").write_bytes(err.replace(b"\r\n", b"\n"))
                       require(selection() == load(r / "private/selection.json"), "E_BINARY_DRIFT")
@@ -571,7 +1179,8 @@ jobs:
                   raise SystemExit(1)
               finally:
                   if (r / "private").is_dir():
-                      put(r / "private" / (phase + "-commands.json"), {"binding": binding(), "commands": COMMANDS})
+                      put(r / "private" / (phase + "-commands.json"),
+                          phase_receipt_payload(phase, binding(), COMMANDS, named_failure_state))
 
           if __name__ == "__main__":
               main(sys.argv[1] if len(sys.argv) == 2 else "prepare")
@@ -644,6 +1253,206 @@ jobs:
         run: |
           import json, os, re, runpy, sys
           from pathlib import Path
+          def validated_named_failure(decision, phase, src, selected, platform_data, expected_binding, states, run_argv, list_argv):
+              # Defined independently in the finalizer; Prepare has identical bytes for
+              # isolated synthetic tests. No harness import, command or raw capture read.
+              try:
+                  def check(ok):
+                      if not ok:
+                          raise ValueError("E_NAMED_DIAGNOSTIC")
+                  def obj(value, keys):
+                      check(type(value) is dict and set(value) == set(keys))
+                  def integer(value, low, high):
+                      check(type(value) is int and low <= value <= high)
+                  def sha(value, length):
+                      check(type(value) is str and re.fullmatch(r"[0-9a-f]{" + str(length) + "}", value) is not None)
+                  names = (
+                      "peripherals::arduino_upload::tests::fake_cli_success_runs_all_stages_and_cleans_workspace",
+                      "peripherals::arduino_upload::tests::compile_failure_reports_stderr_and_cleans_workspace",
+                      "peripherals::arduino_upload::tests::failed_preflight_does_not_compile_or_upload",
+                      "peripherals::arduino_upload::tests::non_not_found_spawn_error_keeps_its_cause",
+                      "peripherals::arduino_upload::tests::compile_timeout_kills_reaps_and_cleans_workspace",
+                      "peripherals::arduino_upload::tests::preflight_timeout_reports_its_stage",
+                      "peripherals::arduino_upload::tests::upload_timeout_reports_its_stage_and_cleans_workspace",
+                      "peripherals::arduino_upload::tests::upload_failure_reports_stderr_and_cleans_workspace",
+                  )
+                  body_hashes = (
+                      "62b62dfa8bc12e71ec3b3b619a4345e4eeea4a42f15cf5d7845efffde66cc617",
+                      "db0ac02938f9a8c42bf8c43ffad607a7d39ee5e12a1598dc89e97b0625e8d919",
+                      "00e027eb758c1a368438d7bfdf3caccc49e2f8d7563e9e0e4897c9e0fcbf8d01",
+                      "bc5b7e764405431f8716836e30b8656ce61675b87ec9ae46db4b9d58de7d9bae",
+                      "19bdda3fd1d53f31dc640225cbc93c9ff5a20526f48bf217b0266488dfb2d6d3",
+                      "95d3424e1e34de1698ae1e4e6c4012c9f0bfed861323793d521356e6cadd8440",
+                      "9a606dc331ea2dcc999d80b83cab543f6b89136b58521dd6f46558c628d5bdb5",
+                      "304b88c801345474c8d39e4f01cf8ea9b4d511078db855d1b8c9747250185b3e",
+                  )
+                  parent = "de4e14f4ca752b34804911e293d018095969d76f"
+                  arduino = "crates/zeroclaw-hardware/src/peripherals/arduino_upload.rs"
+                  workflow = ".github/workflows/qualify-pr11364-arduino-eight-windows.yml"
+                  binding_keys = ["head", "base", "merge", "workflow", "repository", "pr", "run_id", "attempt"]
+                  obj(expected_binding, binding_keys)
+                  for key in binding_keys[:4]:
+                      sha(expected_binding[key], 40)
+                  check(expected_binding["repository"] == "zeroclaw-labs/zeroclaw")
+                  check(type(expected_binding["pr"]) is int and expected_binding["pr"] == 11364)
+                  for key in ["run_id", "attempt"]:
+                      check(type(expected_binding[key]) is str and re.fullmatch(r"[1-9][0-9]{0,19}", expected_binding[key]) is not None)
+                  step_keys = ["PREPARE_OUTCOME", "TOOLCHAIN_OUTCOME", "CACHE_OUTCOME", "SETUP_OUTCOME", "LIST_OUTCOME", "TEST_OUTCOME"]
+                  obj(states, step_keys)
+                  check(all(states[key] == "success" for key in step_keys[:-1]) and states["TEST_OUTCOME"] == "failure")
+                  obj(phase, ["binding", "commands", "named_failure_committed"])
+                  check(phase["binding"] == expected_binding and phase["named_failure_committed"] is True)
+                  obj(src, ["binding", "tree", "parents", "file_sha256", "arduino_blob", "body_hash_basis", "body_sha256", "merge_base_workflow_fields"])
+                  check(src["binding"] == expected_binding and src["parents"] == [parent])
+                  sha(src["tree"], 40)
+                  check(src["arduino_blob"] == "028627cb1907b9aace3cec9f6bb9a9e7200702cb")
+                  check(src["body_sha256"] == dict(zip(names, body_hashes)))
+                  check(src["body_hash_basis"] == "Pinned inventory bound by complete unchanged Arduino bytes, not a new Rust AST extraction")
+                  check(src["merge_base_workflow_fields"] == "Official event descriptors, distinct from the explicitly checked-out head")
+                  hashes = src["file_sha256"]
+                  obj(hashes, [arduino, workflow, "Cargo.lock", "Cargo.toml", "crates/zeroclaw-hardware/Cargo.toml"])
+                  expected_hashes = {
+                      arduino: "56d246bdd3103249d6b8b7eba9294e40ebd025e3d716d3b8eb8424d9435323dc",
+                      "Cargo.lock": "4294db86b3307b07bfb67f1c10b3bd686069c6b2b2dbfae39af54c58846410ad",
+                      "Cargo.toml": "4c955ec6672a3a255f4962a21c821e468e89424cd9b4937660f0f40a898745ba",
+                      "crates/zeroclaw-hardware/Cargo.toml": "7f8d1fd77e33cff1deb4b2fc81d8e8eec485bf0d78b1a36ef7dfba09b5fcf466",
+                  }
+                  check(all(hashes[key] == value for key, value in expected_hashes.items()))
+                  sha(hashes[workflow], 64)
+                  obj(selected, ["binding", "selected", "selected_ignored", "excluded_before_run", "excluded_reasons", "list_sha256", "executable"])
+                  check(selected["binding"] == expected_binding and selected["selected"] == sorted(names))
+                  integer(selected["selected_ignored"], 0, 0)
+                  integer(selected["excluded_before_run"], 0, 2097152)
+                  obj(selected["excluded_reasons"], ["expression", "ignored"])
+                  for value in selected["excluded_reasons"].values():
+                      integer(value, 0, 2097152)
+                  check(sum(selected["excluded_reasons"].values()) == selected["excluded_before_run"])
+                  sha(selected["list_sha256"], 64)
+                  executable = selected["executable"]
+                  obj(executable, ["sha256", "bytes", "relative_path"])
+                  sha(executable["sha256"], 64)
+                  integer(executable["bytes"], 1, 268435456)
+                  check(type(executable["relative_path"]) is str and re.fullmatch(r"target/(?:x86_64-pc-windows-msvc/)?debug/deps/zeroclaw_hardware-[0-9a-f]{16}\.exe", executable["relative_path"]) is not None)
+                  obj(platform_data, ["binding", "runner_label", "image", "compiler", "cargo", "nextest", "nextest_executable_sha256", "cache"])
+                  check(platform_data["binding"] == expected_binding and platform_data["runner_label"] == "windows-latest")
+                  obj(platform_data["image"], ["ImageOS", "ImageVersion", "RUNNER_OS", "RUNNER_ARCH"])
+                  check(all(type(x) is str and re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", x) is not None for x in platform_data["image"].values()))
+                  check(platform_data["image"]["RUNNER_OS"] == "Windows" and platform_data["image"]["RUNNER_ARCH"] == "X64")
+                  check(re.fullmatch(r"rustc 1\.98\.0 \([0-9a-f]{7,40} [0-9]{4}-[0-9]{2}-[0-9]{2}\)\nbinary: rustc\ncommit-hash: [0-9a-f]{40}\ncommit-date: [0-9]{4}-[0-9]{2}-[0-9]{2}\nhost: x86_64-pc-windows-msvc\nrelease: 1\.98\.0\nLLVM version: [0-9.]+", platform_data["compiler"]) is not None)
+                  check(re.fullmatch(r"cargo 1\.98\.0 \([0-9a-f]{7,40} [0-9]{4}-[0-9]{2}-[0-9]{2}\)", platform_data["cargo"]) is not None)
+                  check(re.fullmatch(r"cargo-nextest 0\.9\.143(?: \([0-9a-f]{7,40} [0-9]{4}-[0-9]{2}-[0-9]{2}\))?", platform_data["nextest"]) is not None)
+                  sha(platform_data["nextest_executable_sha256"], 64)
+                  cache = platform_data["cache"]
+                  obj(cache, ["action", "shared_key", "save", "exact_match_output", "key_and_restore_source"])
+                  check(cache["action"] == "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6" and cache["shared_key"] == "platform-test" and cache["save"] is False and cache["exact_match_output"] in ["true", "false"])
+                  check(cache["key_and_restore_source"] == "Independent official Restore-only Rust cache step log readback required; false alone does not distinguish fallback from miss")
+                  allowed = [run_argv, list_argv, ["rustc", "-vV"], ["cargo", "-V"], ["cargo", "nextest", "-V"]]
+                  for args in [["rev-list", "--parents", "-n", "1", "HEAD"], ["diff-tree", "--no-commit-id", "--name-status", "-r", "6b98ff79ba9c7a0b3246e1c2398626f8a652c25e", "HEAD"], ["status", "--porcelain=v1", "--untracked-files=all"], ["rev-parse", "HEAD:" + arduino], ["rev-parse", "HEAD^{tree}"]]:
+                      allowed.append(["git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=NUL", "-c", "core.attributesFile=NUL", *args])
+                  check(type(phase["commands"]) is list and len(phase["commands"]) <= 64)
+                  runs = []
+                  for row in phase["commands"]:
+                      obj(row, ["argv", "exit", "elapsed_seconds", "stdout_bytes", "stderr_bytes", "stdout_sha256", "stderr_sha256", "owned_job_empty"])
+                      check(row["argv"] in allowed and row["owned_job_empty"] is True)
+                      check(type(row["elapsed_seconds"]) in [int, float] and 0 <= row["elapsed_seconds"] <= 2705)
+                      for key in ["stdout_bytes", "stderr_bytes"]:
+                          integer(row[key], 0, 16777216)
+                      for key in ["stdout_sha256", "stderr_sha256"]:
+                          sha(row[key], 64)
+                      if row["argv"] == run_argv:
+                          integer(row["exit"], 1, 4294967295)
+                          check(row["stdout_bytes"] == 0 and row["stderr_bytes"] <= 2097152)
+                          runs.append(row)
+                      else:
+                          integer(row["exit"], 0, 0)
+                  check(len(runs) == 1)
+                  obj(decision, ["schema", "kind", "binding", "association", "selection", "capture", "reporter", "exit_class", "terminal", "final_echo_ordinals", "counts"])
+                  integer(decision["schema"], 1, 1)
+                  check(decision["kind"] == "EXACT_RUN_COMPLETE_NAMED_FAILURE" and decision["binding"] == expected_binding and decision["exit_class"] == "NONZERO")
+                  check(len((json.dumps(decision, sort_keys=True) + "\n").encode()) <= 16384)
+                  assoc = decision["association"]
+                  obj(assoc, ["source_tree", "expected_parent", "arduino_blob", "selected_executable_sha256", "selected_executable_bytes", "nextest_executable_sha256"])
+                  check(assoc == {"source_tree": src["tree"], "expected_parent": parent, "arduino_blob": src["arduino_blob"],
+                                  "selected_executable_sha256": executable["sha256"], "selected_executable_bytes": executable["bytes"],
+                                  "nextest_executable_sha256": platform_data["nextest_executable_sha256"]})
+                  integer(assoc["selected_executable_bytes"], 1, 268435456)
+                  dsel = decision["selection"]
+                  obj(dsel, ["selected", "selected_ignored", "binary_id", "excluded_before_run"])
+                  check(dsel["selected"] == list(names) and dsel["binary_id"] == "zeroclaw-hardware")
+                  integer(dsel["selected_ignored"], 0, 0)
+                  integer(dsel["excluded_before_run"], 0, 2097152)
+                  check(dsel["excluded_before_run"] == selected["excluded_before_run"])
+                  obj(decision["capture"], ["complete", "closed_owned_job_and_pipes", "cleanup_validated", "stdout_empty", "exact_RUN"])
+                  check(all(x is True for x in decision["capture"].values()))
+                  reporter = decision["reporter"]
+                  obj(reporter, ["version", "profile", "status_level", "final_status_level", "failure_output", "success_output", "retries", "nextest_run_id", "summary_complete", "final_echoes_complete", "footer"])
+                  check(all(reporter[key] == value for key, value in {"version": "0.9.143", "profile": "default", "status_level": "pass", "final_status_level": "fail", "failure_output": "never", "success_output": "never", "footer": "TEST_RUN_FAILED"}.items()))
+                  integer(reporter["retries"], 0, 0)
+                  check(reporter["summary_complete"] is True and reporter["final_echoes_complete"] is True)
+                  check(type(reporter["nextest_run_id"]) is str and re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", reporter["nextest_run_id"]) is not None)
+                  terminal = decision["terminal"]
+                  check(type(terminal) is list and len(terminal) == 8)
+                  by_name, ordinals = {}, []
+                  for row in terminal:
+                      obj(row, ["ordinal", "name", "status"])
+                      integer(row["ordinal"], 1, 8)
+                      check(row["name"] in names and row["name"] not in by_name and row["status"] in ["PASS", "FAIL", "TIMEOUT", "XFAIL"])
+                      by_name[row["name"]] = row["status"]; ordinals.append(row["ordinal"])
+                  check(set(by_name) == set(names) and sorted(ordinals) == list(range(1, 9)))
+                  failed_ordinals = sorted(row["ordinal"] for row in terminal if row["status"] != "PASS")
+                  check(failed_ordinals and type(decision["final_echo_ordinals"]) is list
+                        and all(type(x) is int for x in decision["final_echo_ordinals"])
+                        and decision["final_echo_ordinals"] == failed_ordinals)
+                  counts = decision["counts"]
+                  obj(counts, ["run", "passed", "failed", "timed_out", "exec_failed", "selected_skipped", "excluded_before_run"])
+                  for key in ["run", "passed", "failed", "timed_out", "exec_failed", "selected_skipped"]:
+                      integer(counts[key], 0, 8)
+                  integer(counts["excluded_before_run"], 0, 2097152)
+                  check(counts == {"run": 8, "passed": sum(x == "PASS" for x in by_name.values()),
+                                   "failed": sum(x == "FAIL" for x in by_name.values()),
+                                   "timed_out": sum(x == "TIMEOUT" for x in by_name.values()),
+                                   "exec_failed": sum(x == "XFAIL" for x in by_name.values()),
+                                   "selected_skipped": 0, "excluded_before_run": selected["excluded_before_run"]})
+                  result = {"schema": 1, "kind": "EXACT_EIGHT_TERMINAL_RESULTS", "exit_class": "NONZERO",
+                            "results": [{"name": name, "status": by_name[name]} for name in names], "counts": dict(counts)}
+                  check(len((json.dumps(result, sort_keys=True) + "\n").encode()) <= 4096)
+                  return result
+              except Exception:
+                  return None
+
+          def bounded_failure_object(minimum, diagnostic):
+              # This pure composition is used in the separate finalizer and synthetic tests.
+              if diagnostic is not None:
+                  candidate = {**minimum, "diagnostic": diagnostic}
+                  if len((json.dumps(candidate, sort_keys=True) + "\n").encode()) <= 4096:
+                      return candidate
+              return minimum
+          def optional_named_failure(read_receipt, expected_binding, states, run_argv, list_argv):
+              # Only fixed typed receipts; read_receipt cannot be used for raw captures.
+              try:
+                  def unique(items):
+                      value = {}
+                      for key, item in items:
+                          if key in value:
+                              raise ValueError("E_JSON_DUPLICATE")
+                          value[key] = item
+                      return value
+                  def typed(name, cap):
+                      data = read_receipt(name, cap)
+                      if type(data) is not bytes or len(data) > cap:
+                          raise ValueError("E_FILE_CAP")
+                      return json.loads(data.decode("utf-8"), object_pairs_hook=unique)
+                  phase = typed("test-commands.json", 65536)
+                  if (type(phase) is not dict or set(phase) != {"binding", "commands", "named_failure_committed"}
+                          or phase["binding"] != expected_binding or phase["named_failure_committed"] is not True):
+                      return None
+                  return validated_named_failure(
+                      typed("named-failure-decision.json", 16384), phase,
+                      typed("source.json", 65536), typed("selection.json", 65536),
+                      typed("platform.json", 65536), expected_binding, states, run_argv, list_argv)
+              except Exception:
+                  return None
+
           run, attempt = os.environ["GITHUB_RUN_ID"], os.environ["GITHUB_RUN_ATTEMPT"]
           assert re.fullmatch(r"[1-9][0-9]{0,19}", run) and re.fullmatch(r"[1-9][0-9]{0,19}", attempt)
           r = Path(os.environ["RUNNER_TEMP"]) / ("pr11364-eight-" + run + "-" + attempt)
@@ -663,8 +1472,37 @@ jobs:
               states = {key: os.environ[key] for key in keys}
               assert all(x in ["success", "failure", "skipped", "cancelled", ""] for x in states.values())
               value["step_outcomes"] = states
-              # Refused, capped, incomplete and private raw captures are never
-              # read here. Failure export has only fixed safe fields and states.
+              # Read only fixed typed receipts; never raw captures or prefixes.
+              def typed_receipt_bytes(name, cap):
+                  path = r / "private" / name
+                  if not path.is_file() or path.is_symlink():
+                      raise ValueError("E_FILE_TYPE")
+                  with path.open("rb") as stream:
+                      data = stream.read(cap + 1)
+                  if len(data) > cap:
+                      raise ValueError("E_FILE_CAP")
+                  return data
+              diagnostic = None
+              try:
+                  if (os.environ["GITHUB_EVENT_NAME"] == "pull_request"
+                          and os.environ["PROOF_REPO"] == "zeroclaw-labs/zeroclaw"
+                          and os.environ["PROOF_NUMBER"] == "11364"
+                          and os.environ["PROOF_TOPIC"] == "test/hardware-windows-fake-arduino-cli"
+                          and not any(os.environ.get(key) for key in ["NEXTEST_PROFILE", "NEXTEST_TEST_THREADS", "CARGO_BUILD_JOBS"])):
+                      expected_binding = {key: os.environ["PROOF_" + key.upper()]
+                                          for key in ["head", "base", "merge", "workflow"]}
+                      expected_binding.update(repository="zeroclaw-labs/zeroclaw", pr=11364, run_id=run, attempt=attempt)
+                      common = ["--locked", "-p", "zeroclaw-hardware", "--features", "hardware",
+                                "--lib", "-E", "test(/^peripherals::arduino_upload::tests::/)"]
+                      expected_run = ["cargo", "nextest", "run", *common, "--no-fail-fast", "--no-tests",
+                                      "fail", "--retries", "0", "--status-level", "pass",
+                                      "--final-status-level", "fail", "--color", "never",
+                                      "--failure-output", "never", "--success-output", "never"]
+                      expected_list = ["cargo", "nextest", "list", *common, "--message-format", "json"]
+                      diagnostic = optional_named_failure(typed_receipt_bytes, expected_binding, states, expected_run, expected_list)
+              except Exception:
+                  pass
+              value = bounded_failure_object(value, diagnostic)
               data = (json.dumps(value, sort_keys=True) + "\n").encode()
               assert len(data) <= 4096
               with (safe / "failure.json").open("xb") as f:
