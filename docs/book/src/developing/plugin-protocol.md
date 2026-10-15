@@ -1060,5 +1060,7 @@ rename that refuses every existing destination, including an empty directory.
 Where the platform or filesystem cannot provide it (other Unix platforms such
 as FreeBSD, an NFS mount without no-replace support, or Linux before 3.15),
 installation and recovery refuse the move. A failed claim leaves the final
-entry unmoved; a failed publication or restoration retains the package in its
-hidden transaction and reports that path. No plain replacing rename is used.
+entry unmoved. An install refused this way removes the copy it staged and
+says the move is unsupported; any other failed publication, and a failed
+restoration, retains the package in its hidden transaction and reports that
+path. No plain replacing rename is used.

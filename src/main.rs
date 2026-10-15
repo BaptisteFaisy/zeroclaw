@@ -5636,8 +5636,8 @@ fn report_seeded_plugin_config_entries(
 /// interrupted install by an older build left half-written. `plugin remove`
 /// deletes such a directory when it is empty, or when it holds only what an
 /// install writes and admission rejects its own contents. A staged copy the
-/// install kept, and a namespace change, get their own messages; every other
-/// error passes through unchanged.
+/// install kept, a move the platform cannot make safely, and a namespace
+/// change get their own messages; every other error passes through unchanged.
 #[cfg(feature = "plugins-wasm")]
 fn with_unadmitted_package_remedy(error: zeroclaw::plugins::error::PluginError) -> anyhow::Error {
     // Install keeps its staged copy when it cannot publish it. A later
@@ -5648,6 +5648,17 @@ fn with_unadmitted_package_remedy(error: zeroclaw::plugins::error::PluginError) 
             &[("path", path.as_str()), ("reason", reason.as_str())],
             format!(
                 "Install could not publish the package and kept the staged copy at {path}: {reason}. Resolve the occupied name or filesystem error, then run the install again."
+            ),
+        ));
+    }
+    // Without a rename that refuses an existing destination no install can
+    // publish here: install cleared its stage, and a retry would fail alike.
+    if let zeroclaw::plugins::error::PluginError::MoveUnsupported(reason) = &error {
+        return anyhow::Error::msg(ta(
+            "cli-plugin-install-move-unsupported",
+            &[("reason", reason.as_str())],
+            format!(
+                "Install needs a rename that refuses an existing destination, and this platform or filesystem has none ({reason}). Nothing was installed and no staged copy was kept. FreeBSD and the other Unix systems besides Linux, Android and macOS, NFS mounts, and Linux before 3.15 lack such a rename; on Linux or macOS, keep the plugins directory on a local filesystem."
             ),
         ));
     }
@@ -24583,6 +24594,25 @@ maxLength = 1
             "{rendered}"
         );
         assert!(!rendered.contains("plugin remove"), "{rendered}");
+    }
+
+    /// An install refused for want of a no-replace rename kept nothing, so it
+    /// names the platforms that lack one and never says to install again.
+    #[test]
+    #[cfg(feature = "plugins-wasm")]
+    fn an_unsupported_install_move_names_the_platforms_and_no_retry() {
+        let error = zeroclaw::plugins::error::PluginError::MoveUnsupported(
+            "atomic no-replace package move unavailable".into(),
+        );
+        let rendered = with_unadmitted_package_remedy(error).to_string();
+        assert!(
+            rendered.contains("atomic no-replace package move unavailable")
+                && rendered.contains("Nothing was installed")
+                && rendered.contains("FreeBSD")
+                && rendered.contains("NFS"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("run the install again"), "{rendered}");
     }
 
     /// REGRESSION (unsupported beta config): removing a pre-typed plugin leaves

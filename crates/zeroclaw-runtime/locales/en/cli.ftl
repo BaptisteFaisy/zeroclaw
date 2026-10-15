@@ -936,6 +936,7 @@ cli-plugin-install-verify-bypassed = note: skipping the install-time load check 
 cli-plugin-install-unadmitted-package = install failed: '{$name}' already exists in the plugins directory but is not an installed package, and install never overwrites it. If an interrupted install left it behind, delete it with `zeroclaw plugin remove {$name}`, then install again.
 cli-plugin-remove-unadmitted-package = `zeroclaw plugin remove` left '{$name}' in place: {$reason}. It deletes a directory the host has not loaded only when the directory is empty, or when it holds only what an install writes and admission rejects its own contents rather than its signature; delete '{$name}' by hand if it should go.
 cli-plugin-install-retained = Install could not publish the package and kept the staged copy at {$path}: {$reason}. Resolve the occupied name or filesystem error, then run the install again.
+cli-plugin-install-move-unsupported = Install needs a rename that refuses an existing destination, and this platform or filesystem has none ({$reason}). Nothing was installed and no staged copy was kept. FreeBSD and the other Unix systems besides Linux, Android and macOS, NFS mounts, and Linux before 3.15 lack such a rename; on Linux or macOS, keep the plugins directory on a local filesystem.
 cli-plugin-recovery-retained = Recovery retained files at {$path}: {$reason}. Resolve the occupied destination or filesystem error, then retry plugin remove.
 cli-plugin-staging-retained = Retained staging at {$path} because its ownership could not be proved abandoned. The recovered package can be installed again using fresh staging.
 cli-plugin-namespace-changed = Plugin operation refused because filesystem ownership changed: {$reason}. Inspect the plugins directory before retrying.
@@ -1434,6 +1435,7 @@ cli-approval-prompt = { "   " }[Y]es / [N]o / [A]lways for {$tool}:{ " " }
 # always) stay hardcoded ASCII in Rust — only the surrounding prose is
 # localized here.
 channel-approval-heading = Tool approval required
+channel-approval-independent-delegate = Independent delegate {$target} from {$caller}
 channel-approval-heading-shout = APPROVAL REQUIRED
 channel-approval-tool-label = Tool
 channel-approval-args-label = Args
