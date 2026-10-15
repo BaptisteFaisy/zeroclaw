@@ -414,7 +414,11 @@ fn register_builtin_tool(
     constructor: impl FnOnce() -> Arc<dyn Tool>,
 ) {
     if select_declared_builtin_tool(selection, reserved_host_names, name) {
+        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+        late_tool_search_observer::record("constructor-enter", name, 0, 0);
         registry.push(constructor());
+        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+        late_tool_search_observer::record("constructor-return", name, 0, 0);
     }
 }
 
@@ -552,7 +556,6 @@ pub(crate) fn register_skill_tools_with_context_and_runtime_optional_nat64(
         return;
     }
 
-    let before = tools_registry.len();
     let policy = Arc::clone(&security);
     let skill_tools = crate::skills::skills_to_tools_with_context_and_runtime_optional_nat64(
         skills,
@@ -565,15 +568,45 @@ pub(crate) fn register_skill_tools_with_context_and_runtime_optional_nat64(
         .iter()
         .map(|t| t.name().to_string())
         .collect();
+    register_prepared_skill_tools(
+        skill_tools,
+        &existing_names,
+        skills,
+        &policy,
+        |tool| tool.name(),
+        |tool| tools_registry.push(tool),
+    );
+}
+
+/// Apply the same fixed pre-batch snapshot to ordinary or prepared skills.
+/// This never admits a new name into the snapshot while iterating the batch.
+pub(crate) fn register_prepared_skill_tools<T>(
+    skill_tools: Vec<T>,
+    existing_names: &std::collections::HashSet<String>,
+    skills: &[crate::skills::Skill],
+    policy: &SecurityPolicy,
+    name: impl Fn(&T) -> &str,
+    mut register: impl FnMut(T),
+) {
+    #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+    late_tool_search_observer::record(
+        "skill-snapshot",
+        "batch",
+        existing_names.len(),
+        skill_tools.len(),
+    );
+    let mut registered = 0;
     for tool in skill_tools {
-        if existing_names.contains(tool.name()) {
+        if existing_names.contains(name(&tool)) {
+            #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+            late_tool_search_observer::record("skill-decision", "duplicate", 0, 0);
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                 &format!(
                     "Skill tool '{}' shadows built-in tool, skipping",
-                    tool.name()
+                    name(&tool)
                 )
             );
         } else if policy
@@ -581,28 +614,34 @@ pub(crate) fn register_skill_tools_with_context_and_runtime_optional_nat64(
             .as_ref()
             .is_some_and(|list| list.is_empty())
         {
+            #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+            late_tool_search_observer::record("skill-decision", "deny-all", 0, 0);
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
                 &format!(
                     "Skill tool '{}' denied by empty allowed_tools (deny-all), skipping",
-                    tool.name()
+                    name(&tool)
                 )
             );
-        } else if policy.is_tool_excluded(tool.name()) {
+        } else if policy.is_tool_excluded(name(&tool)) {
+            #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+            late_tool_search_observer::record("skill-decision", "excluded", 0, 0);
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
                 &format!(
                     "Skill tool '{}' denied by excluded_tools, skipping",
-                    tool.name()
+                    name(&tool)
                 )
             );
         } else {
-            tools_registry.push(tool);
+            #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+            late_tool_search_observer::record("skill-decision", "register", 0, 0);
+            register(tool);
+            registered += 1;
         }
     }
-    let registered = tools_registry.len() - before;
 
     ::zeroclaw_log::record!(
         INFO,
@@ -1221,7 +1260,11 @@ pub(crate) fn all_tools_with_runtime_context(
     execution_capability: Option<AgentExecutionCapability>,
     acp_sessions: Option<AcpSessionReadView>,
 ) -> anyhow::Result<AllToolsResult> {
+    #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+    let late_trace = late_tool_search_observer::capture();
     let builder = move || {
+        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+        let _late_guard = late_tool_search_observer::enter_builder(late_trace);
         // Warm the lazy regexes BEFORE the registry build and BEFORE any
         // turn can start: LazyLock runs the initializer on whichever thread
         // reaches it first, so a turn racing an un-joined warmup would
@@ -2810,6 +2853,8 @@ fn all_tools_with_runtime_on_thread(
 
     // Knowledge graph tool
     if root_config.knowledge.enabled && select_tool!("knowledge") {
+        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+        late_tool_search_observer::record("knowledge-open", "actual", 0, 0);
         let db_path = root_config.knowledge.resolved_db_path();
         match zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
             &db_path,
@@ -2852,6 +2897,15 @@ fn all_tools_with_runtime_on_thread(
                 .map(|(name, cfg)| (name.clone(), cfg.clone()))
                 .collect();
             let parent_tools = Arc::new(RwLock::new(tool_arcs.clone()));
+            #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+            late_tool_search_observer::record(
+                "delegate-snapshot",
+                "original",
+                late_tool_search_observer::arc_id(&parent_tools),
+                tool_arcs.len(),
+            );
+            #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+            late_tool_search_observer::record("constructor-enter", "delegate", 0, 0);
             let delegate_tool = DelegateTool::new_with_options(
             delegate_agents,
             delegate_global_credential.clone(),
@@ -2889,6 +2943,13 @@ fn all_tools_with_runtime_on_thread(
         .with_execution_capability(execution_capability.clone())
         .with_caller_alias(agent_alias);
             let delegate_tool = Arc::new(delegate_tool);
+            #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+            late_tool_search_observer::record(
+                "constructor-return",
+                "delegate",
+                late_tool_search_observer::arc_id(&delegate_tool),
+                0,
+            );
             #[cfg(test)]
             {
                 built_delegate_tool = Some(Arc::clone(&delegate_tool));
@@ -3074,6 +3135,8 @@ fn register_plugin_tools(
             continue;
         }
 
+        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+        late_tool_search_observer::record("wasm-probe-enter", &package, 0, 0);
         let tool = zeroclaw_plugins::wasm_tool::WasmTool::from_wasm(
             component.clone(),
             scope,
@@ -3098,6 +3161,13 @@ fn register_plugin_tools(
                     continue;
                 }
                 tool_arcs.push(Arc::new(tool));
+                #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+                late_tool_search_observer::record(
+                    "wasm-admitted",
+                    &package,
+                    late_tool_search_observer::arc_id(tool_arcs.last().expect("just appended")),
+                    0,
+                );
                 registered_count += 1;
             }
             Err(e) => {
@@ -7133,3 +7203,96 @@ mod wrapper_spec_forwarding_tests {
 
 #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
 mod r5_namespace_tests;
+
+// Test evidence follows the actual case through the existing registry thread.
+// It owns no executable, policy, schema, or alternate registry.
+#[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+pub(crate) mod late_tool_search_observer {
+    use std::cell::RefCell;
+    use std::future::Future;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Debug, serde::Serialize)]
+    pub(crate) struct Event {
+        pub kind: &'static str,
+        pub label: String,
+        pub first: usize,
+        pub second: usize,
+    }
+
+    #[derive(Default)]
+    struct Events {
+        rows: Vec<Event>,
+        overflow: bool,
+    }
+
+    #[derive(Clone, Default)]
+    pub(crate) struct CaseTrace(Arc<Mutex<Events>>);
+
+    tokio::task_local! {
+        static CASE: CaseTrace;
+    }
+    thread_local! {
+        static BUILDER: RefCell<Option<CaseTrace>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) struct TraceGuard(Option<CaseTrace>);
+
+    impl Drop for TraceGuard {
+        fn drop(&mut self) {
+            BUILDER.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+
+    pub(crate) fn capture() -> Option<CaseTrace> {
+        CASE.try_with(Clone::clone)
+            .ok()
+            .or_else(|| BUILDER.with(|slot| slot.borrow().clone()))
+    }
+
+    pub(crate) fn enter_builder(trace: Option<CaseTrace>) -> TraceGuard {
+        TraceGuard(BUILDER.with(|slot| slot.replace(trace)))
+    }
+
+    pub(crate) async fn scope_case<T>(trace: CaseTrace, body: impl Future<Output = T>) -> T {
+        CASE.scope(trace, body).await
+    }
+
+    pub(crate) fn record(kind: &'static str, label: &str, first: usize, second: usize) {
+        let Some(trace) = capture() else { return };
+        let mut state = trace.0.lock().unwrap_or_else(|error| error.into_inner());
+        if state.rows.len() >= 4096 || label.len() > 128 {
+            state.overflow = true;
+            return;
+        }
+        state.rows.push(Event {
+            kind,
+            label: label.to_owned(),
+            first,
+            second,
+        });
+    }
+
+    pub(crate) fn arc_id<T: ?Sized>(value: &Arc<T>) -> usize {
+        Arc::as_ptr(value) as *const () as usize
+    }
+
+    pub(crate) fn borrowed_id<T: ?Sized>(value: &T) -> usize {
+        value as *const T as *const () as usize
+    }
+
+    impl CaseTrace {
+        pub(crate) fn events(&self) -> Vec<Event> {
+            let state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+            assert!(!state.overflow, "late ToolSearch trace overflow");
+            state.rows.clone()
+        }
+
+        pub(crate) fn count(&self, kind: &str, label: &str) -> usize {
+            self.events()
+                .iter()
+                .filter(|row| row.kind == kind && row.label == label)
+                .count()
+        }
+    }
+}
