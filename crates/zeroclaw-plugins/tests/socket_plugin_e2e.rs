@@ -160,6 +160,23 @@ async fn plain_echo() -> u16 {
     port
 }
 
+/// Bind a listener that accepts nothing on its own, so a test can check
+/// afterwards that no connection reached it.
+async fn idle_listener() -> (TcpListener, u16) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    (listener, port)
+}
+
+/// A connection that reached the server would be waiting in the listener's
+/// backlog, so an accept that times out shows the refused connect never got
+/// there.
+async fn assert_never_reached(listener: &TcpListener) {
+    let reached =
+        tokio::time::timeout(std::time::Duration::from_millis(200), listener.accept()).await;
+    assert!(reached.is_err(), "a refused connect reached the server");
+}
+
 /// Echo over TLS from the first byte.
 async fn tls_echo(acceptor: tokio_rustls::TlsAcceptor) -> u16 {
     tls_echo_after(acceptor, std::time::Duration::ZERO).await
@@ -429,17 +446,19 @@ async fn starttls_negotiates_in_plaintext_then_upgrades_in_place() {
 /// A refused connect is recorded for the operator, who otherwise sees nothing:
 /// the guest gets only `access-denied`. The record names the transport and,
 /// when a grant would help, the command that adds it while keeping the grant
-/// the instance already has.
+/// the instance already has. The record follows the refusal: the server never
+/// sees the connection.
 #[tokio::test]
 async fn a_refused_socket_is_recorded_for_the_operator() {
     egress_records::start();
-    let port = plain_echo().await;
+    let (listener, port) = idle_listener().await;
     // The binding `run` derives for a plaintext run on this port.
     let instance = format!("socket-plaintext-{port}");
 
     run(plain(port, Some(egress(&["records.example.com"], false))))
         .await
         .expect_err("an ungranted destination must be refused");
+    assert_never_reached(&listener).await;
     let refused = egress_records::matching(|record| {
         record["binding"] == instance.as_str() && record["remedy"].is_string()
     });
@@ -460,6 +479,7 @@ async fn a_refused_socket_is_recorded_for_the_operator() {
     run(plain(port, None))
         .await
         .expect_err("a store with no egress authority has no reach");
+    assert_never_reached(&listener).await;
     let unattached = egress_records::matching(|record| {
         record["binding"] == instance.as_str() && record["remedy"].is_null()
     });
