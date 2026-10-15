@@ -249,7 +249,20 @@ jobs:
             cargo nextest run --locked --no-fail-fast \
               --features plugins-wasm-cranelift \
               --bin zeroclaw \
-              plugin_registry:: plugins:: egress 2>&1 | tee "$plugin_cli_log"
+              plugin_registry:: plugins:: egress \
+              tests::a_batch_leaves_a_package_displaced \
+              tests::a_legacy_row_refusal \
+              tests::a_package_that_goes_away \
+              tests::a_package_the_registry_does_not_list \
+              tests::a_refused_update \
+              tests::a_restored_copy_the_policy_rejects \
+              tests::an_interrupted_update \
+              tests::an_update_ \
+              tests::config_rejections_name_the_instance \
+              tests::installing_an_installed_package_points_at_plugin_update \
+              tests::rendered_update_tokens \
+              tests::the_displaced_note \
+              tests::update_ 2>&1 | tee "$plugin_cli_log"
             plugin_cli_status=${PIPESTATUS[0]}
             cargo nextest run --locked --no-fail-fast \
               --features plugins-wasm-cranelift \
