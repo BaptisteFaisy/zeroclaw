@@ -139,8 +139,11 @@ failure.
 inside the plugins directory and holds an operating-system lease through
 publication. It moves the package into place without replacing any occupant,
 only after the manifest, component, and any `skills/` tree are written. If the
-platform or filesystem cannot provide an atomic no-replace move, installation
-refuses and reports the retained hidden package. A failed or interrupted write leaves no partial package under the
+platform or filesystem cannot provide an atomic no-replace move, as on FreeBSD
+and the other Unix systems besides Linux, Android and macOS, on an NFS mount,
+or on Linux before 3.15, installation refuses, removes its staged copy and
+says so; retrying there fails the same way. A failed or interrupted write
+leaves no partial package under the
 final name. Discovery ignores hidden transactions, and a later install uses
 fresh staging instead of replacing another process's stage.
 
