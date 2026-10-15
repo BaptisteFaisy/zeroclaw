@@ -1,5 +1,6 @@
 [workspace]
 members = [".", "crates/zeroclaw-api", "crates/zeroclaw-buildinfo", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-dist", "crates/zeroclaw-log", "crates/zeroclaw-log/tests/fixtures/attribution-macro-support", "crates/zeroclaw-log/tests/fixtures/attribution-macro-consumer", "crates/zeroclaw-tls", "crates/zeroclaw-relay-proto", "apps/zerorelay", "crates/zeroclaw-spawn", "crates/zeroclaw-commands", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-sop-graph", "crates/zeroclaw-runtime", "crates/zeroclaw-eval", "apps/zerocode", "crates/zeroclaw-plugins", "crates/zeroclaw-plugins/tests/fixtures/channel-fixture", "crates/zeroclaw-plugins/tests/fixtures/channel-egress-fixture", "crates/zeroclaw-plugins/tests/fixtures/channel-websocket-fixture", "crates/zeroclaw-plugins/tests/fixtures/egress-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-timeout-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-sequential-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-secret-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-socket-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-websocket-fixture", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/zeroclaw-macros", "apps/tauri", "tools/fill-translations", "xtask"]
+exclude = ["vendor/crossterm-0.29.0"]
 resolver = "2"
 
 [workspace.package]
@@ -210,10 +211,16 @@ libc = "0.2"
 # it lives here in the canonical registry. install.sh and `cargo cmd convert`
 # both read this; neither shadows it with its own list.
 [package.metadata.zeroclaw]
+# Published CLI archives use this selection across the release target matrix.
+# Every archive carries adapters for both runtime tool settings; no second archive.
+release_distributions = ["dist"]
 non_row_features = [
     "default",
     "default-channels",
     "channels-full",
+    "tools-saas",
+    "tools-coding-cli",
+    "tools-compat",
     "ci-all",
     "fantoccini",
     "landlock",
@@ -238,6 +245,7 @@ dist_extra_features = [
     "channel-git",
     "whatsapp-web",
     "plugins-wasm-cranelift",
+    "tools-compat",
 ]
 
 # Features whose build needs system C libraries or tooling the minimal static
@@ -309,6 +317,44 @@ channels-full = [
     "channel-whatsapp-cloud", "channel-voice-call",
 ]
 
+# Native adapters are opt-in for Cargo-default source builds. Standard
+# distributions carry their implementations for minimal/full runtime selection.
+tools-external = ["zeroclaw-runtime/tools-external", "zeroclaw-tools/tools-external"]
+# Standard/source adapter bundle; registration still requires [tools].optional.
+tools-compat = ["tools-saas", "tools-coding-cli", "tools-external"]
+tools-saas = [
+    "tool-jira",
+    "tool-notion",
+    "tool-linkedin",
+    "tool-composio",
+    "tool-google-workspace",
+    "tool-microsoft365",
+    "tool-project-intel",
+]
+
+# Opt-in tools that delegate to external coding CLIs.
+tools-coding-cli = [
+    "tool-claude-code",
+    "tool-claude-code-runner",
+    "tool-codex-cli",
+    "tool-gemini-cli",
+    "tool-opencode-cli",
+]
+
+# Tools — each forwards to zeroclaw-runtime, which registers it.
+tool-jira = ["zeroclaw-runtime/tool-jira"]
+tool-notion = ["zeroclaw-runtime/tool-notion"]
+tool-linkedin = ["zeroclaw-runtime/tool-linkedin"]
+tool-composio = ["zeroclaw-runtime/tool-composio"]
+tool-google-workspace = ["zeroclaw-runtime/tool-google-workspace"]
+tool-microsoft365 = ["zeroclaw-runtime/tool-microsoft365"]
+tool-project-intel = ["zeroclaw-runtime/tool-project-intel"]
+tool-claude-code = ["zeroclaw-runtime/tool-claude-code"]
+tool-claude-code-runner = ["zeroclaw-runtime/tool-claude-code-runner", "zeroclaw-gateway?/tool-claude-code-runner"]
+tool-codex-cli = ["zeroclaw-runtime/tool-codex-cli"]
+tool-gemini-cli = ["zeroclaw-runtime/tool-gemini-cli"]
+tool-opencode-cli = ["zeroclaw-runtime/tool-opencode-cli"]
+
 # Major subsystems — each forwards to exactly ONE crate
 gateway = [
     "dep:zeroclaw-gateway",
@@ -375,7 +421,7 @@ peripheral-rpi = ["dep:zeroclaw-hardware", "zeroclaw-hardware/peripheral-rpi"]
 dev-sim = ["dep:zeroclaw-hardware", "zeroclaw-hardware/dev-sim"]
 sandbox-landlock = ["zeroclaw-runtime/sandbox-landlock"]
 sandbox-bubblewrap = ["zeroclaw-runtime/sandbox-bubblewrap"]
-browser-native = ["zeroclaw-tools/browser-native"]
+browser-native = ["tools-external", "zeroclaw-tools/browser-native"]
 plugins-wasm = [
     "dep:zeroclaw-plugins",
     "zeroclaw-runtime/plugins-wasm",
@@ -438,6 +484,7 @@ ci-all = [
     "browser-native", "probe",
     "plugins-wasm", "plugins-wasm-cranelift",
     "webauthn", "memory-postgres",
+    "tools-saas", "tools-coding-cli", "tools-external",
 ]
 
 [profile.dev]
@@ -541,3 +588,7 @@ path = "tests/channel_websocket_e2e.rs"
 [[bench]]
 name = "agent_benchmarks"
 harness = false
+
+# Temporary upstream terminal EOF/error backport. See vendor/crossterm-0.29.0/PATCH.md.
+[patch.crates-io]
+crossterm = { path = "vendor/crossterm-0.29.0" }

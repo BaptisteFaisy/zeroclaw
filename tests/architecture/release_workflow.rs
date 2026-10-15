@@ -123,10 +123,36 @@ fn yaml_block<'a>(document: &'a str, header: &str) -> &'a str {
         .find_map(|(offset, line)| {
             let trimmed = line.trim();
             let indent = line.len() - line.trim_start().len();
-            (!trimmed.is_empty() && indent <= header_indent).then_some(offset)
+            (!trimmed.is_empty() && !trimmed.starts_with('#') && indent <= header_indent)
+                .then_some(offset)
         })
         .unwrap_or(remainder.len());
     &remainder[..end]
+}
+
+#[test]
+fn workflow_yaml_block_retains_outdented_comments_until_the_next_job() {
+    let release = workflow("release-stable-manual.yml");
+    assert!(release.contains("\n# >>> end generated:release-distributions <<<\n"));
+    let build = yaml_block(&release, "  build:\n");
+    assert!(build.contains("uses: ./.github/actions/build-release-payloads"));
+    assert!(
+        yaml_block(yaml_block(build, "    strategy:\n"), "      matrix:\n").contains("include:")
+    );
+    assert!(!build.contains("  build-desktop:\n"));
+    let annotated = release.replacen(
+        "\n  build-desktop:\n",
+        "\n# comment before the next real job\n  build-desktop:\n",
+        1,
+    );
+    assert_ne!(annotated, release);
+    let retained = yaml_block(&annotated, "  build:\n");
+    assert!(retained.contains("# comment before the next real job"));
+    assert!(retained.contains("uses: ./.github/actions/build-release-payloads"));
+    assert!(
+        yaml_block(yaml_block(retained, "    strategy:\n"), "      matrix:\n").contains("include:")
+    );
+    assert!(!retained.contains("  build-desktop:\n"));
 }
 
 // Immutable test-only reference from public 8b04361c24b99d5a700ac97f517308c2ed456650.
@@ -1047,6 +1073,29 @@ fn assert_manual_qualification_wiring(manual: &str) {
     assert!(!complete.contains(".removeprefix("));
     assert!(complete.contains("scripts/ci/verify_release_archive.py"));
     assert!(!manual.contains("contents: write") && !manual.contains("secrets."));
+}
+
+#[test]
+fn stable_and_qualification_builds_share_the_actual_cache_prefix() {
+    let release = workflow("release-stable-manual.yml");
+    let manual = workflow("cross-platform-build-manual.yml");
+    let cache_header =
+        "      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2\n";
+    let stable_cache = yaml_block(yaml_block(&release, "  build:\n"), cache_header);
+    let qualifier_cache = yaml_block(yaml_block(&manual, "  stable-gnu-build:\n"), cache_header);
+    let stable_prefix = yaml_block(stable_cache, "        with:\n")
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("prefix-key: "))
+        .expect("the actual Stable build must declare its cache prefix");
+    let qualifier_prefix = yaml_block(qualifier_cache, "        with:\n")
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("prefix-key: "))
+        .expect("the actual qualifier build must declare its cache prefix");
+    assert_eq!(
+        stable_prefix, qualifier_prefix,
+        "qualification must restore from the actual Stable cache namespace"
+    );
+    assert_eq!(stable_prefix, "${{ matrix.os }}-${{ matrix.target }}");
 }
 
 #[test]

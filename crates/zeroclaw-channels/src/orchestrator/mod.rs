@@ -16746,7 +16746,7 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
                 "Open approved HTTPS URLs in system browser (allowlist-only, no scraping)",
             ));
         }
-        if config.composio.enabled {
+        if tools::composio_tool_available(&config) {
             tool_descs.push((
                 "composio",
                 "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover actions, 'list_accounts' to retrieve connected account IDs, 'execute' to run (optionally with connected_account_id), and 'connect' for OAuth.",
@@ -16790,8 +16790,10 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
                 tool_descs.retain(|(name, _)| !excluded.iter().any(|ex| ex == name));
             }
         }
-        let effective_tool_names =
+        let mut effective_tool_names =
             effective_non_cli_tool_names(tools_registry.as_ref(), &risk_profile);
+        let hidden_builtin_names = tools_registry.hidden_builtin_names();
+        effective_tool_names.retain(|name| !hidden_builtin_names.contains(*name));
         tool_descs.retain(|(name, _)| effective_tool_names.contains(name));
 
         let bootstrap_max_chars = if agent.resolved.compact_context {
@@ -16811,6 +16813,18 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
             startup_excluded_tools,
             ch_activated_handle.as_ref(),
         )?;
+        if let Some(state) = &ch_activated_handle {
+            let section = state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .deferred_builtin_prompt_section();
+            if !section.is_empty() {
+                if !deferred_section.is_empty() {
+                    deferred_section.push_str("\n\n");
+                }
+                deferred_section.push_str(&section);
+            }
+        }
         let expose_text_tool_protocol = compose_channel_mcp_prompt_sections(
             native_tools,
             agent.resolved.strict_tool_parsing,
@@ -20055,8 +20069,35 @@ pub(crate) mod tests {
 
     #[test]
     fn matrix_safe_policy_fields_match_active_standard_tool_schemas() {
+        use zeroclaw_config::builtin_tools::EXTERNAL_TOOL_NAMES;
+        use zeroclaw_config::validation_warnings::TOOL_COMPILED_OUT;
+
         let temp = TempDir::new().expect("temporary workspace");
-        let config = Arc::new(Config::default());
+        let mut config = Config {
+            data_dir: temp.path().join("data"),
+            config_path: temp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.tools.optional = vec!["*".into()];
+
+        // Config owns compile availability; channels has no tools-external feature of its own.
+        let compiled_out_external = config
+            .collect_warnings()
+            .iter()
+            .filter(|warning| warning.code == TOOL_COMPILED_OUT && warning.path == "tools.optional")
+            .count();
+        assert!(
+            compiled_out_external == 0 || compiled_out_external == EXTERNAL_TOOL_NAMES.len(),
+            "maximal selection must report every external adapter or none as compiled out"
+        );
+        let mut expected_absent_required_tools: Vec<&str> = MATRIX_REQUIRED_SAFE_TOOL_ARGUMENTS
+            .iter()
+            .flat_map(|(tools, _)| tools.iter().copied())
+            .filter(|tool| compiled_out_external != 0 && EXTERNAL_TOOL_NAMES.contains(tool))
+            .collect();
+        expected_absent_required_tools.sort_unstable();
+
+        let config = Arc::new(config);
         let security = Arc::new(SecurityPolicy::default());
         let registry = tools::all_tools(
             Arc::clone(&config),
@@ -20125,9 +20166,10 @@ pub(crate) mod tests {
             checked_tools >= 20,
             "the standard registry unexpectedly exposed only {checked_tools} safe-policy tools"
         );
-        assert!(
-            absent_required_tools.is_empty(),
-            "required Matrix safe policy tools absent from the standard registry: {absent_required_tools:?}"
+        absent_required_tools.sort_unstable();
+        assert_eq!(
+            absent_required_tools, expected_absent_required_tools,
+            "required Matrix safe policy tool absences must exactly match this build's external adapters"
         );
     }
 
@@ -27779,6 +27821,7 @@ BTC is currently around $65,000 based on latest tool output."#
     fn channel_all_tools_result(tools: Vec<Box<dyn Tool>>) -> tools::AllToolsResult {
         tools::AllToolsResult {
             tools,
+            reserved_host_names: std::collections::HashSet::new(),
             delegate_handle: None,
             ask_user_handle: None,
             reaction_handle: Arc::new(parking_lot::RwLock::new(HashMap::new())),

@@ -209,6 +209,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        target: [x86_64-unknown-linux-gnu, x86_64-unknown-linux-musl, aarch64-unknown-linux-gnu, aarch64-unknown-linux-musl, armv7-unknown-linux-gnueabihf, arm-unknown-linux-gnueabihf, aarch64-apple-darwin, x86_64-apple-darwin, aarch64-linux-android, x86_64-pc-windows-msvc]
+        # >>> generated:release-distributions by `cargo generate installers` - do not edit <<<
+        distribution: ["dist"]
+# >>> end generated:release-distributions <<<
         include:
           # Use ubuntu-22.04 for Linux builds to link against glibc 2.35,
           # ensuring compatibility with Ubuntu 22.04+ (#3573).

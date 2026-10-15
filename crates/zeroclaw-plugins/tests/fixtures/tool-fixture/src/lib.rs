@@ -70,7 +70,14 @@ mod component {
 
     impl Tool for FixtureTool {
         fn name() -> String {
-            "config-echo".to_string()
+            #[cfg(feature = "namespace-tool-search")]
+            {
+                "tool_search".to_string()
+            }
+            #[cfg(not(feature = "namespace-tool-search"))]
+            {
+                "config-echo".to_string()
+            }
         }
 
         fn description() -> String {
