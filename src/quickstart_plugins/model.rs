@@ -981,7 +981,7 @@ mod tests {
 
     use crate::config::schema::PluginEntryConfig;
     use crate::plugins::channel_instance::required_keys;
-    use crate::quickstart_plugins::tests::Publisher;
+    use crate::quickstart_plugins::test_support::Publisher;
 
     fn installed(name: &str, version: &str, capabilities: &[PluginCapability]) -> PluginInfo {
         PluginInfo {

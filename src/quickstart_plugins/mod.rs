@@ -2515,7 +2515,48 @@ async fn activation_consent<P: QuickstartPrompter>(
     }
 }
 
+/// Test support the pure model's tests share with the step's tests. It needs
+/// no plugin backend, so it is available to every test build.
 #[cfg(test)]
+pub(crate) mod test_support {
+    /// A plugin publisher's signing key, generated the way the plugin crate's
+    /// own signature tests generate theirs: a ring Ed25519 PKCS#8 document and
+    /// its hex public key.
+    pub(crate) struct Publisher {
+        pkcs8: Vec<u8>,
+        pub(crate) key: String,
+    }
+
+    impl Publisher {
+        pub(crate) fn new() -> Self {
+            let (pkcs8, key) =
+                zeroclaw::plugins::signature::generate_signing_key().expect("a test signing key");
+            Self { pkcs8, key }
+        }
+
+        /// `manifest` signed with the plugin crate's own signer, the two
+        /// signature fields embedded after its first line, where TOML keeps
+        /// them root fields, as a publisher embeds them.
+        pub(crate) fn sign(&self, manifest: &str) -> String {
+            let signature = zeroclaw::plugins::signature::sign_manifest(manifest, &self.pkcs8)
+                .expect("the manifest signs");
+            let (first, rest) = manifest
+                .split_once('\n')
+                .expect("the manifest has more than one line");
+            format!(
+                "{first}\nsignature = \"{signature}\"\npublisher_key = \"{}\"\n{rest}",
+                self.key
+            )
+        }
+    }
+}
+
+/// The step's tests install a real component: the in-tree tool fixture, a
+/// raw component that only the Cranelift backend compiles. The runtime-only
+/// backend loads precompiled components alone and would fail every install
+/// here, so these tests run with `plugins-wasm-cranelift`, as the plugin
+/// load-check tests do; CI's plugin test legs use that backend.
+#[cfg(all(test, feature = "plugins-wasm-cranelift"))]
 mod tests {
     use super::*;
     use std::collections::VecDeque;
@@ -2530,6 +2571,7 @@ mod tests {
     use zeroclaw::plugins::registry::{PluginRegistryEntry, PluginRegistryIndex};
     use zeroclaw_runtime::quickstart::QuickstartStep;
 
+    use super::test_support::Publisher;
     use crate::tests::tool_component_fixture;
 
     const FIXTURE_NAME: &str = "tool-fixture";
@@ -2622,37 +2664,6 @@ hosts = ["api.example.com"]
         let digest = digest_of(&bytes);
         serve_archive(server, ResponseTemplate::new(200).set_body_bytes(bytes), 1).await;
         selection(fixture_entry(server, Some(digest)))
-    }
-
-    /// A plugin publisher's signing key, generated the way the plugin crate's
-    /// own signature tests generate theirs: a ring Ed25519 PKCS#8 document and
-    /// its hex public key.
-    pub(super) struct Publisher {
-        pkcs8: Vec<u8>,
-        pub(super) key: String,
-    }
-
-    impl Publisher {
-        pub(super) fn new() -> Self {
-            let (pkcs8, key) =
-                zeroclaw::plugins::signature::generate_signing_key().expect("a test signing key");
-            Self { pkcs8, key }
-        }
-
-        /// `manifest` signed with the plugin crate's own signer, the two
-        /// signature fields embedded after its first line, where TOML keeps
-        /// them root fields, as a publisher embeds them.
-        pub(super) fn sign(&self, manifest: &str) -> String {
-            let signature = zeroclaw::plugins::signature::sign_manifest(manifest, &self.pkcs8)
-                .expect("the manifest signs");
-            let (first, rest) = manifest
-                .split_once('\n')
-                .expect("the manifest has more than one line");
-            format!(
-                "{first}\nsignature = \"{signature}\"\npublisher_key = \"{}\"\n{rest}",
-                self.key
-            )
-        }
     }
 
     fn fixture_entry(server: &MockServer, sha256: Option<String>) -> PluginRegistryEntry {
@@ -6889,10 +6900,17 @@ enum = ["", "auto"]
 
     /// Every English string of the Plugins step parses and formats. A Fluent
     /// syntax error would otherwise surface only at run time, as the `{key}`
-    /// sentinel in place of the message.
+    /// sentinel in place of the message. The catalogue is read at run time:
+    /// it lives in another crate, which a compile-time include would reach
+    /// out of this crate's package for.
     #[test]
     fn every_plugins_step_string_formats_with_its_placeables() {
-        let english = include_str!("../../crates/zeroclaw-runtime/locales/en/cli.ftl");
+        let english = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("crates/zeroclaw-runtime/locales/en/cli.ftl"),
+        )
+        .expect("read the English CLI catalogue");
+        let english = english.as_str();
         let mut checked = 0;
         for (key, value) in english.lines().filter_map(|line| line.split_once(" = ")) {
             if !key.starts_with("cli-quickstart-plugins-") && key != "cli-quickstart-row-plugins" {

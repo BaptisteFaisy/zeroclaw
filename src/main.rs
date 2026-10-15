@@ -20618,11 +20618,9 @@ mod tests {
 
     /// The in-tree tool component, for every test in this binary that needs a
     /// real one: the plugin load-check tests below and the Quickstart plugin
-    /// step's tests.
-    #[cfg(any(
-        feature = "plugins-wasm-cranelift",
-        all(feature = "agent-runtime", feature = "plugins-wasm")
-    ))]
+    /// step's tests. Both run with the Cranelift backend, the one that
+    /// compiles this raw component.
+    #[cfg(feature = "plugins-wasm-cranelift")]
     pub(crate) mod tool_component_fixture {
         use std::path::PathBuf;
         use std::process::Command;
