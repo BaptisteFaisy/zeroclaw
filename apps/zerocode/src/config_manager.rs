@@ -111,6 +111,7 @@ pub(crate) fn restore_terminal(term: &mut Term) -> Result<()> {
 
 // ── Screen stack ─────────────────────────────────────────────────
 
+#[derive(Clone)]
 enum Screen {
     SectionList,
     TypeList {
@@ -156,6 +157,20 @@ struct FilterOrigin {
     pane: ZeroclawPane,
     section_cursor: usize,
     active_tab: usize,
+    /// Detail page open when a sidebar search started. Previewing other
+    /// sections replaces it, so cancel reopens this page rather than the
+    /// section root.
+    detail: Option<DetailOrigin>,
+}
+
+struct DetailOrigin {
+    screen: Screen,
+    loaded_section: Option<usize>,
+    type_cursor: usize,
+    alias_cursor: usize,
+    alias_tab: usize,
+    cost_cursor: usize,
+    field_cursor: usize,
 }
 
 enum FilterEditAction {
@@ -3379,10 +3394,20 @@ impl App {
         } else {
             self.visible_cursor()
         };
+        let detail = (self.zeroclaw_pane == ZeroclawPane::Sections).then(|| DetailOrigin {
+            screen: self.screen.clone(),
+            loaded_section: self.loaded_section,
+            type_cursor: self.type_cursor,
+            alias_cursor: self.alias_cursor,
+            alias_tab: self.alias_tab,
+            cost_cursor: self.cost_cursor,
+            field_cursor: self.field_cursor,
+        });
         self.filter_origin = Some(FilterOrigin {
             pane: self.zeroclaw_pane,
             section_cursor: self.section_cursor,
             active_tab: self.active_tab,
+            detail,
         });
         self.filter = Some(String::new());
         self.filter_cursor = cursor.min(filtered_len.saturating_sub(1));
@@ -3400,7 +3425,13 @@ impl App {
             self.zeroclaw_pane = origin.pane;
             self.section_cursor = origin.section_cursor;
             if origin.pane == ZeroclawPane::Sections {
-                if let Err(err) = self.preview_section(origin.section_cursor).await {
+                let restored = match origin.detail {
+                    Some(detail) if detail.loaded_section != self.loaded_section => {
+                        self.reopen_detail(detail, origin.active_tab).await
+                    }
+                    _ => self.preview_section(origin.section_cursor).await,
+                };
+                if let Err(err) = restored {
                     self.status_msg = Some(crate::i18n::t_args(
                         "zc-config-status-load-failed",
                         &[("err", &err.to_string())],
@@ -3411,6 +3442,60 @@ impl App {
                     .min(self.tab_names.len().saturating_sub(1));
             }
         }
+        Ok(())
+    }
+
+    /// Reload the detail page saved when a sidebar search started, with its
+    /// cursors and tab. Pages that hold unsaved input (an open editor or a
+    /// create form) fall back to their section root.
+    async fn reopen_detail(&mut self, detail: DetailOrigin, active_tab: usize) -> Result<()> {
+        let Some(section_idx) = detail.loaded_section else {
+            return Ok(());
+        };
+        match detail.screen {
+            Screen::AliasList {
+                section_idx,
+                map_path,
+                breadcrumb,
+            } => {
+                self.load_aliases(&map_path).await?;
+                self.screen = Screen::AliasList {
+                    section_idx,
+                    map_path,
+                    breadcrumb,
+                };
+                if detail.alias_tab == 1 {
+                    self.alias_tab = 1;
+                    self.load_cost_resources().await?;
+                }
+                self.alias_cursor = detail.alias_cursor.min(self.aliases.len());
+                self.cost_cursor = detail
+                    .cost_cursor
+                    .min(self.cost_resources.len().saturating_sub(1));
+            }
+            Screen::FieldList {
+                section_idx,
+                prefix,
+                breadcrumb,
+            } => {
+                self.load_fields(&prefix).await?;
+                self.screen = Screen::FieldList {
+                    section_idx,
+                    prefix,
+                    breadcrumb,
+                };
+                self.field_cursor = detail.field_cursor.min(self.fields.len().saturating_sub(1));
+                self.active_tab = active_tab.min(self.tab_names.len().saturating_sub(1));
+            }
+            _ => {
+                self.load_section_content(section_idx).await?;
+                self.type_cursor = detail
+                    .type_cursor
+                    .min(self.type_list_len(section_idx).saturating_sub(1));
+            }
+        }
+        self.loaded_section = Some(section_idx);
+        self.status_msg = None;
         Ok(())
     }
 
@@ -6006,6 +6091,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn config_filter_cancel_reopens_the_nested_page_it_started_from() {
+        let (mut manager, _) = responding_manager();
+        filter_fixture(&mut manager);
+        manager.screen = Screen::FieldList {
+            section_idx: 1,
+            prefix: "agents.alpha".into(),
+            breadcrumb: vec!["Agents".into(), "alpha".into()],
+        };
+        let mut term = filter_test_term();
+        manager
+            .handle_key(key(KeyCode::Char('/')), &mut term)
+            .await
+            .unwrap();
+        manager.handle_paste("MCP").await;
+        assert_eq!(manager.loaded_section, Some(2));
+        manager
+            .handle_key(key(KeyCode::Esc), &mut term)
+            .await
+            .unwrap();
+        assert!(manager.filter.is_none());
+        assert_eq!(manager.section_cursor, 1);
+        assert_eq!(manager.loaded_section, Some(1));
+        assert_eq!(manager.field_cursor, 1);
+        match &manager.screen {
+            Screen::FieldList {
+                prefix, breadcrumb, ..
+            } => {
+                assert_eq!(prefix, "agents.alpha");
+                assert_eq!(breadcrumb.len(), 2);
+            }
+            _ => panic!("cancel should reopen the agent page"),
+        }
+    }
+
+    #[tokio::test]
     async fn config_filter_failed_paste_and_cancel_keep_tui_open_and_detail_inert() {
         for fail_on_cancel in [false, true] {
             let (mut manager, _) = responding_manager();
@@ -6451,6 +6571,7 @@ mod tests {
             pane: ZeroclawPane::Detail,
             section_cursor: 0,
             active_tab: 0,
+            detail: None,
         });
         mgr.filter_cursor = 0;
 
