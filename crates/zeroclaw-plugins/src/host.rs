@@ -466,19 +466,37 @@ impl PluginHost {
             component.as_ref(),
         );
         if let Err(error) = staged {
-            recovery::clear_owned(&package)?;
-            drop(package);
-            tx.dir.remove_dir(recovery::PACKAGE)?;
-            tx.finish(root)?;
+            clear_unpublished_stage(root, tx, package)?;
             return Err(error);
         }
         drop(package);
         // Publication never replaces an entry that holds files, even one an
         // unrelated writer put there; see `recovery::rename_new`.
         if let Err(error) = tx.publish(root, &manifest.name) {
-            return Err(PluginError::RecoveryRetained {
-                path: root.retained_path(&tx),
-                reason: error.to_string(),
+            let path = root.retained_path(&tx);
+            return Err(match error {
+                // Without a rename that refuses an existing destination no
+                // retry can publish, so the copy this install staged is cleared
+                // as a failed write clears it, instead of one being kept for
+                // every attempt.
+                PluginError::Io(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+                    let cleared = tx
+                        .dir
+                        .open_dir(recovery::PACKAGE)
+                        .map_err(PluginError::from)
+                        .and_then(|package| clear_unpublished_stage(root, tx, package));
+                    match cleared {
+                        Ok(()) => PluginError::MoveUnsupported(error.to_string()),
+                        Err(cleanup) => PluginError::RecoveryRetained {
+                            path,
+                            reason: format!("{error}; clearing the staged copy failed: {cleanup}"),
+                        },
+                    }
+                }
+                error => PluginError::RecoveryRetained {
+                    path,
+                    reason: error.to_string(),
+                },
             });
         }
         #[cfg(test)]
@@ -1817,6 +1835,7 @@ fn is_structural_admission_failure(error: &PluginError) -> bool {
         | PluginError::UnadmittedPackage { .. }
         | PluginError::NamespaceChanged(_)
         | PluginError::RecoveryRetained { .. }
+        | PluginError::MoveUnsupported(_)
         | PluginError::InvalidConfig(_)
         | PluginError::InvalidInstanceId(_)
         | PluginError::InvalidEndpoint(_)
@@ -2002,7 +2021,6 @@ fn finish_naming_entry(
     })
 }
 
-/// Why recovery keeps a directory it claimed, worded for the operator.
 /// The directory a manifest path names its package in: its parent, or the
 /// current directory for a bare file name, whose parent is the empty path that
 /// no directory handle opens.
@@ -2045,6 +2063,21 @@ mod identity_fault {
     }
 }
 
+/// Clear the copy an install staged in `package`, inside `tx`, and finish the
+/// transaction. Nothing of it was published, so nothing of this install is
+/// left behind.
+fn clear_unpublished_stage(
+    root: &recovery::Root,
+    tx: recovery::Transaction,
+    package: Dir,
+) -> Result<(), PluginError> {
+    recovery::clear_owned(&package)?;
+    drop(package);
+    tx.dir.remove_dir(recovery::PACKAGE)?;
+    tx.finish(root)
+}
+
+/// Why recovery keeps a directory it claimed, worded for the operator.
 fn kept(name: &str, reason: impl Into<String>) -> PluginError {
     PluginError::UnadmittedPackage {
         name: name.into(),
@@ -4888,8 +4921,10 @@ capabilities = ["tool"]
         ));
     }
 
-    /// An unavailable no-replace primitive refuses publication and recovery,
-    /// preserving the staged package and every final package's bytes.
+    /// An unavailable no-replace primitive refuses publication and recovery.
+    /// Install then clears the copy it staged, so a retry, which fails the same
+    /// way, leaves nothing behind either, and every final package keeps its
+    /// bytes.
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     #[test]
     fn install_and_recovery_refuse_without_a_no_replace_rename() {
@@ -4908,13 +4943,14 @@ capabilities = ["tool"]
         let source = tempdir().unwrap();
         write_tool_source(source.path(), "plain", b"\0asm plain");
         let expected = package_bytes(source.path());
-        let result = host.install(source.path().to_str().unwrap());
-        let Err(PluginError::RecoveryRetained { path, reason }) = result else {
-            panic!("an unsupported publication must retain the stage: {result:?}");
-        };
-        assert_eq!(package_bytes(Path::new(&path)), expected);
-        assert!(reason.contains("no-replace"), "{reason}");
-        assert!(!plugins.path().join("plain").exists());
+        for _ in 0..2 {
+            let result = host.install(source.path().to_str().unwrap());
+            assert!(
+                matches!(&result, Err(PluginError::MoveUnsupported(reason)) if reason.contains("no-replace")),
+                "an unsupported publication must clear its stage: {result:?}"
+            );
+            assert_eq!(dir_entries(plugins.path()), [".zeroclaw-package-lock-v1"]);
+        }
 
         let broken = plugins.path().join("broken");
         std::fs::create_dir(&broken).unwrap();
@@ -4938,7 +4974,6 @@ capabilities = ["tool"]
         ));
         assert_eq!(package_bytes(&late), before);
         assert_eq!(package_bytes(source.path()), expected);
-        assert_eq!(package_bytes(Path::new(&path)), expected);
     }
 
     /// A lock file this user cannot write, such as one another user created in

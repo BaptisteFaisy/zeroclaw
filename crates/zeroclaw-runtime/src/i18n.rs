@@ -1922,7 +1922,7 @@ mod tests {
         /// every locale's rendering must contain.
         type ParityCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
         const PATH: &str = "/plugins/.tool-fixture.recovering-v1-0/package";
-        let cases: [ParityCase; 6] = [
+        let cases: [ParityCase; 7] = [
             (
                 "cli-plugin-install-unadmitted-package",
                 &[("name", "tool-fixture")],
@@ -1937,6 +1937,11 @@ mod tests {
                 "cli-plugin-install-retained",
                 &[("path", PATH), ("reason", REASON)],
                 &[PATH, REASON],
+            ),
+            (
+                "cli-plugin-install-move-unsupported",
+                &[("reason", REASON)],
+                &[REASON, "FreeBSD", "NFS", "3.15"],
             ),
             (
                 "cli-plugin-recovery-retained",

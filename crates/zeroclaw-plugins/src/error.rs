@@ -21,6 +21,14 @@ pub enum PluginError {
     #[error("plugin recovery retained bytes at {path}: {reason}")]
     RecoveryRetained { path: String, reason: String },
 
+    /// The platform or filesystem has no rename that refuses an existing
+    /// destination, so install removed the copy it staged and installed
+    /// nothing; a retry there fails the same way.
+    #[error(
+        "nothing was installed: this platform or filesystem cannot move a package without risking an existing entry ({0})"
+    )]
+    MoveUnsupported(String),
+
     #[error("invalid plugin config: {0}")]
     InvalidConfig(String),
 
