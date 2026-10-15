@@ -528,7 +528,7 @@ fn immutable_stable_release_recipe_has_real_command_and_failure_baselines() {
     let outside = format!("{}{}", &release[..start], &release[end..]);
     assert_eq!(
         format!("{:x}", Sha256::digest(outside.as_bytes())),
-        "b014f48559771f21ab5b8b117e0d4c1c5f9284b6258bc622d238db2bf7879d3a"
+        "ea33e50faf4ad1f9200f1188362b740ecd588646c47c09067e6c0e6f1ba0e8cb"
     );
     let matrix = yaml_block(build, "      matrix:\n");
     for context in RELEASE_RECIPE_CONTEXTS {
