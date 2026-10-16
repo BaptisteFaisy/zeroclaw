@@ -5825,7 +5825,16 @@ fn with_unadmitted_package_remedy(error: zeroclaw::plugins::error::PluginError) 
             "cli-plugin-install-move-unsupported",
             &[("reason", reason.as_str())],
             format!(
-                "Install needs a rename that refuses an existing destination, and this platform or filesystem has none ({reason}). Nothing was installed and no staged copy was kept. FreeBSD and the other Unix systems besides Linux, Android and macOS, NFS mounts, and Linux before 3.15 lack such a rename; on Linux or macOS, keep the plugins directory on a local filesystem."
+                "Install needs a rename that refuses an existing destination, and this platform or filesystem has none ({reason}). Nothing was installed and no staged copy was kept. This build refuses that move on FreeBSD and other Unix systems besides Linux, Android and macOS. Linux before 3.15 and NFS mounts without no-replace support also lack the operation; choose a plugins directory on a filesystem that supports atomic no-replace moves."
+            ),
+        ));
+    }
+    if let zeroclaw::plugins::error::PluginError::MoveUnsupportedCleanup { path, reason } = &error {
+        return anyhow::Error::msg(ta(
+            "cli-plugin-install-move-unsupported-cleanup",
+            &[("path", path.as_str()), ("reason", reason.as_str())],
+            format!(
+                "Install cannot safely publish on this platform or filesystem ({reason}). Nothing was installed. Cleanup of its unpublished transaction could not be confirmed at {path}. Repair safe no-replace move support and resolve this cleanup failure before attempting another install."
             ),
         ));
     }
@@ -25052,6 +25061,38 @@ maxLength = 1
             "{rendered}"
         );
         assert!(!rendered.contains("run the install again"), "{rendered}");
+        assert!(
+            rendered.contains("NFS mounts without no-replace support"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "plugins-wasm")]
+    fn an_unsupported_install_cleanup_names_its_failed_phase_without_retry() {
+        for path in [
+            "/synthetic/plugins/.probe.installing-v1-test/package",
+            "/synthetic/plugins/.probe.installing-v1-test",
+        ] {
+            let error = zeroclaw::plugins::error::PluginError::MoveUnsupportedCleanup {
+                path: path.into(),
+                reason: "atomic move unavailable; cleanup I/O fault".into(),
+            };
+            let rendered = with_unadmitted_package_remedy(error).to_string();
+            assert!(rendered.contains(path), "{rendered}");
+            assert!(rendered.contains("cleanup I/O fault"), "{rendered}");
+            assert!(rendered.contains("Nothing was installed"), "{rendered}");
+            assert!(
+                rendered.contains("Repair safe no-replace move support"),
+                "{rendered}"
+            );
+            assert!(!rendered.contains("run the install again"), "{rendered}");
+            assert!(!rendered.contains("kept the staged copy"), "{rendered}");
+            assert!(!rendered.contains("no staged copy was kept"), "{rendered}");
+            if !path.ends_with("/package") {
+                assert!(!rendered.contains(&format!("{path}/package")), "{rendered}");
+            }
+        }
     }
 
     /// REGRESSION (unsupported beta config): removing a pre-typed plugin leaves

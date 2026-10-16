@@ -643,10 +643,20 @@ impl PluginHost {
         )
         .and_then(|()| check_staged_skills(&manifest, &package));
         if let Err(error) = staged {
-            clear_unpublished_stage(root, tx, package)?;
+            clear_unpublished_stage(&self.plugins_dir, root, tx, package)
+                .map_err(|failure| failure.error)?;
             return Err(error);
         }
-        drop(package);
+        // Unix permits publishing an open directory: keep this exact staged
+        // generation for cleanup if the move is unsupported. Windows needs
+        // the directory closed before publication and uses the closed path.
+        #[cfg(unix)]
+        let package = Some(package);
+        #[cfg(not(unix))]
+        let package = {
+            drop(package);
+            None
+        };
         // Publication never replaces an entry that holds files, even one an
         // unrelated writer put there; see `recovery::rename_new`.
         if let Err(error) = tx.publish(root, &manifest.name) {
@@ -657,18 +667,9 @@ impl PluginHost {
                 // as a failed write clears it, instead of one being kept for
                 // every attempt.
                 PluginError::Io(error) if error.kind() == std::io::ErrorKind::Unsupported => {
-                    let cleared = tx
-                        .dir
-                        .open_dir(recovery::PACKAGE)
-                        .map_err(PluginError::from)
-                        .and_then(|package| clear_unpublished_stage(root, tx, package));
-                    match cleared {
-                        Ok(()) => PluginError::MoveUnsupported(error.to_string()),
-                        Err(cleanup) => PluginError::RecoveryRetained {
-                            path,
-                            reason: format!("{error}; clearing the staged copy failed: {cleanup}"),
-                        },
-                    }
+                    #[cfg(test)]
+                    recovery::pause("install-unsupported-before-cleanup");
+                    cleanup_after_unsupported_publish(&self.plugins_dir, root, tx, package, error)
                 }
                 error => PluginError::RecoveryRetained {
                     path,
@@ -676,6 +677,7 @@ impl PluginHost {
                 },
             });
         }
+        drop(package);
         #[cfg(test)]
         recovery::pause("install-published");
         // The package is installed. Only the stage's lease and entry are left,
@@ -2588,6 +2590,7 @@ fn is_structural_admission_failure(error: &PluginError) -> bool {
         | PluginError::RecoveryRetained { .. }
         | PluginError::ReplacementInterrupted { .. }
         | PluginError::MoveUnsupported(_)
+        | PluginError::MoveUnsupportedCleanup { .. }
         | PluginError::InvalidConfig(_)
         | PluginError::InvalidInstanceId(_)
         | PluginError::InvalidEndpoint(_)
@@ -2835,18 +2838,153 @@ mod identity_fault {
     }
 }
 
-/// Clear the copy an install staged in `package`, inside `tx`, and finish the
-/// transaction. Nothing of it was published, so nothing of this install is
-/// left behind.
+/// The actual failed cleanup operation determines the diagnostic location.
+/// This carrier does not confer ownership or assert the original bytes remain.
+struct UnpublishedStageFailure {
+    path: String,
+    error: PluginError,
+}
+
+/// Missing root/lock lookups mean the cleanup namespace disappeared, rather
+/// than an ordinary cleanup I/O failure. Other root-check errors stay I/O.
+fn check_cleanup_namespace(root: &recovery::Root) -> Result<(), PluginError> {
+    root.check().map_err(|error| match error {
+        PluginError::Io(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            PluginError::NamespaceChanged(
+                "plugins root or package coordination lock is no longer present".into(),
+            )
+        }
+        error => error,
+    })
+}
+
+/// A detected namespace change takes priority, but another check failure must
+/// not erase the actual package-open error that led to this diagnostic.
+fn cleanup_open_error(open: std::io::Error, check: Result<(), PluginError>) -> PluginError {
+    match check {
+        Err(namespace @ PluginError::NamespaceChanged(_)) => namespace,
+        _ => open.into(),
+    }
+}
+
+/// `package` is the original staged capability on Unix. Only callers that had
+/// to close it before publication pass None and reopen through the held entry.
+fn cleanup_after_unsupported_publish(
+    plugins_dir: &Path,
+    root: &recovery::Root,
+    tx: recovery::Transaction,
+    package: Option<Dir>,
+    unsupported: std::io::Error,
+) -> PluginError {
+    let package = match package {
+        Some(package) => Ok(package),
+        None => tx.dir.open_dir(recovery::PACKAGE),
+    };
+    let cleared = match package {
+        Ok(package) => clear_unpublished_stage(plugins_dir, root, tx, package),
+        Err(open) => {
+            let path = if open.kind() == std::io::ErrorKind::NotFound {
+                plugins_dir.join(&tx.entry).display().to_string()
+            } else {
+                root.retained_path(&tx)
+            };
+            Err(UnpublishedStageFailure {
+                path,
+                error: cleanup_open_error(open, check_cleanup_namespace(root)),
+            })
+        }
+    };
+    match cleared {
+        Ok(()) => PluginError::MoveUnsupported(unsupported.to_string()),
+        Err(UnpublishedStageFailure {
+            error: namespace @ PluginError::NamespaceChanged(_),
+            ..
+        }) => namespace,
+        Err(cleanup) => PluginError::MoveUnsupportedCleanup {
+            path: cleanup.path,
+            reason: format!(
+                "{unsupported}; unpublished transaction cleanup failed: {}",
+                cleanup.error
+            ),
+        },
+    }
+}
+
+/// Clear only this unpublished transaction through its held capabilities.
+/// Keep namespace refusals and the failed phase's location distinct, including
+/// a finish failure after the package directory has already been removed.
 fn clear_unpublished_stage(
+    plugins_dir: &Path,
     root: &recovery::Root,
     tx: recovery::Transaction,
     package: Dir,
-) -> Result<(), PluginError> {
-    recovery::clear_owned(&package)?;
+) -> Result<(), UnpublishedStageFailure> {
+    let package_path = root.retained_path(&tx);
+    let entry_path = plugins_dir.join(&tx.entry).display().to_string();
+    let package_failure = |error| UnpublishedStageFailure {
+        path: package_path.clone(),
+        error,
+    };
+    #[cfg(test)]
+    recovery::pause("install-cleanup-before-clear");
+    check_cleanup_namespace(root).map_err(package_failure)?;
+    #[cfg(all(
+        test,
+        any(target_os = "linux", target_os = "android", target_vendor = "apple")
+    ))]
+    cleanup_fault::before_clear(&package).map_err(|error| package_failure(error.into()))?;
+    recovery::clear_owned(&package).map_err(package_failure)?;
     drop(package);
-    tx.dir.remove_dir(recovery::PACKAGE)?;
-    tx.finish(root)
+    #[cfg(test)]
+    recovery::pause("install-cleanup-before-package-unlink");
+    check_cleanup_namespace(root).map_err(package_failure)?;
+    tx.dir
+        .remove_dir(recovery::PACKAGE)
+        .map_err(|error| package_failure(error.into()))?;
+    #[cfg(test)]
+    recovery::pause("install-cleanup-before-finish");
+    check_cleanup_namespace(root).map_err(|error| UnpublishedStageFailure {
+        path: entry_path.clone(),
+        error,
+    })?;
+    tx.finish(root).map_err(|error| UnpublishedStageFailure {
+        path: entry_path,
+        error,
+    })
+}
+
+/// A test-only cleanup I/O fault after one actual staged file was deleted.
+/// The remaining files are real, so the caller must report partial cleanup.
+/// This exercises propagation beside `clear_owned`, not its internal `?`.
+#[cfg(all(
+    test,
+    any(target_os = "linux", target_os = "android", target_vendor = "apple")
+))]
+mod cleanup_fault {
+    thread_local! {
+        static ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    pub(super) struct Armed;
+
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            ARMED.with(|armed| armed.set(false));
+        }
+    }
+
+    pub(super) fn arm() -> Armed {
+        ARMED.with(|armed| armed.set(true));
+        Armed
+    }
+
+    pub(super) fn before_clear(package: &cap_std::fs::Dir) -> std::io::Result<()> {
+        if ARMED.with(|armed| armed.replace(false)) {
+            package.remove_file("manifest.toml")?;
+            return Err(std::io::Error::other("injected partial cleanup fault"));
+        }
+        Ok(())
+    }
 }
 
 /// Why recovery keeps a directory it claimed, worded for the operator.

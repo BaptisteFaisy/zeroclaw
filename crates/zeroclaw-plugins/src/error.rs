@@ -42,6 +42,14 @@ pub enum PluginError {
     )]
     MoveUnsupported(String),
 
+    /// The same permanent publication refusal, but cleanup did not complete.
+    /// `path` names the failed cleanup operation, not a guarantee that all
+    /// original payload bytes remain. This is never a recommendation to retry.
+    #[error(
+        "nothing was installed: safe package move unavailable; cleanup could not be confirmed at {path}: {reason}"
+    )]
+    MoveUnsupportedCleanup { path: String, reason: String },
+
     #[error("invalid plugin config: {0}")]
     InvalidConfig(String),
 
