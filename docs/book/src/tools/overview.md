@@ -21,7 +21,7 @@ section.
 
 ## Minimal and full tools
 
-New installations use **minimal** unless they explicitly select extras:
+Fresh configurations written by setup or config generation use **minimal** unless they explicitly select extras:
 eleven built-ins in Chat, or eight in Code/ACP, which retains its
 exclusion of persistent-memory tools. Chat's eleven are `shell`, `file_read`,
 `file_write`, `file_edit`, `glob_search`, `content_search`, `memory_recall`,
@@ -89,7 +89,7 @@ is a v0.9.0 design decision; v0.8.6 upgrades preserve their selection.
 | Release archive | Standard `dist` includes the native `tools-compat` adapters | Minimal by default; full and named extras work without another download |
 | Desktop sidecar | The same target-resolved `dist` CLI, plus requested desktop features | The same minimal/full settings and prerequisites |
 | Homebrew source build | Depends on the formula's feature selection; a Cargo-default build omits native adapters | Full reports missing adapters; use the standard source build below when the formula does not carry them |
-| Docker `dist` image | Standard `dist`, including native adapters | The same minimal/full settings; configure dependencies explicitly |
+| Docker `dist` image | Standard `dist`, including native adapters | Baked configs currently omit `[tools]` and load full for compatibility; set `optional = []` for minimal |
 
 One release matrix has ten target legs, with unchanged archive names. Android is
 experimental and allowed to fail; publication requires the other nine targets.
@@ -120,7 +120,7 @@ config, data and service paths. A config setting cannot change a bottle's
 compiled features. Source users can also select individual existing `tool-*`
 features or `tools-compat`; they still need the runtime selection.
 
-Standard `dist` retains `plugins-wasm-cranelift` on the seven supported native
+Standard `dist` includes the plugin host and `plugins-wasm-cranelift` on the seven supported native
 64-bit targets: GNU and musl Linux on x86_64 and aarch64, both macOS architectures,
 and x86_64 Windows MSVC. ARMv6/ARMv7 omit Cranelift and Prometheus; experimental
 Android omits Cranelift and WhatsApp Web. Cargo defaults do not include a plugin
@@ -128,6 +128,13 @@ host. Compiling the host leaves `plugins.enabled` and `plugins.auto_discover`
 false; consent, trust, grants and configured activation still apply. Runtime-only
 precompiled `.cwasm` support and Pulley do not replace portable registry `.wasm`
 compilation. Target policy comes from `package.metadata.zeroclaw` in `Cargo.toml`.
+
+Minimal is a runtime catalog selection. Standard `dist` still carries the
+compiled native adapters, so minimal alone is not binary-size evidence for
+[the tool extraction work](https://github.com/zeroclaw-labs/zeroclaw/issues/10998).
+Container, Kubernetes and Nix defaults that omit `[tools]` take the same
+full-availability compatibility path as existing files; explicit minimal
+configuration is needed for those artifacts.
 
 ## Built-in tools
 
