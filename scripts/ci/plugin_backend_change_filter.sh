@@ -26,6 +26,8 @@
 # the feature, the golden harness and fixtures, the shared webhook types in
 # zeroclaw-api, and the plugin webhook ingress in zeroclaw-infra. Other gateway
 # paths stay out: the default-feature Test job covers them.
+# The plugin artifact smoke harness is listed as well: this job is the only
+# place its scripts run before a release, so a change to them has to run it.
 # Prints "false" otherwise. Always exits 0; the workflow step forwards the
 # printed value to GITHUB_OUTPUT.
 
@@ -51,7 +53,10 @@ while IFS= read -r path; do
         wit/*|\
         Cargo.toml|Cargo.lock|\
         .github/workflows/ci.yml|\
-        scripts/ci/plugin_backend_change_filter*.sh)
+        scripts/ci/plugin_backend_change_filter*.sh|\
+        scripts/ci/plugin_artifact_smoke*.sh|\
+        scripts/ci/plugin_smoke_provider*.py|\
+        scripts/ci/build_plugin_smoke_packages.sh)
             run=true
             ;;
     esac
