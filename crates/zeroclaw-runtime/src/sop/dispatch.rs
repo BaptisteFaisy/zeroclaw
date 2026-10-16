@@ -653,11 +653,13 @@ pub async fn dispatch_sop_event_to_deduplicated(
     .await
 }
 
-pub(crate) trait StartEffectGuard {}
-impl<T> StartEffectGuard for T {}
+/// Keeps a caller's authority valid until a synchronous SOP effect finishes.
+/// Callbacks must return this guard rather than just checking and releasing it.
+pub(crate) trait SopEffectGuard {}
+impl<T> SopEffectGuard for T {}
 
-type StartAuthorization<'a> =
-    dyn Fn(&super::Sop) -> Result<Box<dyn StartEffectGuard + 'a>, String> + Sync + 'a;
+type SopAdmissionCheck<'a> =
+    dyn Fn(&super::Sop) -> Result<Box<dyn SopEffectGuard + 'a>, String> + Sync + 'a;
 
 /// RPC admission hook, borrowed only for this dispatch. It runs under the engine
 /// lock after decision-model waits, against the procedure that will actually
@@ -669,7 +671,7 @@ pub(crate) async fn dispatch_sop_event_to_authorized(
     event: SopEvent,
     target_sop: &str,
     dedup_key: Option<&str>,
-    authorize: &StartAuthorization<'_>,
+    authorize: &SopAdmissionCheck<'_>,
 ) -> Vec<DispatchResult> {
     dispatch_sop_event_filtered(
         engine,
@@ -699,7 +701,7 @@ async fn dispatch_sop_event_filtered(
     // Semantic key shared by fresh producers. Coalesces only while its run is
     // active; terminal retries remain possible.
     active_dedup: Option<&str>,
-    authorize: Option<&StartAuthorization<'_>>,
+    authorize: Option<&SopAdmissionCheck<'_>>,
 ) -> Vec<DispatchResult> {
     let safety = match engine.lock() {
         Ok(eng) => ContentSafety::from_sop_config(eng.config()),

@@ -2390,6 +2390,17 @@ impl RpcDispatcher {
         // rehydration, and subsequent prompts.
         let narrowing = principal_tool_ceiling(grants);
         agent.narrow_to_principal_tools(narrowing.as_deref());
+        if let Some(auth) = self.auth.clone() {
+            let inbound = Arc::clone(&self.ctx.auth);
+            agent.apply_sop_tool_admission(
+                grants.admin,
+                Arc::new(move || {
+                    inbound
+                        .current_grants(&auth)
+                        .is_ok_and(|grants| grants.admin)
+                }),
+            );
+        }
         if !grants.admin
             && !grants
                 .allowed_agents
@@ -12549,7 +12560,7 @@ impl RpcDispatcher {
     fn sop_execution_lease<'a>(
         &'a self,
         method: Method,
-    ) -> Result<Box<dyn crate::sop::dispatch::StartEffectGuard + 'a>, JsonRpcError> {
+    ) -> Result<Box<dyn crate::sop::dispatch::SopEffectGuard + 'a>, JsonRpcError> {
         // Match publication's config -> accepted authority -> pairing order.
         // Callers use a nonblocking store and drop this before any await.
         let config = self.ctx.config.read();
@@ -19487,23 +19498,25 @@ mod tests {
     }
 
     fn allow_all_sop_agents(ctx: &RpcContext) {
-        let mut config = ctx.config.write();
+        let mut config = ctx.config_authority.snapshot_config();
         config
             .permission_profiles
             .get_mut("cron-alpha")
             .unwrap()
             .allowed_agents = vec!["*".into()];
         ctx.auth.refresh_from_config(&config).unwrap();
+        ctx.config_authority.publish_for_test(config);
     }
 
     fn grant_sop_admin(ctx: &RpcContext) {
-        let mut config = ctx.config.write();
+        let mut config = ctx.config_authority.snapshot_config();
         config
             .permission_profiles
             .get_mut("cron-alpha")
             .unwrap()
             .admin = true;
         ctx.auth.refresh_from_config(&config).unwrap();
+        ctx.config_authority.publish_for_test(config);
     }
 
     fn park_sop_run(engine: &Arc<std::sync::Mutex<crate::sop::SopEngine>>, name: &str) -> String {
@@ -20077,7 +20090,7 @@ mod tests {
                 let change = async {
                     entered.notified().await;
                     if revoke {
-                        let guard = Arc::clone(&ctx.config_write_lock).lock_owned().await;
+                        let commit = ctx.config_authority.begin_config_commit().await.unwrap();
                         let mut changed = ctx.config.read().clone();
                         changed
                             .permission_profiles
@@ -20086,7 +20099,11 @@ mod tests {
                             .admin = false;
                         changed.mark_dirty("permission_profiles.cron-alpha");
                         operator
-                            .save_and_swap_config(changed, &guard)
+                            .save_and_publish_config(
+                                commit,
+                                changed,
+                                RpcConfigCommitEffects::default(),
+                            )
                             .await
                             .unwrap();
                     }

@@ -33,8 +33,7 @@ importantly, what changes for existing remote connections.
      live session held under such an alias is refused. The other
      session methods do not check the agent yet, as described under
      [What this layer does not do (yet)](#what-this-layer-does-not-do-yet);
-   - running or approving an SOP requires unrestricted tool and agent
-     selectors plus `tools:execute`, or administrator grants. Creating,
+   - running or approving an SOP requires administrator grants. Creating,
      saving, or deleting one requires the agents it runs as. A step that names
      no agent, on the step or on the procedure, counts as the first configured agent alias in
      sort order, which is the agent the headless executor falls back to.
@@ -377,13 +376,24 @@ and the named deferred MCP tool for on-demand activation; the helper is never
 implicitly granted. Permitted `mode = "always"` MCP tools are preactivated and
 remain callable without the helper.
 
-If either the principal's tool selector or agent selector is constrained,
-`delegate` (bounded and independent), `spawn_subagent`, `execute_pipeline`,
-`sop_execute`, `sop_approve`, and `sop_advance` are unavailable, including skill
-aliases wrapping those tools. These nested
-paths do not yet carry both current principal ceilings; the ordinary parent
-turn remains usable. Admin principals and principals with both selectors set
-to `"*"` keep their agent's configured nested capabilities.
+Non-admin RPC sessions cannot use `sop_execute`, `sop_approve`,
+`sop_advance`, or `sop_workshop`, including skill aliases. They also cannot
+use `spawn_subagent` or `execute_pipeline`: those builders can restore SOP
+entry points without carrying the caller's authority. Read-only SOP tools
+remain available according to the ordinary tool selector.
+
+The direct `delegate` tool remains available when both principal selectors
+are `"*"`; its aliases are withheld because their captured targets cannot
+be identified as the controlled delegate handle.
+Bounded, independent, background, parallel, and nested delegates inherit a
+resolver for the originating credential and read its current authority when
+building each child registry; they withhold the same unsafe tools for a
+non-admin or a revoked credential. Constrained selectors still disable
+`delegate` and its aliases because delegation does not carry both selector
+ceilings. Administrators and the shared operator keep configured tools.
+As with other session tool narrowing, demotion removes parent tools at the
+next prompt admission and a later promotion does not restore removed tools
+in an existing session.
 
 RPC `sops/run` and `sops/decide` require administrator grants, including
 when a non-admin has wildcard tool and agent selectors. Headless steps do
