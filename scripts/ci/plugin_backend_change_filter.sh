@@ -52,7 +52,7 @@ while IFS= read -r path; do
         crates/zeroclaw-infra/src/plugin_webhook*|\
         crates/zeroclaw-infra/src/lib.rs|\
         crates/zeroclaw-infra/Cargo.toml|\
-        src/plugins/*|src/plugin_registry.rs|src/main.rs|\
+        src/plugins/*|src/plugin_registry.rs|src/quickstart_plugins/*|src/main.rs|\
         wit/*|\
         Cargo.toml|Cargo.lock|\
         .github/workflows/ci.yml|\
