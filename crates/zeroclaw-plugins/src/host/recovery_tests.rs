@@ -1403,6 +1403,100 @@ fn an_update_stopped_before_its_claim_leaves_nothing_to_recover() {
     );
 }
 
+/// The stage of the `update` child paused in `root`.
+#[cfg(unix)]
+fn update_stage(root: &Path) -> PathBuf {
+    root.join(
+        tests::dir_entries(root)
+            .into_iter()
+            .find(|name| name.starts_with(".race.installing-v1-"))
+            .unwrap(),
+    )
+}
+
+/// Move the staged `package` aside and put a directory of the writer's own in
+/// its place; return the file that directory holds.
+#[cfg(unix)]
+fn substitute_staged_package(stage: &Path) -> PathBuf {
+    std::fs::rename(stage.join("package"), stage.join("staged-original")).unwrap();
+    std::fs::create_dir_all(stage.join("package/sentinel-tree")).unwrap();
+    let sentinel = stage.join("package/sentinel-tree/keep");
+    std::fs::write(&sentinel, b"not staged by this update").unwrap();
+    sentinel
+}
+
+/// A writer that swaps the staged `package` for a directory of its own and
+/// replaces the package lock while an update waits: the update refuses the
+/// changed lock, and its cleanup clears neither the substitute nor the stage
+/// it moved aside.
+#[cfg(unix)]
+#[test]
+fn an_update_refused_under_a_replaced_lock_clears_nothing() {
+    let root = tempfile::tempdir().unwrap();
+    let previous = installed(root.path(), b"\0asm previous");
+    let replacement = update_source(root.path(), b"\0asm replacement");
+    let paused = Paused::start(root.path(), "update-staged", "update");
+    let stage = update_stage(root.path());
+    let sentinel = substitute_staged_package(&stage);
+    std::fs::rename(
+        root.path().join(".zeroclaw-package-lock-v1"),
+        root.path().join("old-lock"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join(".zeroclaw-package-lock-v1"),
+        b"replacement lock",
+    )
+    .unwrap();
+
+    let output = paused.resume();
+
+    assert!(output.contains("NamespaceChanged"), "{output}");
+    assert_eq!(
+        std::fs::read(&sentinel).unwrap(),
+        b"not staged by this update",
+        "{output}"
+    );
+    assert_eq!(
+        tests::package_bytes(&stage.join("staged-original")),
+        replacement
+    );
+    assert_eq!(tests::package_bytes(&root.path().join("race")), previous);
+}
+
+/// With the namespace intact, an update that fails after staging clears the
+/// package it staged, through the handle it wrote it with, and never a
+/// directory a writer substituted at `package` meanwhile.
+#[cfg(unix)]
+#[test]
+fn an_update_cleanup_clears_its_staged_package_not_a_substitute() {
+    let root = tempfile::tempdir().unwrap();
+    let previous = installed(root.path(), b"\0asm previous");
+    update_source(root.path(), b"\0asm replacement");
+    let paused = Paused::start(root.path(), "update-staged", "update");
+    let stage = update_stage(root.path());
+    let sentinel = substitute_staged_package(&stage);
+    // The claim then fails: nothing is installed under the name any more.
+    std::fs::rename(root.path().join("race"), root.path().join("race-moved")).unwrap();
+
+    let output = paused.resume();
+
+    assert!(output.contains("RESULT:Err"), "{output}");
+    assert_eq!(
+        std::fs::read(&sentinel).unwrap(),
+        b"not staged by this update",
+        "{output}"
+    );
+    assert!(
+        tests::dir_entries(&stage.join("staged-original")).is_empty(),
+        "{output}"
+    );
+    assert_eq!(
+        tests::package_bytes(&root.path().join("race-moved")),
+        previous
+    );
+}
+
 /// The window an update holds the previous generation in is its own: a
 /// recovery started in another process meanwhile waits for the package lock
 /// instead of putting the claim back or deleting it, then finds nothing left
