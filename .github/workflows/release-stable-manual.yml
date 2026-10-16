@@ -324,9 +324,9 @@ jobs:
         shell: bash
         run: bash scripts/ci/check_binary_size.sh "target/${{ matrix.target }}/release/${{ matrix.artifact }}" "${{ matrix.target }}"
         env:
-          # 80 MiB cap for standard release builds. The former 64 MiB cap left
-          # the v0.8.5 x86_64 Linux binaries about 5.3 MiB of headroom, and the
-          # WASM plugin host adds about 4.7 MiB measured on aarch64-apple-darwin.
+          # 80 MiB cap: x86_64 GNU host+Cranelift adds 9,086,320 B (8.67 MiB).
+          # Source: 2026-10-15 size comparison at 88f69013, variants B/C;
+          # official 4d08d6b/run38836146884 measures a 75,978,760 B main binary.
           BINARY_SIZE_HARD_LIMIT: "83886080"
 
       - name: Package (Unix)

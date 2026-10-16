@@ -826,7 +826,7 @@ jobs:
         run: cargo check --locked -p zeroclaw-plugins --no-default-features --features ${{ matrix.features }}
       - name: Run plugin component tests
         if: steps.changed.outputs.run == 'true' && matrix.suite == 'components'
-        run: cargo test --locked -p zeroclaw-plugins --features plugins-wasm-cranelift --test channel_plugin_e2e --test egress_plugin_e2e --test tool_plugin_timeout_e2e --test reference_plugin --test reference_plugin_e2e --test tool_plugin_e2e
+        run: cargo test --locked -p zeroclaw-plugins --features plugins-wasm-cranelift --test channel_plugin_e2e --test egress_plugin_e2e --test tool_plugin_timeout_e2e --test reference_plugin --test reference_plugin_e2e --test tool_plugin_e2e --test socket_plugin_e2e --test websocket_plugin_e2e
       - name: Run plugins lib unit tests
         if: steps.changed.outputs.run == 'true' && matrix.suite == 'components'
         run: cargo test --locked -p zeroclaw-plugins --no-default-features --features plugins-wasm-cranelift --lib
@@ -1253,7 +1253,8 @@ jobs:
               raise RuntimeError('exact twenty-three namespace listing refused')
           # Keep the original larger OR selection and its order; new prefix is appended.
           selectors_old = ['plugin_runtime::', 'tools::tests::shared_ceiling', 'tools::tests::repeated_loader',
-                           'tools::tests::auto_discover', 'tools::tests::colliding_plugin']
+                           'tools::tests::auto_discover', 'tools::tests::colliding_plugin',
+                           'tools::tests::plugin_tls_coherence']
           code, output = run(base + selectors_old + [prefix], 16 * 1024 * 1024, env=env)
           print(output.decode('utf-8', errors='replace'), end='', flush=True)
           passed = re.findall(rb'^test (tools::r5_namespace_tests::late_tool_search\w*) \.\.\. ok$', output, re.M)
