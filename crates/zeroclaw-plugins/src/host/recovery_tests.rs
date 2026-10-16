@@ -39,9 +39,19 @@ fn recovery_process_child() {
         // Dropping the process/lease without cleanup simulates abandonment.
         return;
     }
-    if std::env::var("ZC_RECOVERY_ACTION").as_deref() == Ok("install") {
+    if matches!(
+        std::env::var("ZC_RECOVERY_ACTION").as_deref(),
+        Ok("install" | "unsupported-install" | "write-fault-install")
+    ) {
+        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        if std::env::var("ZC_RECOVERY_ACTION").as_deref() == Ok("unsupported-install") {
+            recovery::FORCE_RENAME_ERROR.with(|error| error.set(Some(rustix::io::Errno::NOSYS)));
+        }
+        let fault = (std::env::var("ZC_RECOVERY_ACTION").as_deref() == Ok("write-fault-install"))
+            .then(|| write_fault::arm(write_fault::Step::Payload));
         let source = std::env::var("ZC_RECOVERY_SOURCE").unwrap();
         let result = host.install(&source);
+        drop(fault);
         println!("RESULT:{result:?}");
         return;
     }
@@ -81,6 +91,10 @@ impl Paused {
     }
     fn start_install(root: &Path, step: &str, source: &Path) -> Self {
         Self::spawn(root, step, "install", Some(source))
+    }
+    #[cfg(unix)]
+    fn start_unsupported_install(root: &Path, step: &str, source: &Path) -> Self {
+        Self::spawn(root, step, "unsupported-install", Some(source))
     }
     fn spawn(root: &Path, step: &str, action: &str, source: Option<&Path>) -> Self {
         let mut command = Command::new(std::env::current_exe().unwrap());
@@ -224,6 +238,449 @@ fn unsupported_claim_preserves_source_substitution_and_destination_file() {
         destination_id
     );
     assert!(output.contains("Unsupported"), "{output}");
+}
+
+#[cfg(unix)]
+struct UnsupportedInstall {
+    // A failed assertion must retire the child before removing its directories.
+    paused: Option<Paused>,
+    parent: tempfile::TempDir,
+    source: tempfile::TempDir,
+    entry: String,
+}
+
+#[cfg(unix)]
+impl UnsupportedInstall {
+    fn at(step: &str) -> Self {
+        Self::with_action(step, "unsupported-install")
+    }
+
+    fn with_action(step: &str, action: &str) -> Self {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("plugins");
+        std::fs::create_dir(&root).unwrap();
+        let source = tempfile::tempdir().unwrap();
+        tests::write_tool_source(source.path(), "race", b"\0asm unsupported fixture");
+        let paused = if action == "unsupported-install" {
+            Paused::start_unsupported_install(&root, step, source.path())
+        } else {
+            Paused::spawn(&root, step, action, Some(source.path()))
+        };
+        let entry = tests::dir_entries(&root)
+            .into_iter()
+            .find(|name| name.starts_with(".race.installing-v1-"))
+            .unwrap();
+        Self {
+            paused: Some(paused),
+            parent,
+            source,
+            entry,
+        }
+    }
+
+    fn root(&self) -> PathBuf {
+        self.parent.path().join("plugins")
+    }
+
+    fn entry_path(&self) -> PathBuf {
+        self.root().join(&self.entry)
+    }
+
+    fn assert_lease_held(&self) {
+        let lease = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(self.entry_path().join("lease"))
+            .unwrap();
+        assert!(
+            matches!(lease.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+            "cleanup must retain the actual transaction lease"
+        );
+    }
+
+    fn resume(&mut self) -> String {
+        self.paused.take().unwrap().resume()
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn unsupported_cleanup_revalidates_root_before_clearing() {
+    let mut case = UnsupportedInstall::at("install-unsupported-before-cleanup");
+    case.assert_lease_held();
+    let expected = tests::package_bytes(case.source.path());
+    let old = case.parent.path().join("old-root");
+    std::fs::rename(case.root(), &old).unwrap();
+    std::fs::create_dir(case.root()).unwrap();
+    std::fs::write(case.root().join("keep"), b"new root occupant").unwrap();
+    let output = case.resume();
+    let package = old.join(&case.entry).join("package");
+    assert!(
+        package.is_dir(),
+        "root identity must refuse before clearing: {output}"
+    );
+    assert_eq!(
+        tests::package_bytes(&package),
+        expected,
+        "root identity must refuse before clearing the retained generation"
+    );
+    assert!(output.contains("NamespaceChanged"), "{output}");
+    assert!(!output.contains("RecoveryRetained"), "{output}");
+    assert_eq!(
+        std::fs::read(case.root().join("keep")).unwrap(),
+        b"new root occupant"
+    );
+    assert_eq!(tests::package_bytes(case.source.path()), expected);
+}
+
+#[cfg(unix)]
+#[test]
+fn round_two_retained_package_handle_protects_substituted_sentinel() {
+    let mut case = UnsupportedInstall::at("install-unsupported-before-cleanup");
+    case.assert_lease_held();
+    let entry = case.entry_path();
+    let expected = tests::package_bytes(case.source.path());
+    std::fs::rename(entry.join("package"), entry.join("staged-original")).unwrap();
+    std::fs::create_dir_all(entry.join("package/sentinel-tree")).unwrap();
+    let sentinel = entry.join("package/sentinel-tree/keep");
+    std::fs::write(&sentinel, b"not staged by this install").unwrap();
+    let output = case.resume();
+    assert!(
+        sentinel.is_file(),
+        "cleanup must use the retained staged handle, never the substitute: {output}"
+    );
+    assert_eq!(
+        std::fs::read(sentinel).unwrap(),
+        b"not staged by this install"
+    );
+    assert!(tests::dir_entries(&entry.join("staged-original")).is_empty());
+    assert_eq!(tests::package_bytes(case.source.path()), expected);
+    assert!(output.contains("MoveUnsupportedCleanup"), "{output}");
+    assert!(!case.root().join("race").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn round_two_vanished_root_is_namespace_refusal() {
+    let mut case = UnsupportedInstall::at("install-unsupported-before-cleanup");
+    case.assert_lease_held();
+    let expected = tests::package_bytes(case.source.path());
+    let old = case.parent.path().join("root-moved-away");
+    std::fs::rename(case.root(), &old).unwrap();
+    let output = case.resume();
+    assert_eq!(
+        tests::package_bytes(&old.join(&case.entry).join("package")),
+        expected
+    );
+    assert!(old.join(&case.entry).join("lease").is_file());
+    assert!(!case.root().exists());
+    assert!(output.contains("NamespaceChanged"), "{output}");
+    assert!(!output.contains("MoveUnsupportedCleanup"), "{output}");
+    assert_eq!(tests::package_bytes(case.source.path()), expected);
+}
+
+#[cfg(unix)]
+#[test]
+fn round_two_failed_write_root_swap_preserves_partial_bytes() {
+    let mut case =
+        UnsupportedInstall::with_action("install-cleanup-before-clear", "write-fault-install");
+    case.assert_lease_held();
+    let source_bytes = tests::package_bytes(case.source.path());
+    let mut partial = source_bytes.clone();
+    for (name, bytes) in &mut partial {
+        if name == "plugin.wasm" {
+            bytes.truncate(bytes.len() / 2);
+        }
+    }
+    assert_eq!(
+        tests::package_bytes(&case.entry_path().join("package")),
+        partial
+    );
+    let old = case.parent.path().join("old-root");
+    std::fs::rename(case.root(), &old).unwrap();
+    std::fs::create_dir(case.root()).unwrap();
+    std::fs::write(case.root().join("keep"), b"replacement root bytes").unwrap();
+    let output = case.resume();
+    assert!(output.contains("NamespaceChanged"), "{output}");
+    assert_eq!(
+        tests::package_bytes(&old.join(&case.entry).join("package")),
+        partial
+    );
+    assert!(old.join(&case.entry).join("lease").is_file());
+    assert_eq!(
+        std::fs::read(case.root().join("keep")).unwrap(),
+        b"replacement root bytes"
+    );
+    assert_eq!(tests::package_bytes(case.source.path()), source_bytes);
+}
+
+#[cfg(unix)]
+#[test]
+fn unsupported_cleanup_revalidates_lock_before_clearing() {
+    let mut case = UnsupportedInstall::at("install-unsupported-before-cleanup");
+    case.assert_lease_held();
+    let expected = tests::package_bytes(case.source.path());
+    std::fs::rename(
+        case.root().join(".zeroclaw-package-lock-v1"),
+        case.root().join("old-lock"),
+    )
+    .unwrap();
+    std::fs::write(
+        case.root().join(".zeroclaw-package-lock-v1"),
+        b"replacement lock",
+    )
+    .unwrap();
+    let output = case.resume();
+    let package = case.entry_path().join("package");
+    assert!(
+        package.is_dir(),
+        "lock identity must refuse before clearing: {output}"
+    );
+    assert_eq!(tests::package_bytes(&package), expected);
+    assert!(output.contains("NamespaceChanged"), "{output}");
+    assert!(!output.contains("RecoveryRetained"), "{output}");
+    assert_eq!(
+        std::fs::read(case.root().join(".zeroclaw-package-lock-v1")).unwrap(),
+        b"replacement lock"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unsupported_cleanup_open_error_preserves_namespace_refusal() {
+    let (_plugins, entry, error) = closed_cleanup_without_package(true);
+    assert!(
+        matches!(error, PluginError::NamespaceChanged(_)),
+        "{error:?}"
+    );
+    assert!(entry.join("lease").is_file());
+}
+
+/// Exercise the actual closed-handle fallback directly. Unix production
+/// install retains its original handle and must never enter this open path.
+#[cfg(unix)]
+fn closed_cleanup_without_package(replace_lock: bool) -> (tempfile::TempDir, PathBuf, PluginError) {
+    let plugins = tempfile::tempdir().unwrap();
+    let root = recovery::Root::open(plugins.path()).unwrap();
+    let lock = root.lock().unwrap();
+    let tx = root.transaction("race", "installing").unwrap();
+    tx.dir.create_dir("package").unwrap();
+    tx.dir
+        .write("package/keep", b"owned closed-path bytes")
+        .unwrap();
+    let entry = plugins.path().join(&tx.entry);
+    std::fs::rename(entry.join("package"), entry.join("held-package")).unwrap();
+    let lease = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(entry.join("lease"))
+        .unwrap();
+    assert!(matches!(
+        lease.try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    drop(lease);
+    if replace_lock {
+        std::fs::rename(
+            plugins.path().join(".zeroclaw-package-lock-v1"),
+            plugins.path().join("old-lock"),
+        )
+        .unwrap();
+        std::fs::write(
+            plugins.path().join(".zeroclaw-package-lock-v1"),
+            b"replacement lock",
+        )
+        .unwrap();
+    }
+    let error = cleanup_after_unsupported_publish(
+        plugins.path(),
+        &root,
+        tx,
+        None,
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "controlled unavailable move",
+        ),
+    );
+    assert_eq!(
+        std::fs::read(entry.join("held-package/keep")).unwrap(),
+        b"owned closed-path bytes"
+    );
+    assert!(entry.join("lease").is_file());
+    assert!(!entry.join("package").exists());
+    assert!(!plugins.path().join("race").exists());
+    drop(lock);
+    (plugins, entry, error)
+}
+
+#[cfg(unix)]
+#[test]
+fn round_two_closed_open_failure_with_intact_namespace_is_not_success() {
+    let (_plugins, entry, error) = closed_cleanup_without_package(false);
+    assert!(
+        matches!(&error, PluginError::MoveUnsupportedCleanup { path, .. } if path == &entry.display().to_string()),
+        "{error:?}"
+    );
+    assert!(
+        !error
+            .to_string()
+            .contains(&entry.join("package").display().to_string()),
+        "{error}"
+    );
+    assert!(entry.join("lease").is_file());
+}
+
+#[test]
+fn round_two_open_failure_keeps_original_error_over_non_namespace_check_error() {
+    let error = cleanup_open_error(
+        std::io::Error::new(std::io::ErrorKind::NotFound, "original staged-package open"),
+        Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "root check denied").into()),
+    );
+    assert!(
+        matches!(&error, PluginError::Io(error) if error.kind() == std::io::ErrorKind::NotFound),
+        "{error:?}"
+    );
+    assert!(
+        error.to_string().contains("original staged-package open"),
+        "{error}"
+    );
+    assert!(!error.to_string().contains("root check denied"), "{error}");
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+#[test]
+fn unsupported_cleanup_partial_clear_fault_keeps_remaining_bytes_without_retry_class() {
+    struct Reset(Option<rustix::io::Errno>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            recovery::FORCE_RENAME_ERROR.with(|error| error.set(self.0));
+        }
+    }
+    let _reset = Reset(
+        recovery::FORCE_RENAME_ERROR.with(|error| error.replace(Some(rustix::io::Errno::NOSYS))),
+    );
+    let root = tempfile::tempdir().unwrap();
+    let source = tempfile::tempdir().unwrap();
+    tests::write_tool_source(source.path(), "race", b"\0asm partially cleared");
+    let expected = tests::package_bytes(source.path());
+    let mut host = PluginHost::from_plugins_dir(root.path()).unwrap();
+    let _fault = cleanup_fault::arm();
+    let error = host.install(source.path().to_str().unwrap()).unwrap_err();
+    let entry = tests::dir_entries(root.path())
+        .into_iter()
+        .find(|name| name.starts_with(".race.installing-v1-"))
+        .unwrap();
+    let package = root.path().join(entry).join("package");
+    assert_eq!(
+        tests::package_bytes(&package),
+        [("plugin.wasm".into(), b"\0asm partially cleared".to_vec())]
+    );
+    assert_eq!(tests::package_bytes(source.path()), expected);
+    assert!(!root.path().join("race").exists());
+    assert!(host.get_plugin("race").is_none());
+    assert!(
+        format!("{error:?}").contains("MoveUnsupportedCleanup"),
+        "permanent unsupported publication must not use the retry class: {error:?}"
+    );
+    assert!(
+        error.to_string().contains(&package.display().to_string()),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("injected partial cleanup fault"),
+        "{error}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unsupported_cleanup_unlink_fault_preserves_new_entry_without_retry() {
+    let mut case = UnsupportedInstall::at("install-cleanup-before-package-unlink");
+    case.assert_lease_held();
+    let package = case.entry_path().join("package");
+    assert!(tests::dir_entries(&package).is_empty());
+    std::fs::write(
+        package.join("new-occupant"),
+        b"not part of the cleared copy",
+    )
+    .unwrap();
+    let output = case.resume();
+    assert_eq!(
+        std::fs::read(package.join("new-occupant")).unwrap(),
+        b"not part of the cleared copy"
+    );
+    assert!(output.contains("MoveUnsupportedCleanup"), "{output}");
+    assert!(output.contains(&package.display().to_string()), "{output}");
+    assert!(!output.contains("RecoveryRetained"), "{output}");
+    assert!(!case.root().join("race").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn unsupported_cleanup_finish_fault_names_entry_without_package_claim() {
+    let mut case = UnsupportedInstall::at("install-cleanup-before-finish");
+    case.assert_lease_held();
+    let entry = case.entry_path();
+    assert!(!entry.join("package").exists());
+    std::fs::write(entry.join("new-occupant"), b"keep transaction entry").unwrap();
+    let output = case.resume();
+    assert_eq!(
+        std::fs::read(entry.join("new-occupant")).unwrap(),
+        b"keep transaction entry"
+    );
+    assert!(!entry.join("package").exists());
+    assert!(output.contains("MoveUnsupportedCleanup"), "{output}");
+    assert!(output.contains(&entry.display().to_string()), "{output}");
+    assert!(
+        !output.contains(&entry.join("package").display().to_string()),
+        "removed package must not be reported as retained: {output}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unsupported_cleanup_revalidates_root_before_package_unlink() {
+    let mut case = UnsupportedInstall::at("install-cleanup-before-package-unlink");
+    case.assert_lease_held();
+    let old = case.parent.path().join("old-root");
+    std::fs::rename(case.root(), &old).unwrap();
+    std::fs::create_dir(case.root()).unwrap();
+    let output = case.resume();
+    let entry = old.join(&case.entry);
+    assert!(
+        entry.join("package").is_dir(),
+        "namespace refusal must precede unlink: {output}"
+    );
+    assert!(
+        entry.join("lease").is_file(),
+        "namespace refusal must precede finish: {output}"
+    );
+    assert!(output.contains("NamespaceChanged"), "{output}");
+    assert!(tests::dir_entries(&case.root()).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn unsupported_cleanup_revalidates_lock_before_finishing_and_keeps_lease() {
+    let mut case = UnsupportedInstall::at("install-cleanup-before-finish");
+    case.assert_lease_held();
+    std::fs::rename(
+        case.root().join(".zeroclaw-package-lock-v1"),
+        case.root().join("old-lock"),
+    )
+    .unwrap();
+    std::fs::write(
+        case.root().join(".zeroclaw-package-lock-v1"),
+        b"replacement lock",
+    )
+    .unwrap();
+    let output = case.resume();
+    assert!(
+        case.entry_path().join("lease").is_file(),
+        "namespace refusal must precede lease removal: {output}"
+    );
+    assert!(output.contains("NamespaceChanged"), "{output}");
+    assert!(!case.entry_path().join("package").exists());
 }
 
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
@@ -764,6 +1221,16 @@ fn namespace_failure_is_never_a_structural_recovery_verdict() {
         &PluginError::RecoveryRetained {
             path: "synthetic".into(),
             reason: "refused".into()
+        }
+    ));
+}
+
+#[test]
+fn unsupported_cleanup_failure_is_not_a_structural_recovery_verdict() {
+    assert!(!is_structural_admission_failure(
+        &PluginError::MoveUnsupportedCleanup {
+            path: "synthetic transaction entry".into(),
+            reason: "partial cleanup refused".into(),
         }
     ));
 }

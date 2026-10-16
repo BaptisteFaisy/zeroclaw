@@ -140,12 +140,24 @@ inside the plugins directory and holds an operating-system lease through
 publication. It moves the package into place without replacing any occupant,
 only after the manifest, component, and any `skills/` tree are written. If the
 platform or filesystem cannot provide an atomic no-replace move, as on FreeBSD
-and the other Unix systems besides Linux, Android and macOS, on an NFS mount,
-or on Linux before 3.15, installation refuses, removes its staged copy and
-says so; retrying there fails the same way. A failed or interrupted write
-leaves no partial package under the
-final name. Discovery ignores hidden transactions, and a later install uses
+and the other Unix systems besides Linux, Android and macOS, on an NFS mount
+without no-replace support, or on Linux before 3.15, installation refuses,
+removes its staged copy and says so; retrying there fails the same way. A failed
+or interrupted write leaves no partial package under the final name. Discovery
+ignores hidden transactions, and a later install uses
 fresh staging instead of replacing another process's stage.
+
+An unsupported move is not a reason to retry on the same unsupported
+filesystem. If cleanup also fails, install reports the failed cleanup location
+and requires that failure and safe-move support to be resolved first. The
+location is the package directory for a partial clear or failed empty-directory
+unlink, or the transaction entry if its package is absent or was already removed.
+The message does not claim the original payload is still intact. Cleanup checks
+treat a replaced or removed plugins root or coordination lock as a namespace
+refusal before continuing. The reported hidden transaction belongs to this failed
+install and does not block a later one: `plugin remove` does not sweep it while no
+package of that name exists, so once no install is running you may inspect and
+delete that specific transaction by hand.
 
 Earlier builds wrote straight into the final directory, creating it and then
 writing `manifest.toml` first, so an interrupted install could leave an empty
