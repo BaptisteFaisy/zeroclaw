@@ -550,25 +550,32 @@ jobs:
 
       - name: Run the plugin smoke against the built binary
         shell: bash
+        env:
+          SMOKE_DISTRIBUTION: ${{ inputs.distribution }}
+          SMOKE_BINARY: ${{ steps.archive.outputs.binary }}
+          SMOKE_ARCHIVE: ${{ steps.archive.outputs.archive }}
+          SMOKE_BINARY_NAME: ${{ runner.os == 'Windows' && 'zeroclaw.exe' || 'zeroclaw' }}
+          SMOKE_LABEL: ${{ inputs.distribution }} / ${{ matrix.target }}
+          SMOKE_EVIDENCE: plugin-smoke-${{ matrix.target }}.md
         run: |
           set -euo pipefail
-          if [ "${{ inputs.distribution }}" = dist ]; then
-            binary="${{ steps.archive.outputs.binary }}"
+          if [ "$SMOKE_DISTRIBUTION" = dist ]; then
+            binary="$SMOKE_BINARY"
           else
-            binary="binary/${{ runner.os == 'Windows' && 'zeroclaw.exe' || 'zeroclaw' }}"
+            binary="binary/$SMOKE_BINARY_NAME"
           fi
           chmod +x "$binary"
           archive_args=()
-          if [ "${{ inputs.distribution }}" = dist ]; then
-            archive_args=(--archive "${{ steps.archive.outputs.archive }}")
+          if [ "$SMOKE_DISTRIBUTION" = dist ]; then
+            archive_args=(--archive "$SMOKE_ARCHIVE")
           fi
           bash scripts/ci/plugin_artifact_smoke.sh \
             --binary "$binary" \
             --expect host \
             --packages plugin-smoke-packages \
-            --label "${{ inputs.distribution }} / ${{ matrix.target }}" \
+            --label "$SMOKE_LABEL" \
             ${archive_args[@]+"${archive_args[@]}"} \
-            --evidence "plugin-smoke-${{ matrix.target }}.md"
+            --evidence "$SMOKE_EVIDENCE"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
         with:

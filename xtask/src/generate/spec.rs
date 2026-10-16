@@ -1744,7 +1744,8 @@ mod tests {
             root().join(".github/actions/build-release-payloads/action.yml"),
         )
         .unwrap();
-        assert!(shared.contains("features --selection dist --target \"${{ inputs.target }}\""));
+        assert!(shared.contains("RELEASE_TARGET: ${{ inputs.target }}"));
+        assert!(shared.contains("features --selection dist --target \"$RELEASE_TARGET\""));
         assert!(!release.contains("excluded_features"));
         // The stable release build MUST pin --no-default-features against the
         // generator's explicit per-target list, exactly like the manual workflow.
@@ -1755,7 +1756,7 @@ mod tests {
         // appears as a literal in the workflow.
         assert!(
             shared.contains(
-                "$BUILD_CMD --release --locked --no-default-features --features \"${FEATURES}\" --target ${{ inputs.target }}"
+                "$BUILD_CMD --release --locked --no-default-features --features \"${FEATURES}\" --target \"$RELEASE_TARGET\""
             ),
             "the stable release build must pin --no-default-features so target-excluded default features cannot leak back in"
         );
@@ -1902,10 +1903,8 @@ mod tests {
         assert!(native_smoke.contains(
             "--expected-run \"$GITHUB_RUN_ID\" --expected-attempt \"$GITHUB_RUN_ATTEMPT\""
         ));
-        assert!(
-            native_smoke
-                .contains("archive_args=(--archive \"${{ steps.archive.outputs.archive }}\")")
-        );
+        assert!(native_smoke.contains("archive_args=(--archive \"$SMOKE_ARCHIVE\")"));
+        assert!(native_smoke.contains("SMOKE_ARCHIVE: ${{ steps.archive.outputs.archive }}"));
         assert!(native_smoke.contains("${archive_args[@]+\"${archive_args[@]}\"}"));
         assert!(
             native_smoke.find("Run scripted provider tests").unwrap()

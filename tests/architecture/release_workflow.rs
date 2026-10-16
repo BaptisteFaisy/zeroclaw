@@ -306,7 +306,17 @@ fn shared_release_recipe() -> String {
     assert!(action.contains("    default: ''\n"));
     assert!(step.contains("        RELEASE_CARGO_JOBS: ${{ inputs.cargo-jobs }}\n"));
     assert!(step.contains("        RELEASE_FEATURES_EVIDENCE: ${{ inputs.emit_features }}\n"));
-    explicit_bash_body(step, "        ")
+    for binding in [
+        "RELEASE_TARGET: ${{ inputs.target }}",
+        "RELEASE_LINKER_ENV: ${{ inputs.linker_env || '' }}",
+        "RELEASE_LINKER: ${{ inputs.linker || '' }}",
+        "RELEASE_USE_CROSS: ${{ inputs.use_cross || 'false' }}",
+    ] {
+        assert!(step.contains(binding));
+    }
+    let body = explicit_bash_body(step, "        ");
+    assert!(!body.contains("${{"), "recipe expressions belong in env");
+    body
 }
 
 fn assert_release_caller(step: &str, emit_features: &str) {
@@ -466,7 +476,14 @@ cross() { controlled_command cross "$@"; }
         .env("RECIPE_LINKER_ENV", context.linker_env)
         .env("RECIPE_FAIL", failure)
         .env("RECIPE_FEATURES", features)
-        .env("RELEASE_FEATURES_EVIDENCE", emit_features);
+        .env("RELEASE_FEATURES_EVIDENCE", emit_features)
+        .env("RELEASE_TARGET", context.target)
+        .env("RELEASE_LINKER_ENV", context.linker_env)
+        .env("RELEASE_LINKER", context.linker)
+        .env(
+            "RELEASE_USE_CROSS",
+            if context.use_cross { "true" } else { "false" },
+        );
     // Retain interpreter startup inputs, including Windows' system directory,
     // while excluding inherited Cargo/compiler flags from the recipe oracle.
     for key in ["PATH", "SystemRoot", "WINDIR", "TEMP", "TMP"] {
@@ -639,12 +656,39 @@ fn shared_release_recipe_preserves_all_ten_command_failure_contexts() {
             .expect("identified adapter ends");
         inverted.replace_range(from..through, "");
     }
-    for field in ["target", "linker_env", "linker", "use_cross"] {
-        inverted = inverted.replace(&format!("inputs.{field}"), &format!("matrix.{field}"));
+    // Invert only the four checked env bindings and target argument quoting;
+    // the immutable full-body comparison and all ten argv traces stay intact.
+    for (from, to) in [
+        (
+            r#"if [ -n "$RELEASE_LINKER_ENV" ] && [ -n "$RELEASE_LINKER" ]; then"#,
+            r#"if [ -n "${{ matrix.linker_env || '' }}" ] && [ -n "${{ matrix.linker || '' }}" ]; then"#,
+        ),
+        (
+            r#"export "$RELEASE_LINKER_ENV=$RELEASE_LINKER""#,
+            r#"export "${{ matrix.linker_env }}=${{ matrix.linker }}""#,
+        ),
+        ("$RELEASE_TARGET", "${{ matrix.target }}"),
+        ("$RELEASE_USE_CROSS", "${{ matrix.use_cross || 'false' }}"),
+    ] {
+        assert!(
+            inverted.contains(from),
+            "env binding must reach recipe: {from}"
+        );
+        inverted = inverted.replace(from, to);
+    }
+    for command in [
+        r#"$BUILD_CMD --release --locked --no-default-features --features "${FEATURES}""#,
+        "$BUILD_CMD --release --locked -p zerocode",
+        "$BUILD_CMD --release --locked -p zerorelay",
+    ] {
+        let quoted = format!(r#"{command} --target "${{{{ matrix.target }}}}""#);
+        let original = format!("{command} --target ${{{{ matrix.target }}}}");
+        assert_eq!(inverted.matches(&quoted).count(), 1);
+        inverted = inverted.replacen(&quoted, &original, 1);
     }
     assert_eq!(
         inverted, OLD_RELEASE_RECIPE,
-        "only the four input bindings and identified adapter may differ"
+        "only the four env bindings, target quoting and identified adapters may differ"
     );
     for context in RELEASE_RECIPE_CONTEXTS {
         let recipe = render_release_recipe(&body, "inputs", context);
@@ -745,11 +789,15 @@ fn shared_release_recipe_behavior_oracle_rejects_actual_recipe_mutations() {
             "BUILD_CMD=\"cargo build --jobs 2\"",
         ),
         (1, "BUILD_CMD=\"cross build\"", "BUILD_CMD=\"cargo build\""),
-        (2, "${{ inputs.linker }}", "ignored-linker"),
+        (
+            2,
+            "$RELEASE_LINKER_ENV=$RELEASE_LINKER",
+            "$RELEASE_LINKER_ENV=ignored-linker",
+        ),
         (5, "-C target-feature=-neon", "-C target-feature=+neon"),
         (
             2,
-            "--target \"${{ inputs.target }}\"",
+            "--target \"$RELEASE_TARGET\"",
             "--target \"x86_64-unknown-linux-gnu\"",
         ),
         (
@@ -779,19 +827,19 @@ fn shared_release_recipe_behavior_oracle_rejects_actual_recipe_mutations() {
     for (stage, needle) in [
         (
             "generator",
-            "FEATURES=\"$(cargo run --quiet -p xtask --bin generate -- features --selection dist --target \"${{ inputs.target }}\")\"",
+            "FEATURES=\"$(cargo run --quiet -p xtask --bin generate -- features --selection dist --target \"$RELEASE_TARGET\")\"",
         ),
         (
             "main",
-            "$BUILD_CMD --release --locked --no-default-features --features \"${FEATURES}\" --target ${{ inputs.target }}",
+            "$BUILD_CMD --release --locked --no-default-features --features \"${FEATURES}\" --target \"$RELEASE_TARGET\"",
         ),
         (
             "zerocode",
-            "$BUILD_CMD --release --locked -p zerocode --target ${{ inputs.target }}",
+            "$BUILD_CMD --release --locked -p zerocode --target \"$RELEASE_TARGET\"",
         ),
         (
             "zerorelay",
-            "$BUILD_CMD --release --locked -p zerorelay --target ${{ inputs.target }}",
+            "$BUILD_CMD --release --locked -p zerorelay --target \"$RELEASE_TARGET\"",
         ),
     ] {
         let changed = body.replacen(needle, &format!("{needle} || true"), 1);
@@ -813,7 +861,7 @@ fn shared_release_recipe_adapter_guards_have_failure_controls() {
     let body = shared_release_recipe();
     for (from, to, target, switch, features) in [
         (
-            "if [ -z \"${{ inputs.target }}\" ]; then",
+            "if [ -z \"$RELEASE_TARGET\" ]; then",
             "if false; then",
             "",
             "false",
@@ -2358,9 +2406,9 @@ fn plugin_execution_smoke_gates_the_release() {
 --binary \"$binary\" \\\n            \
 --expect host \\\n            \
 --packages plugin-smoke-packages \\\n            \
---label \"${{ inputs.distribution }} / ${{ matrix.target }}\" \\\n            \
+--label \"$SMOKE_LABEL\" \\\n            \
 ${archive_args[@]+\"${archive_args[@]}\"} \\\n            \
---evidence \"plugin-smoke-${{ matrix.target }}.md\"\n";
+--evidence \"$SMOKE_EVIDENCE\"\n";
     for required in [
         "needs: [build, plugin-smoke-packages]",
         "if: ${{ !cancelled() && inputs.qualification_profile == 'normal' && !inputs.release_tools_only && needs.plugin-smoke-packages.result == 'success' }}",
@@ -2413,12 +2461,23 @@ ${archive_args[@]+\"${archive_args[@]}\"} \\\n            \
         !rehearsal_smoke.contains("continue-on-error"),
         "the actual rehearsal smoke step must propagate every failed control"
     );
+    for binding in [
+        "SMOKE_DISTRIBUTION: ${{ inputs.distribution }}",
+        "SMOKE_BINARY: ${{ steps.archive.outputs.binary }}",
+        "SMOKE_ARCHIVE: ${{ steps.archive.outputs.archive }}",
+        "SMOKE_BINARY_NAME: ${{ runner.os == 'Windows' && 'zeroclaw.exe' || 'zeroclaw' }}",
+        "SMOKE_LABEL: ${{ inputs.distribution }} / ${{ matrix.target }}",
+        "SMOKE_EVIDENCE: plugin-smoke-${{ matrix.target }}.md",
+    ] {
+        assert!(rehearsal_smoke.contains(binding));
+    }
+    assert!(!explicit_bash_body(rehearsal_smoke, "          ").contains("${{"));
     assert!(rehearsal_smoke.contains(rehearsal_invocation));
     assert!(rehearsal_smoke.contains(
-        "if [ \"${{ inputs.distribution }}\" = dist ]; then\n            binary=\"${{ steps.archive.outputs.binary }}\"\n          else\n            binary=\"binary/${{ runner.os == 'Windows' && 'zeroclaw.exe' || 'zeroclaw' }}\"\n          fi"
+        "if [ \"$SMOKE_DISTRIBUTION\" = dist ]; then\n            binary=\"$SMOKE_BINARY\"\n          else\n            binary=\"binary/$SMOKE_BINARY_NAME\"\n          fi"
     ));
     assert!(rehearsal_smoke.contains(
-        "archive_args=()\n          if [ \"${{ inputs.distribution }}\" = dist ]; then\n            archive_args=(--archive \"${{ steps.archive.outputs.archive }}\")\n          fi"
+        "archive_args=()\n          if [ \"$SMOKE_DISTRIBUTION\" = dist ]; then\n            archive_args=(--archive \"$SMOKE_ARCHIVE\")\n          fi"
     ));
     assert!(
         yaml_block(&manual, "  plugin-smoke-packages:\n")

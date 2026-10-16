@@ -72,6 +72,7 @@ mod tests {
         let recipe =
             std::fs::read_to_string(root.join(".github/actions/build-release-payloads/action.yml"))
                 .unwrap();
-        assert!(recipe.contains("features --selection dist --target \"${{ inputs.target }}\""));
+        assert!(recipe.contains("RELEASE_TARGET: ${{ inputs.target }}"));
+        assert!(recipe.contains("features --selection dist --target \"$RELEASE_TARGET\""));
     }
 }
