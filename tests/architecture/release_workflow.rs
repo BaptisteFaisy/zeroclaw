@@ -363,7 +363,10 @@ fn assert_arm64_build_memory(job: &str) {
     } else {
         "false"
     };
-    assert_release_caller(yaml_block(job, "      - name: Build release\n"), emit_features);
+    assert_release_caller(
+        yaml_block(job, "      - name: Build release\n"),
+        emit_features,
+    );
 }
 
 fn without_arm64_build_memory(document: &str) -> String {
@@ -680,7 +683,10 @@ fn shared_release_recipe_optional_jobs_is_explicit_and_narrow() {
             .into_iter()
             .map(|line| line.replace("|build|", "|build|--jobs|2|"))
             .collect();
-        assert_eq!(observed.status, Some(if failure.is_empty() { 0 } else { 83 }));
+        assert_eq!(
+            observed.status,
+            Some(if failure.is_empty() { 0 } else { 83 })
+        );
         assert_eq!(observed.trace, expected, "{}", observed.diagnostics);
         assert!(observed.evidence.is_none());
     }
