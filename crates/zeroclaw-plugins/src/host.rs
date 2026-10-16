@@ -1252,15 +1252,31 @@ impl PluginHost {
 
         let root = opened_root(&self.recovery_root, &self.plugins_dir)?;
         let _guard = root.lock()?;
+        // The replacement is staged as install stages a package, and the
+        // handle it was written through is kept for cleanup, so a directory
+        // substituted at `package` meanwhile is never the one cleared.
         let stage = root.transaction(&manifest.name, "installing")?;
-        if let Err(error) = stage_replacement(
-            &stage,
+        if let Err(error) = stage.dir.create_dir(recovery::PACKAGE) {
+            discard(root, stage, None);
+            return Err(error.into());
+        }
+        let package = match stage.dir.open_dir(recovery::PACKAGE) {
+            Ok(package) => package,
+            Err(error) => {
+                discard(root, stage, None);
+                return Err(error.into());
+            }
+        };
+        let staged = write_package(
+            &package,
             &manifest,
             &manifest_toml,
             &source_dir,
             component.as_ref(),
-        ) {
-            discard(root, stage);
+        )
+        .and_then(|()| check_staged_skills(&manifest, &package));
+        if let Err(error) = staged {
+            discard(root, stage, Some(package));
             return Err(error);
         }
         #[cfg(test)]
@@ -1269,7 +1285,7 @@ impl PluginHost {
         let held = match root.transaction(&manifest.name, "replacing") {
             Ok(held) => held,
             Err(error) => {
-                discard(root, stage);
+                discard(root, stage, Some(package));
                 return Err(error);
             }
         };
@@ -1277,13 +1293,13 @@ impl PluginHost {
         recovery::pause("update-before-claim");
         if let Err(error) = held.claim(root, &entry) {
             let _ = held.finish(root);
-            discard(root, stage);
+            discard(root, stage, Some(package));
             return Err(error);
         }
         #[cfg(test)]
         recovery::pause("update-claimed");
         if let Err(error) = self.claimed_is_loaded(&held, &manifest.name) {
-            discard(root, stage);
+            discard(root, stage, Some(package));
             let refused = put_back(root, &manifest.name, &entry, held, error);
             if matches!(refused, PluginError::ReplacementInterrupted { .. }) {
                 self.loaded.remove(&manifest.name);
@@ -1291,16 +1307,28 @@ impl PluginHost {
             return Err(refused);
         }
 
+        // Unix permits publishing an open directory, so the staged handle is
+        // kept for cleanup if publication fails. Windows needs the directory
+        // closed before publication, and its cleanup reopens it through the
+        // stage, still behind the namespace checks.
+        #[cfg(unix)]
+        let package = Some(package);
+        #[cfg(not(unix))]
+        let package = {
+            drop(package);
+            None
+        };
         #[cfg(test)]
         replace_hook::run(&self.plugins_dir, &stage.entry, &held.entry);
         if let Err(error) = stage.publish(root, &entry) {
-            discard(root, stage);
+            discard(root, stage, package);
             let refused = put_back(root, &manifest.name, &entry, held, error);
             if matches!(refused, PluginError::ReplacementInterrupted { .. }) {
                 self.loaded.remove(&manifest.name);
             }
             return Err(refused);
         }
+        drop(package);
         #[cfg(test)]
         recovery::pause("update-published");
         // The stage holds nothing but its lease now. One left behind is swept
@@ -1620,35 +1648,43 @@ fn delete_claimed(
     }
 }
 
-/// Delete a stage's package through its handle and release the stage. A stage
-/// that cannot be cleared is left for the sweep of abandoned stages.
-fn discard(root: &recovery::Root, stage: recovery::Transaction) {
-    let cleared = match stage.dir.open_dir(recovery::PACKAGE) {
-        Ok(package) => recovery::clear_owned(&package).and_then(|()| {
-            drop(package);
-            stage.dir.remove_dir(recovery::PACKAGE)?;
-            Ok(())
-        }),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
+/// Clear the replacement an update staged and release its stage, with the
+/// checks install's cleanup makes: the plugins root and the package lock are
+/// checked before the clear, before unlinking the package directory and
+/// before finishing the stage, and a stage whose namespace changed is left as
+/// found. The clear goes through `package`, the handle the stage was written
+/// through, so a directory substituted at `package` is never the one cleared.
+/// `package` is `None` when the directory was never opened, or was closed so
+/// that it could be published; it is then reopened through the stage's own
+/// handle. A package directory that is already gone has nothing left to
+/// unlink. A stage that cannot be cleared is left for the sweep of abandoned
+/// stages.
+fn discard(root: &recovery::Root, stage: recovery::Transaction, package: Option<Dir>) {
+    let package = match package {
+        Some(package) => Some(package),
+        None => match stage.dir.open_dir(recovery::PACKAGE) {
+            Ok(package) => Some(package),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return,
+        },
     };
-    if cleared.is_ok() {
+    if let Some(package) = package {
+        if check_cleanup_namespace(root).is_err() || recovery::clear_owned(&package).is_err() {
+            return;
+        }
+        drop(package);
+        if check_cleanup_namespace(root).is_err() {
+            return;
+        }
+        match stage.dir.remove_dir(recovery::PACKAGE) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return,
+        }
+    }
+    if check_cleanup_namespace(root).is_ok() {
         let _ = stage.finish(root);
     }
-}
-
-/// Build the admitted package in `stage`, as install does.
-fn stage_replacement(
-    stage: &recovery::Transaction,
-    manifest: &PluginManifest,
-    manifest_toml: &str,
-    source_dir: &Path,
-    component: Option<&AdmittedComponent>,
-) -> Result<(), PluginError> {
-    stage.dir.create_dir(recovery::PACKAGE)?;
-    let package = stage.dir.open_dir(recovery::PACKAGE)?;
-    write_package(&package, manifest, manifest_toml, source_dir, component)?;
-    check_staged_skills(manifest, &package)
 }
 
 /// Check the skill bundle a skill-capable package actually staged, as
