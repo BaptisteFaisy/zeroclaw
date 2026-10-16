@@ -302,6 +302,9 @@ fn shared_release_recipe() -> String {
     let action = fs::read_to_string(action_path).expect("read shared release recipe");
     let step = yaml_block(&action, "    - id: build\n");
     assert!(step.contains("      shell: bash\n"));
+    assert!(action.contains("  cargo-jobs:\n"));
+    assert!(action.contains("    default: ''\n"));
+    assert!(step.contains("        RELEASE_CARGO_JOBS: ${{ inputs.cargo-jobs }}\n"));
     assert!(step.contains("        RELEASE_FEATURES_EVIDENCE: ${{ inputs.emit_features }}\n"));
     explicit_bash_body(step, "        ")
 }
@@ -317,11 +320,59 @@ fn assert_release_caller(step: &str, emit_features: &str) {
                 "          linker_env: ${{{{ matrix.linker_env || '' }}}}\n",
                 "          linker: ${{{{ matrix.linker || '' }}}}\n",
                 "          use_cross: ${{{{ matrix.use_cross || 'false' }}}}\n",
-                "          emit_features: '{}'"
+                "          emit_features: '{}'\n",
+                "          cargo-jobs: ${{{{ matrix.target == 'aarch64-unknown-linux-gnu' && '2' || '' }}}}"
             ),
             emit_features
         )
     );
+}
+
+fn arm64_build_memory_steps() -> [&'static str; 2] {
+    [
+        concat!(
+            "      - name: Prepare bounded Linux ARM64 build memory\n",
+            "        id: dist_memory\n",
+            "        timeout-minutes: 5\n",
+            "        if: runner.os == 'Linux' && matrix.target == 'aarch64-unknown-linux-gnu'\n",
+            "        shell: bash\n",
+            "        run: bash scripts/ci/dist_runner_memory.sh prepare\n\n"
+        ),
+        concat!(
+            "      - name: Report and release owned Linux ARM64 build memory\n",
+            "        timeout-minutes: 5\n",
+            "        if: always() && runner.os == 'Linux' && matrix.target == 'aarch64-unknown-linux-gnu'\n",
+            "        shell: bash\n",
+            "        env:\n",
+            "          ZC_DIST_SWAP_FILE: ${{ steps.dist_memory.outputs.swap_file }}\n",
+            "          ZC_DIST_SWAP_IDENTITY: ${{ steps.dist_memory.outputs.swap_identity }}\n",
+            "        run: bash scripts/ci/dist_runner_memory.sh cleanup\n\n"
+        ),
+    ]
+}
+
+fn assert_arm64_build_memory(job: &str) {
+    let [prepare, cleanup] = arm64_build_memory_steps();
+    assert_eq!(job.matches(prepare).count(), 1);
+    assert_eq!(job.matches(cleanup).count(), 1);
+    assert_eq!(job.matches("dist_runner_memory.sh").count(), 2);
+    let build = job.find("      - name: Build release\n").unwrap();
+    assert!(job.find(prepare).unwrap() < build && build < job.find(cleanup).unwrap());
+    let emit_features = if job.contains("emit_features: 'true'") {
+        "true"
+    } else {
+        "false"
+    };
+    assert_release_caller(yaml_block(job, "      - name: Build release\n"), emit_features);
+}
+
+fn without_arm64_build_memory(document: &str) -> String {
+    let mut document = document.to_owned();
+    for step in arm64_build_memory_steps() {
+        assert_eq!(document.matches(step).count(), 1);
+        document = document.replacen(step, "", 1);
+    }
+    document
 }
 
 fn render_release_recipe(body: &str, namespace: &str, context: ReleaseRecipeContext) -> String {
@@ -514,7 +565,9 @@ fn immutable_stable_release_recipe_has_real_command_and_failure_baselines() {
         format!("{:x}", Sha256::digest(OLD_RELEASE_RECIPE.as_bytes())),
         OLD_RELEASE_RECIPE_SHA256
     );
-    let release = workflow("release-stable-manual.yml");
+    let original = workflow("release-stable-manual.yml");
+    assert_arm64_build_memory(yaml_block(&original, "  build:\n"));
+    let release = without_arm64_build_memory(&original);
     let build = yaml_block(&release, "  build:\n");
     let caller = yaml_block(build, "      - name: Build release\n");
     assert_release_caller(caller, "false");
@@ -571,6 +624,10 @@ fn shared_release_recipe_preserves_all_ten_command_failure_contexts() {
             "# BEGIN qualification-only FEATURES output adapter\n",
             "# END qualification-only FEATURES output adapter\n",
         ),
+        (
+            "# BEGIN optional build concurrency adapter\n",
+            "# END optional build concurrency adapter\n",
+        ),
     ] {
         let from = inverted.find(start).expect("identified adapter starts");
         let through = inverted[from..]
@@ -603,6 +660,35 @@ fn shared_release_recipe_preserves_all_ten_command_failure_contexts() {
             observed.evidence.as_deref(),
             Some("features=fixture-a,fixture-b\n")
         );
+    }
+}
+
+#[test]
+fn shared_release_recipe_optional_jobs_is_explicit_and_narrow() {
+    let context = RELEASE_RECIPE_CONTEXTS
+        .into_iter()
+        .find(|context| context.target == "aarch64-unknown-linux-gnu")
+        .unwrap();
+    let recipe = render_release_recipe(&shared_release_recipe(), "inputs", context);
+    let empty = format!("RELEASE_CARGO_JOBS=''\n{recipe}");
+    let observed = run_release_recipe(&empty, context, "", "false", "fixture");
+    assert_release_trace(&observed, context, "", "fixture");
+    for failure in ["", "generator", "main", "zerocode", "zerorelay"] {
+        let bounded = format!("RELEASE_CARGO_JOBS=2\n{recipe}");
+        let observed = run_release_recipe(&bounded, context, failure, "false", "fixture");
+        let expected: Vec<_> = expected_release_trace(context, failure, "fixture")
+            .into_iter()
+            .map(|line| line.replace("|build|", "|build|--jobs|2|"))
+            .collect();
+        assert_eq!(observed.status, Some(if failure.is_empty() { 0 } else { 83 }));
+        assert_eq!(observed.trace, expected, "{}", observed.diagnostics);
+        assert!(observed.evidence.is_none());
+    }
+    for jobs in ["0", "-1", "two", "2;true"] {
+        let invalid = format!("RELEASE_CARGO_JOBS={jobs:?}\n{recipe}");
+        let observed = run_release_recipe(&invalid, context, "", "false", "fixture");
+        assert_eq!(observed.status, Some(2), "{}", observed.diagnostics);
+        assert_eq!(observed.trace.len(), 1, "only feature resolution may run");
     }
 }
 
@@ -1001,7 +1087,9 @@ fn assert_manual_qualification_wiring(manual: &str) {
     assert!(build.contains("needs: [release-tool-smoke, stable-gnu-web]"));
     assert!(build.contains("timeout-minutes: 90"));
     assert_eq!(build.matches("- os: ubuntu-22.04").count(), 4);
-    assert!(!build.contains("--jobs") && !build.contains("dist_runner_memory"));
+    // GNU ARM64: run 38836146884 and the 10/10 helper versus 0/5 baseline require the existing bounded helper.
+    assert_arm64_build_memory(build);
+    assert!(!build.contains("--jobs"));
     assert!(!build.contains("cache-targets:"));
     assert_release_caller(yaml_block(build, "      - name: Build release\n"), "true");
     let inputs = yaml_block(

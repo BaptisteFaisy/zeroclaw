@@ -1036,6 +1036,13 @@ jobs:
           retention-days: 1
           if-no-files-found: error
           compression-level: 0
+      - name: Prepare bounded Linux ARM64 build memory
+        id: dist_memory
+        timeout-minutes: 5
+        if: runner.os == 'Linux' && matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        run: bash scripts/ci/dist_runner_memory.sh prepare
+
       - name: Build release
         id: payloads
         uses: ./.github/actions/build-release-payloads
@@ -1045,6 +1052,7 @@ jobs:
           linker: ${{ matrix.linker || '' }}
           use_cross: ${{ matrix.use_cross || 'false' }}
           emit_features: 'true'
+          cargo-jobs: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && '2' || '' }}
       - name: Check standard main binary size
         shell: bash
         env:
@@ -1133,6 +1141,15 @@ jobs:
             archive-evidence/
           if-no-files-found: error
           retention-days: 7
+
+      - name: Report and release owned Linux ARM64 build memory
+        timeout-minutes: 5
+        if: always() && runner.os == 'Linux' && matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        env:
+          ZC_DIST_SWAP_FILE: ${{ steps.dist_memory.outputs.swap_file }}
+          ZC_DIST_SWAP_IDENTITY: ${{ steps.dist_memory.outputs.swap_identity }}
+        run: bash scripts/ci/dist_runner_memory.sh cleanup
 
   stable-gnu-plugin-smoke:
     name: Stable GNU Ubuntu22 / Native ${{ matrix.target }}

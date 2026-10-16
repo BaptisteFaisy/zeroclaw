@@ -13,6 +13,10 @@ inputs:
   use_cross:
     description: Existing release-matrix cross selector; only true selects cross.
     required: false
+  cargo-jobs:
+    description: Optional positive Cargo job count; empty preserves the existing command.
+    required: false
+    default: ''
   emit_features:
     description: Explicitly false for Stable; true only for qualification evidence.
     required: true
@@ -27,6 +31,7 @@ runs:
       shell: bash
       env:
         RELEASE_FEATURES_EVIDENCE: ${{ inputs.emit_features }}
+        RELEASE_CARGO_JOBS: ${{ inputs.cargo-jobs }}
       run: |
         # BEGIN release input/evidence adapter
         if [ -z "${{ inputs.target }}" ]; then
@@ -76,6 +81,15 @@ runs:
         else
           BUILD_CMD="cargo build"
         fi
+        # BEGIN optional build concurrency adapter
+        if [ -n "${RELEASE_CARGO_JOBS:-}" ]; then
+          if [[ ! "$RELEASE_CARGO_JOBS" =~ ^[1-9][0-9]*$ ]]; then
+            echo "cargo-jobs must be a positive integer" >&2
+            exit 2
+          fi
+          BUILD_CMD="$BUILD_CMD --jobs $RELEASE_CARGO_JOBS"
+        fi
+        # END optional build concurrency adapter
         # Always build --no-default-features against the generator's explicit
         # per-target list: FEATURES already carries the default leaves for the
         # target, so this applies the canonical per-target exclusions with no
