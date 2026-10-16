@@ -26,9 +26,9 @@
 # the feature, the golden harness and fixtures, the shared webhook types in
 # zeroclaw-api, and the plugin webhook ingress in zeroclaw-infra. The infra
 # crate root and manifest are listed too: the root holds the dedup limit
-# helpers and the committed-key set the ingress stores its delivered message
-# keys in, and the manifest defines the ingress's dependencies. Other gateway
-# and infra paths stay out: the default-feature Test job covers them.
+# helpers that size the ingress's reservation store, and the manifest defines
+# the ingress's dependencies. Other gateway and infra paths stay out: the
+# default-feature Test job covers them.
 # The plugin artifact smoke harness is listed as well: this job is the only
 # place its scripts run before a release, so a change to them has to run it.
 # Prints "false" otherwise. Always exits 0; the workflow step forwards the
