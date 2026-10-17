@@ -86,7 +86,7 @@ impl PluginWebhookIngress {
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(route_attrs(&owner, &path, "plugin_webhook_route_closed")),
+                        .with_attrs(route_attrs(&owner, "plugin_webhook_route_closed")),
                     "Channel plugin webhook route stopped accepting requests"
                 );
                 return PluginWebhookOutcome::Unavailable;
@@ -101,7 +101,7 @@ impl PluginWebhookIngress {
                 return PluginWebhookOutcome::Timeout;
             }
         };
-        worker_outcome(received, cancel, &owner, &path)
+        worker_outcome(received, cancel, &owner)
     }
 }
 
@@ -109,7 +109,6 @@ fn worker_outcome(
     received: Result<Result<WebhookOutcome, WebhookReject>, oneshot::error::RecvError>,
     cancel: &WebhookCancellation,
     owner: &PluginWebhookOwner,
-    path: &str,
 ) -> PluginWebhookOutcome {
     match received {
         Ok(Ok(WebhookOutcome::Ack)) => PluginWebhookOutcome::Ack,
@@ -122,7 +121,7 @@ fn worker_outcome(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(route_attrs(owner, path, "plugin_webhook_unauthorized")),
+                    .with_attrs(route_attrs(owner, "plugin_webhook_unauthorized")),
                 "Channel plugin rejected webhook authentication"
             );
             PluginWebhookOutcome::Unauthorized
@@ -132,7 +131,7 @@ fn worker_outcome(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(route_attrs(owner, path, "plugin_webhook_invalid")),
+                    .with_attrs(route_attrs(owner, "plugin_webhook_invalid")),
                 "Channel plugin rejected malformed webhook"
             );
             PluginWebhookOutcome::BadRequest
@@ -142,7 +141,7 @@ fn worker_outcome(
                 ERROR,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(route_attrs(owner, path, "plugin_webhook_unavailable")),
+                    .with_attrs(route_attrs(owner, "plugin_webhook_unavailable")),
                 "Channel plugin webhook processing unavailable"
             );
             PluginWebhookOutcome::Unavailable
@@ -157,7 +156,7 @@ fn worker_outcome(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(route_attrs(owner, path, "plugin_webhook_reply_dropped")),
+                    .with_attrs(route_attrs(owner, "plugin_webhook_reply_dropped")),
                 "Channel plugin webhook worker dropped a request without an outcome"
             );
             PluginWebhookOutcome::Unavailable
@@ -165,11 +164,13 @@ fn worker_outcome(
     }
 }
 
-fn route_attrs(owner: &PluginWebhookOwner, path: &str, error_key: &str) -> serde_json::Value {
+/// The route's owner identifies it in a failure record. The path stays out:
+/// some vendors use an unguessable webhook path as their shared secret, and
+/// these records are persisted as written.
+fn route_attrs(owner: &PluginWebhookOwner, error_key: &str) -> serde_json::Value {
     ::serde_json::json!({
         "plugin": owner.plugin(),
         "channel_alias": owner.channel_alias(),
-        "path": path,
         "error_key": error_key,
     })
 }

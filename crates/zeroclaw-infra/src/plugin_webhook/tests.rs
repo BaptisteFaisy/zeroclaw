@@ -554,12 +554,16 @@ async fn dedup_is_keyed_by_route_owner_and_survives_republication() {
     assert_eq!(reserve_once(&ingress, owner("q", "a")).await, "owner");
 }
 
+/// Webhook paths shaped like the unguessable secrets some vendors use.
+const SECRET_PATH: &str = "s3cret-path-6f1d2c8a9b";
+const SECRET_CLOSED_PATH: &str = "s3cret-closed-path-6f1d2c8a9b";
+
 fn attr<'a>(record: &'a serde_json::Value, key: &str) -> Option<&'a str> {
     record["attributes"][key].as_str()
 }
 
 #[tokio::test]
-async fn dispatch_logs_route_and_worker_failures_with_the_route_owner() {
+async fn dispatch_logs_route_and_worker_failures_by_owner_without_the_path() {
     let _hook_guard = zeroclaw_log::__private_test_hook_lock();
     zeroclaw_log::try_install_capture_subscriber();
     let mut records = zeroclaw_log::subscribe_or_install();
@@ -569,8 +573,12 @@ async fn dispatch_logs_route_and_worker_failures_with_the_route_owner() {
     let (_lease, mut receivers) = publish(
         &ingress,
         &[
-            ("logged", owner("log-plugin", "log-alias"), 1),
-            ("logged-closed", owner("log-plugin", "log-closed-alias"), 1),
+            (SECRET_PATH, owner("log-plugin", "log-alias"), 1),
+            (
+                SECRET_CLOSED_PATH,
+                owner("log-plugin", "log-closed-alias"),
+                1,
+            ),
         ],
     );
     drop(receivers.remove(1));
@@ -589,7 +597,7 @@ async fn dispatch_logs_route_and_worker_failures_with_the_route_owner() {
 
     for (path, channel_alias, body, outcome, level, error_key) in [
         (
-            "logged",
+            SECRET_PATH,
             "log-alias",
             "unauthorized",
             PluginWebhookOutcome::Unauthorized,
@@ -597,7 +605,7 @@ async fn dispatch_logs_route_and_worker_failures_with_the_route_owner() {
             "plugin_webhook_unauthorized",
         ),
         (
-            "logged",
+            SECRET_PATH,
             "log-alias",
             "bad-request",
             PluginWebhookOutcome::BadRequest,
@@ -605,7 +613,7 @@ async fn dispatch_logs_route_and_worker_failures_with_the_route_owner() {
             "plugin_webhook_invalid",
         ),
         (
-            "logged",
+            SECRET_PATH,
             "log-alias",
             "unavailable",
             PluginWebhookOutcome::Unavailable,
@@ -613,7 +621,7 @@ async fn dispatch_logs_route_and_worker_failures_with_the_route_owner() {
             "plugin_webhook_unavailable",
         ),
         (
-            "logged",
+            SECRET_PATH,
             "log-alias",
             "drop-reply",
             PluginWebhookOutcome::Unavailable,
@@ -621,7 +629,7 @@ async fn dispatch_logs_route_and_worker_failures_with_the_route_owner() {
             "plugin_webhook_reply_dropped",
         ),
         (
-            "logged-closed",
+            SECRET_CLOSED_PATH,
             "log-closed-alias",
             "body",
             PluginWebhookOutcome::Unavailable,
@@ -652,7 +660,11 @@ async fn dispatch_logs_route_and_worker_failures_with_the_route_owner() {
             Some(channel_alias),
             "{record:#?}"
         );
-        assert_eq!(attr(record, "path"), Some(path), "{record:#?}");
+        assert_eq!(record["attributes"].get("path"), None, "{record:#?}");
+        assert!(
+            !record.to_string().contains(path),
+            "the webhook path must not reach the record: {record:#?}"
+        );
     }
     zeroclaw_log::clear_broadcast_hook();
 }
