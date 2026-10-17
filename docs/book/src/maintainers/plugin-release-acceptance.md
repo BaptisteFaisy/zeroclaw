@@ -91,7 +91,7 @@ throughout.
 | Inbound goes through the plugin | The tester sends a message | A `channel inbound message` record with `zeroclaw.channel = plugin.acceptance` | |
 | Outbound goes through the plugin | The agent replies | A `reply delivered` record for `plugin.acceptance`; a redacted screenshot of the reply | |
 | The built-in channel handled nothing | Read the startup output and `/health` | The channel list shows `plugin.acceptance` and no `discord.*`; `/health` lists `channel:plugin.acceptance` and no `channel:discord.*`; the config copy has no `[channels.discord]` table | |
-| Negative control | Set `channels.plugin.acceptance.enabled` to `false`, restart, send a message | No inbound record and no reply; set it back to `true` | |
+| Negative control | Set `channels.plugin.acceptance.enabled` to `false`, restart, send a message | No inbound record and no reply; set it back to `true` and restart again before the next row | |
 | Reconnect | Cut the machine's network for at least two minutes, then restore it | The next message is answered; note whether the plugin resumed its session or started a new one | |
 | Shutdown | Stop the daemon | The process exits cleanly; note how long the bot takes to show offline | |
 | Denied destination | Remove `*.discord.gg` from the instance's `egress_hosts`, restart | A `plugin_egress_denied` record with `transport = websocket`, the refused host, and a `remedy` command; no inbound | |
