@@ -324,9 +324,11 @@ jobs:
         shell: bash
         run: bash scripts/ci/check_binary_size.sh "target/${{ matrix.target }}/release/${{ matrix.artifact }}" "${{ matrix.target }}"
         env:
-          # 80 MiB cap: x86_64 GNU host+Cranelift adds 9,086,320 B (8.67 MiB).
-          # Source: 2026-10-15 size comparison at 88f69013, variants B/C;
-          # official 4d08d6b/run38836146884 measures a 75,978,760 B main binary.
+          # 80 MiB cap: measured normal/dist maximum is 76,241,040 B
+          # (x86_64-unknown-linux-musl), leaving 7,645,040 B headroom.
+          # Source: run 39001999557/attempt 1 at 61a2c951; all 10 main binaries measured.
+          # Historical x86_64 GNU host+Cranelift delta: +9,086,320 B
+          # (2026-10-15 source 88f69013, matched variants B/C).
           BINARY_SIZE_HARD_LIMIT: "83886080"
 
       - name: Package (Unix)

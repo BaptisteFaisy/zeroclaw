@@ -1067,7 +1067,7 @@ artifact carries the host, and what proves it:
 | GHCR `dist` variant, AUR package, Nix flake package, `setup.bat` source build | Cranelift: source builds from the generated distribution list | `.wasm` | none |
 | GHCR `all-features` image | Cranelift, Pulley, and runtime-only all compiled in | `.wasm` | none |
 | GHCR `minimal` and `default-features` images | none | none | |
-| Desktop bundles (dmg, deb, AppImage, msi, setup exe) | none: the sidecar builds with Cargo `default` (plus `embedded-web` on macOS) | none | |
+| Desktop bundles (dmg, deb, AppImage, msi, setup exe) | Cranelift: the standard sidecar build uses the target's generated `dist` features (plus `embedded-web` on macOS) | `.wasm` | source wiring in `scripts/desktop/prepare-kernel.sh`; desktop bundles have no plugin smoke gate |
 | `cargo install zeroclaw` and the `install.sh` source build | none by default; opt in with `--features plugins-wasm-cranelift` | `.wasm` with the opt-in | |
 | Homebrew core | formula-owned, outside this repository | | |
 

@@ -6,7 +6,7 @@ Every workflow lives in `.github/workflows/`. The sections below group them by t
 
 ### Quality Gate (`ci.yml`)
 
-Fires on every PR targeting `master` or `test/10994-plugin-artifact-smoke` and on trusted pushes to `master`.
+Fires on every PR targeting `master` and on trusted pushes to `master`.
 Composite job with multiple matrix legs:
 
 - **fmt**: `cargo fmt --all -- --check`
