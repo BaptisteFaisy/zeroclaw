@@ -117,9 +117,10 @@ fn names(assembled: &ScopedAssembled) -> BTreeSet<String> {
 }
 
 #[tokio::test]
-async fn default_model_catalog_is_eleven_before_optional_store_preparation() {
+async fn minimal_model_catalog_is_eleven_before_optional_store_preparation() {
     let tmp = TempDir::new().unwrap();
     let mut config = fixture(&tmp);
+    config.tools.optional = Vec::new();
     config.knowledge.enabled = true;
     let assembled = assemble(&tmp, &config, None, None, None).await;
 
@@ -282,7 +283,8 @@ fn full_chat_fixture_names() -> BTreeSet<String> {
 #[tokio::test]
 async fn minimal_acp_catalog_is_eight_without_optional_preparation() {
     let tmp = TempDir::new().unwrap();
-    let config = fixture(&tmp);
+    let mut config = fixture(&tmp);
+    config.tools.optional = Vec::new();
     let assembled = assemble_context(&tmp, &config, None, None, None, true, true).await;
     let expected = CORE_TOOL_NAMES
         .iter()
@@ -332,6 +334,14 @@ async fn full_chat_and_acp_restore_the_matching_builtin_fixture() {
             serde_json::to_string(&names(&assembled)).unwrap()
         );
     }
+}
+
+#[tokio::test]
+async fn default_selection_is_the_full_builtin_fixture() {
+    let tmp = TempDir::new().unwrap();
+    let config = fixture(&tmp);
+    let assembled = assemble(&tmp, &config, None, None, None).await;
+    assert_eq!(names(&assembled), full_chat_fixture_names());
 }
 
 #[tokio::test]

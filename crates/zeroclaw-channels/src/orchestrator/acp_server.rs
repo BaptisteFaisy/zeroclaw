@@ -5686,7 +5686,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(32);
         let mut config = make_test_config(workspace.path());
-        // This transcript exercises selected delivery without changing the minimal ACP catalog.
+        // This transcript exercises selected delivery on the minimal ACP catalog plus deliver_file.
         config.tools.optional = vec!["deliver_file".into()];
         config
             .risk_profiles

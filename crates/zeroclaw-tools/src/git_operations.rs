@@ -3111,8 +3111,10 @@ mod tests {
             .mount(&server)
             .await;
         let tmp = TempDir::new().unwrap();
-        git_init_no_sign(tmp.path(), &[]);
-        let tool = test_tool(tmp.path());
+        // Authorize the physical workspace, including /var aliases and Windows 8.3 paths.
+        let workspace = tmp.path().canonicalize().unwrap();
+        git_init_no_sign(&workspace, &[]);
+        let tool = test_tool(&workspace);
         let remote = format!("{}/private/repo.git", server.uri());
 
         // Isolate only this invocation from credential helpers, askpass,
@@ -3129,7 +3131,7 @@ mod tests {
             "fetch",
             &remote,
         ];
-        let fetch = tool.run_git_command(&args, tmp.path());
+        let fetch = tool.run_git_command(&args, &workspace);
         let res = tokio::time::timeout(std::time::Duration::from_secs(10), fetch).await;
         assert!(
             res.is_ok(),

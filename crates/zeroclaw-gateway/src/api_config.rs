@@ -5579,6 +5579,31 @@ mod tests {
         assert!(drift.is_empty());
     }
 
+    /// An upgraded file without `[tools]`, or with a `[tools]` section that
+    /// omits `optional`, loads full both through the loader and through the
+    /// plain parse drift compares against, so it reports no drift.
+    #[tokio::test]
+    async fn compute_drift_ignores_an_omitted_tools_selector() {
+        let version = zeroclaw_config::migration::CURRENT_SCHEMA_VERSION;
+        for raw in [
+            format!("schema_version = {version}\n"),
+            format!("schema_version = {version}\n[tools]\n"),
+        ] {
+            let (_tmp, path) = temp_config_path();
+            tokio::fs::write(&path, &raw).await.unwrap();
+            let mut cfg = zeroclaw_config::migration::migrate_to_current_salvaged(&raw).config;
+            cfg.config_path = path.clone();
+            assert_eq!(cfg.tools.optional, ["*"], "{raw}");
+
+            let drift = try_compute_drift(&cfg).await.expect("drift");
+            assert!(
+                drift.iter().all(|entry| !entry.path.starts_with("tools")),
+                "{raw}: {drift:?}"
+            );
+            assert!(drift.is_empty(), "{raw}: {drift:?}");
+        }
+    }
+
     #[tokio::test]
     async fn apply_comments_writes_decoration_to_existing_value() {
         let (_tmp, path) = temp_config_path();

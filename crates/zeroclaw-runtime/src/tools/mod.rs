@@ -3584,7 +3584,9 @@ mod tests {
 
     #[test]
     fn optional_builtin_is_not_constructed_or_exposed_until_selected() {
-        let mut selection = zeroclaw_config::builtin_tools::BuiltinToolsConfig::default();
+        let mut selection = zeroclaw_config::builtin_tools::BuiltinToolsConfig {
+            optional: Vec::new(),
+        };
         let constructions = std::cell::Cell::new(0);
         let mut registry = Vec::new();
         let mut reserved = std::collections::HashSet::new();
@@ -3617,10 +3619,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_assembly_exposes_eleven_and_does_not_open_optional_database() {
+    async fn minimal_assembly_exposes_eleven_and_does_not_open_optional_database() {
         use crate::tools::scoped::{ScopedAssembly, ScopedToolRegistry};
         let tmp = TempDir::new().unwrap();
         let mut config = Config {
+            tools: zeroclaw_config::builtin_tools::BuiltinToolsConfig {
+                optional: Vec::new(),
+            },
             data_dir: tmp.path().join("data"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()

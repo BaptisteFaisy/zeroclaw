@@ -20278,14 +20278,20 @@ pub(crate) mod tests {
         config.tools.optional = vec!["*".into()];
 
         // Config owns compile availability; channels has no tools-external feature of its own.
-        let compiled_out_external = config
+        // Only named adapters are reported as compiled out, so probe with every one by name.
+        let mut probe = config.clone();
+        probe.tools.optional = EXTERNAL_TOOL_NAMES
+            .iter()
+            .map(|name| (*name).into())
+            .collect();
+        let compiled_out_external = probe
             .collect_warnings()
             .iter()
             .filter(|warning| warning.code == TOOL_COMPILED_OUT && warning.path == "tools.optional")
             .count();
         assert!(
             compiled_out_external == 0 || compiled_out_external == EXTERNAL_TOOL_NAMES.len(),
-            "maximal selection must report every external adapter or none as compiled out"
+            "naming every external adapter must report all of them or none as compiled out"
         );
         let mut expected_absent_required_tools: Vec<&str> = MATRIX_REQUIRED_SAFE_TOOL_ARGUMENTS
             .iter()

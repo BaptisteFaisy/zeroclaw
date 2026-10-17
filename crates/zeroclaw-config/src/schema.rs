@@ -259,8 +259,9 @@ pub struct Config {
     #[group = "Operations"]
     pub security: SecurityConfig,
 
-    /// Optional model-visible built-ins (`[tools]`). The default is eleven core
-    /// tools; selection never grants execution permission. Reload after edits.
+    /// Optional model-visible built-ins (`[tools]`). The default is full;
+    /// `optional = []` selects the eleven core tools. Selection never grants
+    /// execution permission. Reload after edits.
     #[serde(default)]
     #[nested]
     #[group = "Tools"]
@@ -23531,8 +23532,10 @@ impl Config {
         warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
     ) {
         if !cfg!(feature = "tools-external") {
+            // Only a named adapter is reported. Full selects what this build
+            // carries, so the wildcard, and with it the default, stays quiet.
             for name in crate::builtin_tools::EXTERNAL_TOOL_NAMES {
-                if self.tools.is_enabled(name) {
+                if self.tools.optional.iter().any(|entry| entry == name) {
                     warnings.push(crate::validation_warnings::ValidationWarning::new(
                         crate::validation_warnings::TOOL_COMPILED_OUT,
                         format!(
@@ -26508,8 +26511,8 @@ impl Config {
             .and_then(|v| v.try_into().ok())
             .unwrap_or_default();
         prune_default_values(&mut new_table, &default_table);
-        // Empty is an explicit minimal selection. Pruning it would make a
-        // freshly saved install look like a legacy document that omitted tools.
+        // Keep the selection even when it is the full default. Pruning it would
+        // leave an omitted section that `config migrate` then has to normalize.
         new_table
             .entry("tools".to_string())
             .or_insert_with(|| toml::Value::Table(toml::Table::new()))
@@ -34842,7 +34845,7 @@ default_temperature = 0.7
 
     // Upgrade compatibility and durable selector persistence.
     #[tokio::test]
-    async fn new_install_remains_minimal_after_repeated_load_and_save() {
+    async fn new_install_remains_full_after_repeated_load_and_save() {
         let _env_guard = env_override_lock().await;
         let dir = TempDir::new().unwrap();
         let _config_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", dir.path());
@@ -34851,13 +34854,16 @@ default_temperature = 0.7
         let _tools_guard = EnvValueGuard::remove("ZEROCLAW_tools__optional");
         for _ in 0..3 {
             let config = Box::pin(Config::load_or_init()).await.unwrap();
-            assert!(config.tools.optional.is_empty());
+            assert_eq!(config.tools.optional, ["*"]);
             config.save().await.unwrap();
             let raw = fs::read_to_string(dir.path().join("config.toml"))
                 .await
                 .unwrap();
             let value: toml::Value = toml::from_str(&raw).unwrap();
-            assert_eq!(value["tools"]["optional"], toml::Value::Array(Vec::new()));
+            assert_eq!(
+                value["tools"]["optional"],
+                toml::Value::Array(vec![toml::Value::String("*".into())])
+            );
             assert!(crate::migration::migrate_file(&raw).unwrap().is_none());
         }
     }
@@ -34965,11 +34971,11 @@ default_temperature = 0.7
         assert_eq!(value.get("tools"), original.get("tools"));
         assert!(written.contains("# preserve invalid selector"));
         assert!(crate::migration::migrate_to_current(&written).is_err());
-        assert!(
+        assert_eq!(
             crate::migration::migrate_to_current_resilient(&written)
                 .tools
-                .optional
-                .is_empty()
+                .optional,
+            ["*"]
         );
     }
 
@@ -35006,11 +35012,7 @@ default_temperature = 0.7
             }
             let mut config = Box::pin(Config::load_or_init()).await.unwrap();
             assert_eq!(config.tools.optional, ["calculator"]);
-            let expected = if legacy {
-                vec!["*".to_string()]
-            } else {
-                Vec::new()
-            };
+            let expected = vec!["*".to_string()];
             if legacy {
                 // The omitted selector must persist from the masked snapshot
                 // before a full save has materialized the tools section.
