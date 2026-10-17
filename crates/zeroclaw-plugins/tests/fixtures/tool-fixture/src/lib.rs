@@ -74,7 +74,13 @@ mod component {
             {
                 "tool_search".to_string()
             }
-            #[cfg(not(feature = "namespace-tool-search"))]
+            // An MCP-shaped `<server>__<tool>` name, for the host's namespace
+            // refusal test.
+            #[cfg(all(feature = "namespace-mcp-tool", not(feature = "namespace-tool-search")))]
+            {
+                "filesystem__read_file".to_string()
+            }
+            #[cfg(not(any(feature = "namespace-tool-search", feature = "namespace-mcp-tool")))]
             {
                 "config-echo".to_string()
             }
