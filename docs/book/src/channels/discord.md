@@ -134,6 +134,11 @@ messages only; the built-in channel remains the default.
   before it installs anything.
 - The bot from the [Quickstart](#quickstart): its token, the **Message Content
   Intent** switched on, and the bot invited to your server.
+- In a private channel, the bot (or one of its roles) needs **View Channel**,
+  **Send Messages**, and **Read Message History** on that channel. Discord
+  sends no events for a channel the bot cannot see, and the plugin logs nothing
+  about it: the bot connects and looks healthy but never sees a message. The
+  same applies when `channel_ids` names a channel the bot cannot view.
 - The numeric user ID of each person allowed to talk to the agent. Enable
   **Developer Mode** (User Settings -> Advanced), right-click the user, and
   click **Copy User ID**.
@@ -230,9 +235,11 @@ matches senders exactly, so list user IDs, not usernames. Restart ZeroClaw
 - A message from an admitted user is logged as `channel inbound message` with
   `zeroclaw.channel = plugin.main`. A message from anyone else is dropped and
   logged with `error_key = plugin_channel_sender_denied`.
-- A connection to a host outside the grant is refused, and the refusal is
-  logged with `error_key = plugin_egress_denied`, the refused host, and the
-  `zeroclaw config set` command that grants it.
+- A connection to a host outside the grant is refused. A refused HTTP request
+  is logged with `error_key = plugin_egress_denied`, the refused host, and the
+  `zeroclaw config set` command that grants it. A refused gateway connection
+  is not logged yet, so a bot that stays offline after a change to
+  `egress_hosts` has most likely lost `*.discord.gg`.
 
 ### How the plugin differs from the built-in channel
 

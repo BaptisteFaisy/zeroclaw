@@ -94,12 +94,12 @@ throughout.
 | Negative control | Set `channels.plugin.acceptance.enabled` to `false`, restart, send a message | No inbound record and no reply; set it back to `true` and restart again before the next row | |
 | Reconnect | Cut the machine's network for at least two minutes, then restore it | The next message is answered; note whether the plugin resumed its session or started a new one | |
 | Shutdown | Stop the daemon | The process exits cleanly; note how long the bot takes to show offline | |
-| Denied destination | Remove `*.discord.gg` from the instance's `egress_hosts`, restart | A `plugin_egress_denied` record with `transport = websocket`, the refused host, and a `remedy` command; no inbound | |
-| Grant restored | Put `*.discord.gg` back, without a restart | The bot reconnects; note how long it took | |
+| Denied destination | Remove `*.discord.gg` from the instance's `egress_hosts`, restart | The gateway does not connect, the bot stays offline, and nothing arrives inbound. A host that logs refused WebSocket connections also writes a `plugin_egress_denied` record with `transport = websocket`, the refused host, and a `remedy` command; v0.8.6 writes none | |
+| Grant restored | Put `*.discord.gg` back and apply it to the running daemon with `POST /admin/reload` from the same machine (see [Remote daemon reload](../ops/network-deployment.md#remote-daemon-reload)), without a full restart. Editing `config.toml` alone does not reach the running daemon | The bot reconnects; note how long it took | |
 | Denied sender | Send from an account outside the peer group | A `plugin_channel_sender_denied` record and no reply | |
 | Missing platform permission | Remove the bot's **Send Messages** permission in one channel and message it there | A send failure in the log, the daemon still running, no reconnect loop | |
 | Invalid token | Set a syntactically valid invalid or revoked token through the masked `config set` prompt, then restart | The plugin reports Discord's authentication refusal and backs off; no reconnect loop in the log over five minutes. A malformed token rejected locally by `configure()` does not exercise platform authentication or backoff | |
-| Trust policy holds | Set `plugins.security.signature_mode` to `strict` without trusting the package's publisher key, restart | The daemon skips the package and logs the signature refusal; `plugin.acceptance` does not start. Restore the previous mode | |
+| Trust policy holds | Set `plugins.security.signature_mode` to `strict` without trusting the package's publisher key, restart | The daemon skips the package and logs the signature refusal; `plugin.acceptance` does not start. The CLI reports the refused package as `Plugin discord not found` or `No plugins installed`, so read the daemon log for the reason. Restore the previous mode | |
 
 ## Redact before posting
 
