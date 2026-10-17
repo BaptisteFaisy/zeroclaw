@@ -314,6 +314,78 @@ async fn a_core_without_dispatch_support_gets_503_and_no_call() {
 }
 
 #[tokio::test]
+async fn core_failure_records_keep_a_secret_path_out() {
+    // Shaped like the unguessable path some vendors use as a shared secret.
+    const SECRET_PATH: &str = "s3cret-path-6f1d2c8a9b";
+    let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+    zeroclaw_log::try_install_capture_subscriber();
+    let mut records = zeroclaw_log::subscribe_or_install();
+    while records.try_recv().is_ok() {}
+    let mut seen = Vec::new();
+    let mut drain = |records: &mut tokio::sync::broadcast::Receiver<Value>| {
+        while let Ok(record) = records.try_recv() {
+            assert!(
+                !record.to_string().contains(SECRET_PATH),
+                "the webhook path must not reach a record: {record:#?}"
+            );
+            let key = record["attributes"]["error_key"]
+                .as_str()
+                .unwrap_or_default();
+            if key.starts_with("plugin_webhook_core_") {
+                assert_eq!(record["attributes"].get("path"), None, "{record:#?}");
+                seen.push(key.to_owned());
+            }
+        }
+    };
+    let secret = |body: &'static str| plugin_webhook_request(SECRET_PATH, body, peer(), None);
+
+    let (router, _state_dir) = router_without_core(CoreRpc::default());
+    let response = send(&router, secret("{}")).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    drain(&mut records);
+
+    let (router, _refused_dir) =
+        router_without_core(CoreRpc::refused_for_test(AUTH_REQUIRED).await);
+    let response = send(&router, secret("{}")).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    drain(&mut records);
+
+    let unsupported = forwarding(
+        &[Method::Status.wire_name()],
+        core_answer(|_| Some(Ok(json!({"outcome": "ack"})))),
+    )
+    .await;
+    let response = send(&unsupported.router, secret("{}")).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    drain(&mut records);
+
+    let unusable = forwarding(&capabilities(), core_answer(answer_from_body)).await;
+    let response = send(&unusable.router, secret(r#"{"outcome": "bogus"}"#)).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    drain(&mut records);
+
+    // Timing out needs the full ingress deadline, so this one is mapped
+    // directly; it has no path to leak either way.
+    let response = dispatched_response(Dispatched::CoreTimedOut);
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    drain(&mut records);
+
+    for key in [
+        "plugin_webhook_core_unavailable",
+        "plugin_webhook_core_refused",
+        "plugin_webhook_core_unsupported",
+        "plugin_webhook_core_unexpected",
+        "plugin_webhook_core_timeout",
+    ] {
+        assert!(
+            seen.iter().any(|seen| seen == key),
+            "{key} recorded: {seen:?}"
+        );
+    }
+    zeroclaw_log::clear_broadcast_hook();
+}
+
+#[tokio::test]
 async fn no_core_connection_fails_fast_with_503() {
     let (router, _state_dir) = router_without_core(CoreRpc::default());
     let started = tokio::time::Instant::now();

@@ -92,15 +92,16 @@ fn dispatch_params(
 
 /// The public response for `request`, as the core's ingress decides it.
 pub(super) async fn respond(core: &CoreRpc, request: PluginWebhookRequest) -> Response {
-    let path = request.path().to_owned();
-    dispatched_response(&path, dispatch(core, request).await)
+    dispatched_response(dispatch(core, request).await)
 }
 
 /// The public response for a forwarded dispatch. An ingress outcome maps
 /// through [`outcome_response`]; a core that could not be asked fails fast
 /// with a 503, or a 504 when it never answered, and the reason is logged here
-/// because it is a gateway-side event.
-fn dispatched_response(path: &str, dispatched: Dispatched) -> Response {
+/// because it is a gateway-side event. The records leave the path out: some
+/// vendors use an unguessable webhook path as their shared secret, and the
+/// records are persisted as written.
+fn dispatched_response(dispatched: Dispatched) -> Response {
     let unavailable = || (StatusCode::SERVICE_UNAVAILABLE, "webhook unavailable").into_response();
     match dispatched {
         Dispatched::Outcome(outcome) => outcome_response(outcome),
@@ -110,7 +111,6 @@ fn dispatched_response(path: &str, dispatched: Dispatched) -> Response {
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
-                        "path": path,
                         "error_key": "plugin_webhook_core_unavailable",
                     })),
                 "Plugin webhook not forwarded: the core is not connected"
@@ -123,7 +123,6 @@ fn dispatched_response(path: &str, dispatched: Dispatched) -> Response {
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
-                        "path": path,
                         "code": code,
                         "error_key": "plugin_webhook_core_refused",
                     })),
@@ -137,7 +136,6 @@ fn dispatched_response(path: &str, dispatched: Dispatched) -> Response {
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
-                        "path": path,
                         "error_key": "plugin_webhook_core_unsupported",
                     })),
                 "Core does not support plugin webhook dispatch"
@@ -150,7 +148,6 @@ fn dispatched_response(path: &str, dispatched: Dispatched) -> Response {
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
-                        "path": path,
                         "reason": reason,
                         "code": code,
                         "error_key": "plugin_webhook_core_unexpected",
@@ -165,7 +162,6 @@ fn dispatched_response(path: &str, dispatched: Dispatched) -> Response {
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
-                        "path": path,
                         "error_key": "plugin_webhook_core_timeout",
                     })),
                 "Core did not answer the plugin webhook dispatch in time"
