@@ -858,12 +858,17 @@ The five bounds are operator-tunable and every value is validated as non-zero:
 only be built with explicit limits, so no load path can construct an
 unsandboxed plugin. Guest `wasi:http` request options may end a call sooner but
 cannot extend the host deadline. An interrupted warm store is never resumed,
-and a channel never reuses a store whose call trapped: channels recreate the
-instance from host-owned inputs on the next call, waiting when traps and
-missed deadlines, other than in approval and choice prompts, outrun a rebuild
-budget of three at once and one per five minutes after that, while memory
-instances remain unavailable until their owner rebuilds them. The canonical
-fields and defaults live in the
+and neither a channel nor a memory backend reuses a store whose call failed
+inside Wasmtime: after a guest trap, exhausted fuel, or a failed host import,
+Wasmtime refuses every later call into the store, and a result it could not
+lift skips the export's post-return cleanup. Channels recreate the instance
+from host-owned inputs on the next call, waiting when traps and missed
+deadlines, other than in approval and choice prompts, outrun a rebuild budget
+of three at once and one per five minutes after that. Memory instances remain
+unavailable until their owner rebuilds them, and later calls that reach the
+plugin fail with the error a missed deadline leaves. A rebuilt memory instance
+starts empty, because the memory world gives a plugin no storage outside its
+own instance. The canonical fields and defaults live in the
 [Config reference](../reference/index.md).
 
 ### 32-bit address space (wasip2 is wasm32)
@@ -1052,19 +1057,19 @@ deletion; it never uses a stale verdict to recursively delete a replacement at
 the package name.
 
 Install and recovery coordinate through a persistent hidden OS lock under the
-plugins root. Only install and remove open that root and its lock, so a host
-that only discovers plugins, such as one the daemon keeps, holds nothing in the
-plugins directory. On Windows an open root pins the plugins directory and its
-ancestors against rename until its host drops. A process that cannot take the
-lock within 60 seconds gives up and names the lock file. Any account that can
-read that file can hold the lock, and where the operating system or filesystem
-offers no file locking, install and remove refuse. New staging directories use
-unique generations and an OS-held lease, rather than a PID as ownership
-evidence. Recovery cleans an abandoned protocol stage only while recovering an
-actual final package, or while finishing the delete of one an earlier remove
-had judged. Legacy PID-only stages without proof of abandonment are retained
-and their paths are printed; they do not prevent a new install from using fresh
-staging.
+plugins root. Only install, update, remove, and listing what an interrupted
+update displaced open that root and its lock, so a host that only discovers
+plugins, such as one the daemon keeps, holds nothing in the plugins directory. On Windows an open root pins the plugins directory and
+its ancestors against rename until its host drops. A process that cannot take
+the lock within 60 seconds gives up and names the lock file. Any account that
+can read that file can hold the lock, and where the operating system or
+filesystem offers no file locking, install, update and remove refuse. New
+staging directories use unique generations and an OS-held lease, rather than a
+PID as ownership evidence. Recovery cleans an abandoned protocol stage only
+while recovering an actual final package, or while finishing the delete of one
+an earlier remove had judged. Legacy PID-only stages without proof of
+abandonment are retained and their paths are printed; they do not prevent a new
+install from using fresh staging.
 
 A refused claimed package is restored without overwriting a concurrent
 occupant. If restoration cannot complete, the error names its retained hidden
