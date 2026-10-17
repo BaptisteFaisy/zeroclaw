@@ -15334,6 +15334,56 @@ mod tests {
             assert_eq!(next_seen(&mut routes).await.path, "fixture");
         }
 
+        #[tokio::test]
+        async fn plugin_webhook_dispatch_refuses_a_published_route_once_its_binding_is_removed() {
+            let ingress = test_ingress();
+            let mut routes = publish(&ingress, &[ack_route()]);
+            let (mut dispatcher, mut rx) = connection(Some(Arc::clone(&ingress)), 8);
+
+            let response = call(
+                &mut dispatcher,
+                &mut rx,
+                1,
+                DISPATCH,
+                params("bound-1", "fixture"),
+            )
+            .await;
+            assert_eq!(response["result"], json!({"outcome": "ack"}), "{response}");
+            assert_eq!(next_seen(&mut routes).await.path, "fixture");
+
+            // A live config write removes the instance. Its route stays
+            // published until the next reload retires it.
+            dispatcher
+                .ctx
+                .config
+                .write()
+                .channels
+                .plugin
+                .remove("fixture-alias");
+            assert!(
+                ingress.registry().get("fixture").is_some(),
+                "the route outlives the write until reload"
+            );
+            let response = call(
+                &mut dispatcher,
+                &mut rx,
+                2,
+                DISPATCH,
+                params("removed-1", "fixture"),
+            )
+            .await;
+            assert_eq!(error_code(&response), i64::from(FORBIDDEN), "{response}");
+            let message = response["error"]["message"].as_str().unwrap_or_default();
+            assert!(
+                message.contains("plugin.fixture-alias") && message.contains("no binding"),
+                "{message}"
+            );
+            assert!(
+                routes.seen.try_recv().is_err(),
+                "the route takes nothing once its binding is gone"
+            );
+        }
+
         #[test]
         fn plugin_webhook_methods_are_classified_under_channels() {
             use zeroclaw_api::grants::{Resource, Verb};
