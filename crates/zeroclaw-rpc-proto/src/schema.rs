@@ -44,6 +44,8 @@ catalog! {
     SessionConfigureResult, SessionCancelResult, SessionGitBranchResult, SessionListParams,
     SessionListResult, SessionEntry, SessionMessagesResult, SessionMessagesParams,
     MessageEntryKind, MessageEntry, SessionStateResult, SessionDeleteResult, SessionOverrides,
+    SessionSteerParams, SessionSteerResult, SessionAppendParams, SessionAppendResult,
+    SessionRenameParams, SessionRenameResult, SessionRunOnceParams, SessionRunOnceResult,
     // Memory
     MemoryListParams, MemoryListResult, MemorySearchParams, MemorySearchResult, MemoryGetParams,
     MemoryGetResult, MemoryStoreParams, MemoryStoreResult, MemoryDeleteParams, MemoryDeleteResult,
@@ -56,6 +58,9 @@ catalog! {
     ConfigResolveAliasSourceResult, ConfigMapKeyCreateParams, ConfigMapKeyCreateResult,
     ConfigMapKeyDeleteParams, ConfigMapKeyDeleteResult, ConfigMapKeyRenameParams,
     ConfigMapKeyRenameResult, ConfigTemplateEntry, ConfigTemplatesResult,
+    // Config publication and application
+    PublishedConfigRevision, ConfigApplicationTarget, ConfigApplicationOutcome,
+    ConfigApplicationReason, ConfigApplicationRecord, ConfigApplicationStatus,
     // Agents and cost
     AgentEntry, AgentsListResult, AgentStatusEntry, AgentsStatusResult,
     AgentDeleteParams, AgentDeletePreviewResult, AgentDeleteResult, CostQueryParams,
@@ -82,7 +87,8 @@ catalog! {
     LogsGetResult, EventsHistoryResult, SubscriptionCancelParams, SubscriptionCancelResult,
     SubscriptionLagged,
     // Notifications
-    SessionUpdateEvent, TurnCompletionOutcome,
+    SessionUpdateEvent, TurnCompletionOutcome, SafeguardFallbackKindWire, SafeguardFallbackWire,
+    ProviderUsageTotals, TurnUsageTotals,
     // Quickstart (wire-stable subset)
     QuickstartStateResult, QuickstartTypeOption, QuickstartValidateParams, QuickstartApplyParams,
     QuickstartDismissResult,
