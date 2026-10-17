@@ -29,6 +29,12 @@ pub struct LoopKnobs {
     /// turn. Side routes such as a dedicated vision provider must satisfy the
     /// same boundary as the primary/fallback chain.
     pub provider_attempt_allowlist: Option<Arc<HashSet<String>>>,
+    /// The caller judges steering itself (memory write, sender authority,
+    /// tool ceiling) and lends the receiver only so the loop can see that a
+    /// message is waiting. After each tool round the loop then stops with
+    /// `SteeringPending` instead of draining, so the message reaches
+    /// the model at the next step rather than after the final answer.
+    pub yield_to_steering: bool,
 }
 
 impl Default for LoopKnobs {
@@ -39,6 +45,7 @@ impl Default for LoopKnobs {
             detect_protocol_without_tools: true,
             draft_reasoning: StreamReasoningMode::Status,
             provider_attempt_allowlist: None,
+            yield_to_steering: false,
         }
     }
 }
