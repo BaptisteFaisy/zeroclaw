@@ -3469,9 +3469,7 @@ impl App {
                     self.load_cost_resources().await?;
                 }
                 self.alias_cursor = detail.alias_cursor.min(self.aliases.len());
-                self.cost_cursor = detail
-                    .cost_cursor
-                    .min(self.cost_resources.len().saturating_sub(1));
+                self.cost_cursor = detail.cost_cursor.min(self.cost_resources.len());
             }
             Screen::FieldList {
                 section_idx,
@@ -5840,7 +5838,7 @@ mod tests {
         .unwrap()
     }
 
-    fn render_config(manager: &mut App) -> String {
+    fn render_config_120(manager: &mut App) -> String {
         let mut term = Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
         term.draw(|frame| manager.draw_into(frame, frame.area()))
             .unwrap();
@@ -5891,7 +5889,7 @@ mod tests {
         assert_eq!(manager.section_cursor, 2);
         assert_eq!(manager.loaded_section, Some(2));
         assert_eq!(manager.filter_cursor, 0);
-        let rendered = render_config(&mut manager);
+        let rendered = render_config_120(&mut manager);
         assert!(rendered.contains("Filter sections: /MCP"));
         assert!(!rendered.contains("Filter list:"));
         assert!(rendered.contains("first ="));
@@ -5904,7 +5902,7 @@ mod tests {
         assert_eq!(manager.loaded_section, Some(1));
         assert_eq!(manager.field_cursor, 1);
         assert_eq!(manager.active_tab, 1);
-        assert!(render_config(&mut manager).contains("second ="));
+        assert!(render_config_120(&mut manager).contains("second ="));
         assert_eq!(manager.zeroclaw_pane, ZeroclawPane::Sections);
         assert_eq!(
             calls.lock().unwrap().as_slice(),
@@ -5934,7 +5932,7 @@ mod tests {
             .await
             .unwrap();
         manager.handle_paste("openai").await;
-        let rendered = render_config(&mut manager);
+        let rendered = render_config_120(&mut manager);
         assert!(rendered.contains("Models"));
         assert!(rendered.contains("Agents"));
         assert!(rendered.contains("MCP"));
@@ -5942,7 +5940,7 @@ mod tests {
         assert!(!rendered.contains("ollama.local"));
         assert!(!rendered.contains("Filter sections:"));
         manager.handle_paste(".missing").await;
-        assert!(render_config(&mut manager).contains("No matches"));
+        assert!(render_config_120(&mut manager).contains("No matches"));
         manager
             .handle_key(key(KeyCode::Enter), &mut term)
             .await
@@ -5955,7 +5953,7 @@ mod tests {
         assert_eq!(manager.select_cursor, 1);
         assert_eq!(manager.zeroclaw_pane, ZeroclawPane::Detail);
         assert!(matches!(manager.screen, Screen::FieldEdit { .. }));
-        assert!(render_config(&mut manager).contains("ollama.local"));
+        assert!(render_config_120(&mut manager).contains("ollama.local"));
     }
 
     #[tokio::test]
@@ -5963,7 +5961,7 @@ mod tests {
         let (mut manager, calls) = responding_manager();
         filter_fixture(&mut manager);
         let mut term = filter_test_term();
-        render_config(&mut manager);
+        render_config_120(&mut manager);
         let stale_main = manager.last_main_area;
         manager
             .handle_key(key(KeyCode::Char('/')), &mut term)
@@ -5975,7 +5973,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let rendered = render_config(&mut manager);
+        let rendered = render_config_120(&mut manager);
         assert_eq!(rendered.matches("No matches").count(), 2);
         assert!(!rendered.contains("second ="));
         assert!(manager.last_section_rows.is_empty());
@@ -6011,7 +6009,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(manager.section_cursor, 1);
-        assert!(render_config(&mut manager).contains("second ="));
+        assert!(render_config_120(&mut manager).contains("second ="));
     }
 
     #[tokio::test]
@@ -6032,7 +6030,7 @@ mod tests {
             .await
             .unwrap();
         manager.handle_paste("second").await;
-        render_config(&mut manager);
+        render_config_120(&mut manager);
         let area = manager.last_main_area;
         let click = MouseEvent {
             kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
@@ -6066,7 +6064,7 @@ mod tests {
             .await
             .unwrap();
         manager.handle_paste("missing").await;
-        assert!(render_config(&mut manager).contains("No matches"));
+        assert!(render_config_120(&mut manager).contains("No matches"));
         manager
             .handle_key(key(KeyCode::Enter), &mut term)
             .await
@@ -6126,6 +6124,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn config_filter_cancel_keeps_the_costs_add_row_selected() {
+        let (mut manager, _) = responding_manager();
+        filter_fixture(&mut manager);
+        manager.sections[1] = entry_with_cost("Agents", "llm");
+        manager.screen = Screen::AliasList {
+            section_idx: 1,
+            map_path: "Agents.anthropic".into(),
+            breadcrumb: vec!["Agents".into(), "anthropic".into()],
+        };
+        manager.alias_tab = 1;
+        manager.cost_resources = vec!["first".into(), "second".into()];
+        manager.cost_cursor = 2;
+        let mut term = filter_test_term();
+        manager
+            .handle_key(key(KeyCode::Char('/')), &mut term)
+            .await
+            .unwrap();
+        manager.handle_paste("MCP").await;
+        assert_eq!(manager.loaded_section, Some(2));
+        manager
+            .handle_key(key(KeyCode::Esc), &mut term)
+            .await
+            .unwrap();
+        assert_eq!(manager.alias_tab, 1);
+        assert_eq!(manager.cost_resources.len(), 2);
+        assert_eq!(manager.cost_cursor, 2);
+    }
+
+    #[tokio::test]
     async fn config_filter_failed_paste_and_cancel_keep_tui_open_and_detail_inert() {
         for fail_on_cancel in [false, true] {
             let (mut manager, _) = responding_manager();
@@ -6153,7 +6180,7 @@ mod tests {
                 assert_eq!(manager.loaded_section, Some(1));
             }
             assert!(manager.status_msg.is_some());
-            let rendered = render_config(&mut manager);
+            let rendered = render_config_120(&mut manager);
             assert!(!rendered.contains("first ="));
             assert!(!rendered.contains("second ="));
             assert_eq!(manager.last_main_area, Rect::default());
@@ -6217,7 +6244,7 @@ mod tests {
             .handle_key(key(KeyCode::Char('M')), &mut term)
             .await
             .unwrap();
-        render_config(&mut manager);
+        render_config_120(&mut manager);
         let area = manager.last_section_list_area;
         manager
             .handle_mouse(
@@ -6687,6 +6714,8 @@ mod tests {
                         req["params"]["value"].clone(),
                     ));
                     serde_json::json!({})
+                } else if method == crate::client::method::CONFIG_MAP_KEYS {
+                    serde_json::json!({ "keys": ["first", "second"] })
                 } else if method == crate::client::method::CONFIG_LIST {
                     let mut first = field("a.first");
                     first.tab = ConfigTab::Connection;
