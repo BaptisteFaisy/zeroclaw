@@ -4003,35 +4003,42 @@ impl Agent {
 
         let active_dispatcher = {
             let base_provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
-            let (vision_provider_box, _degrade_strip_images) =
-                match zeroclaw_providers::reliable::scope_provider_attempt_allowlist(
-                    attempt_allowlist.clone(),
-                    crate::agent::turn::vision_route::resolve_vision_provider_with_allowed_refs(
-                        self.full_config(),
-                        self.model_provider.as_ref(),
-                        &base_provider_messages,
-                        &self.multimodal_config,
-                        &selected_route.provider_name,
-                        &selected_route.model,
-                        &effective_model,
-                        Some(self.security.as_ref()),
-                        attempt_allowlist.as_deref(),
-                    ),
-                )
-                .await
-                {
-                    Ok(resolved) => resolved,
-                    Err(error) => {
-                        let _ = self.trim_history(Some(&turn_id));
-                        return Err(error);
-                    }
-                };
-            let (active_provider, active_model): (&dyn ModelProvider, &str) =
-                vision_provider_box.as_ref().map_or(
-                    (self.model_provider.as_ref(), effective_model.as_str()),
-                    |resolved| (resolved.provider.as_ref(), resolved.model.as_str()),
-                );
-            tool_dispatcher_for_provider(&self.config, active_provider, active_model)
+            let resolved = zeroclaw_providers::reliable::scope_provider_attempt_allowlist(
+                attempt_allowlist.clone(),
+                async {
+                    let (vision_provider_box, _degrade_strip_images) =
+                        crate::agent::turn::vision_route::resolve_vision_provider_with_allowed_refs(
+                            self.full_config(),
+                            self.model_provider.as_ref(),
+                            &base_provider_messages,
+                            &self.multimodal_config,
+                            &selected_route.provider_name,
+                            &selected_route.model,
+                            &effective_model,
+                            Some(self.security.as_ref()),
+                            attempt_allowlist.as_deref(),
+                        )
+                        .await?;
+                    let (active_provider, active_model): (&dyn ModelProvider, &str) =
+                        vision_provider_box.as_ref().map_or(
+                            (self.model_provider.as_ref(), effective_model.as_str()),
+                            |resolved| (resolved.provider.as_ref(), resolved.model.as_str()),
+                        );
+                    Ok::<_, anyhow::Error>(tool_dispatcher_for_provider(
+                        &self.config,
+                        active_provider,
+                        active_model,
+                    ))
+                },
+            )
+            .await;
+            match resolved {
+                Ok(dispatcher) => dispatcher,
+                Err(error) => {
+                    let _ = self.trim_history(Some(&turn_id));
+                    return Err(error);
+                }
+            }
         };
 
         if let Err(error) = self.rebuild_system_prompt_for_dispatcher(active_dispatcher.as_ref()) {
@@ -4525,40 +4532,47 @@ impl Agent {
 
         let active_dispatcher = {
             let base_provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
-            let (vision_provider_box, _degrade_strip_images) =
-                match zeroclaw_providers::reliable::scope_provider_attempt_allowlist(
-                    attempt_allowlist.clone(),
-                    crate::agent::turn::vision_route::resolve_vision_provider_with_allowed_refs(
-                        self.full_config(),
-                        self.model_provider.as_ref(),
-                        &base_provider_messages,
-                        &self.multimodal_config,
-                        &selected_route.provider_name,
-                        &selected_route.model,
-                        &effective_model,
-                        Some(self.security.as_ref()),
-                        attempt_allowlist.as_deref(),
-                    ),
-                )
-                .await
-                {
-                    Ok(resolved) => resolved,
-                    Err(error) => {
-                        let notice = self.trim_history(Some(&turn_id));
-                        forward_history_trim_notice(&event_tx, notice).await;
-                        return Err(StreamedTurnError {
-                            error,
-                            committed_response: String::new(),
-                            new_messages: new_msgs,
-                        });
-                    }
-                };
-            let (active_provider, active_model): (&dyn ModelProvider, &str) =
-                vision_provider_box.as_ref().map_or(
-                    (self.model_provider.as_ref(), effective_model.as_str()),
-                    |resolved| (resolved.provider.as_ref(), resolved.model.as_str()),
-                );
-            tool_dispatcher_for_provider(&self.config, active_provider, active_model)
+            let resolved = zeroclaw_providers::reliable::scope_provider_attempt_allowlist(
+                attempt_allowlist.clone(),
+                async {
+                    let (vision_provider_box, _degrade_strip_images) =
+                        crate::agent::turn::vision_route::resolve_vision_provider_with_allowed_refs(
+                            self.full_config(),
+                            self.model_provider.as_ref(),
+                            &base_provider_messages,
+                            &self.multimodal_config,
+                            &selected_route.provider_name,
+                            &selected_route.model,
+                            &effective_model,
+                            Some(self.security.as_ref()),
+                            attempt_allowlist.as_deref(),
+                        )
+                        .await?;
+                    let (active_provider, active_model): (&dyn ModelProvider, &str) =
+                        vision_provider_box.as_ref().map_or(
+                            (self.model_provider.as_ref(), effective_model.as_str()),
+                            |resolved| (resolved.provider.as_ref(), resolved.model.as_str()),
+                        );
+                    Ok::<_, anyhow::Error>(tool_dispatcher_for_provider(
+                        &self.config,
+                        active_provider,
+                        active_model,
+                    ))
+                },
+            )
+            .await;
+            match resolved {
+                Ok(dispatcher) => dispatcher,
+                Err(error) => {
+                    let notice = self.trim_history(Some(&turn_id));
+                    forward_history_trim_notice(&event_tx, notice).await;
+                    return Err(StreamedTurnError {
+                        error,
+                        committed_response: String::new(),
+                        new_messages: new_msgs,
+                    });
+                }
+            }
         };
 
         if let Err(error) = self.rebuild_system_prompt_for_dispatcher(active_dispatcher.as_ref()) {
@@ -7288,6 +7302,24 @@ mod tests {
         cloud_escalation: zeroclaw_config::scattered_types::CloudEscalationPolicy,
         routes: Vec<zeroclaw_config::schema::ModelRouteConfig>,
     ) -> (Agent, Arc<Mutex<Vec<EffortRoutingProbe>>>) {
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let agent = effort_routing_test_agent_with_provider(
+            cloud_escalation,
+            routes,
+            Box::new(EffortRoutingProbeProvider {
+                observations: Arc::clone(&observations),
+            }),
+            Vec::new(),
+        );
+        (agent, observations)
+    }
+
+    fn effort_routing_test_agent_with_provider(
+        cloud_escalation: zeroclaw_config::scattered_types::CloudEscalationPolicy,
+        routes: Vec<zeroclaw_config::schema::ModelRouteConfig>,
+        provider: Box<dyn ModelProvider>,
+        tools: Vec<Box<dyn Tool>>,
+    ) -> Agent {
         let policy = zeroclaw_config::scattered_types::EffortRoutingConfig {
             local_hint: "local".into(),
             cloud_hint: "cloud".into(),
@@ -7331,7 +7363,6 @@ mod tests {
             "custom.local".into(),
             "base-model".into(),
         ));
-        let observations = Arc::new(Mutex::new(Vec::new()));
         let memory_cfg = zeroclaw_config::schema::MemoryConfig {
             backend: "none".into(),
             ..Default::default()
@@ -7341,14 +7372,12 @@ mod tests {
                 .expect("memory creation should succeed"),
         );
         let config = Arc::new(config);
-        let agent = Agent::builder()
-            .model_provider(Box::new(EffortRoutingProbeProvider {
-                observations: Arc::clone(&observations),
-            }))
+        Agent::builder()
+            .model_provider(provider)
             .model_provider_name("custom.local".into())
             .model_name("base-model".into())
             .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
-                Vec::new(),
+                tools,
             ))
             .memory(memory)
             .observer(Arc::from(crate::observability::NoopObserver {}))
@@ -7363,8 +7392,7 @@ mod tests {
                 live: None,
             })
             .build()
-            .expect("effort routing test agent must build");
-        (agent, observations)
+            .expect("effort routing test agent must build")
     }
 
     fn effort_routing_test_routes() -> Vec<zeroclaw_config::schema::ModelRouteConfig> {
@@ -10755,6 +10783,95 @@ mod tests {
                 cloud_allowed: true,
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn agent_turn_preserves_admitted_native_tool_history_across_turns() {
+        assert_admitted_native_tool_history_across_turns(false).await;
+    }
+
+    #[tokio::test]
+    async fn agent_turn_streamed_preserves_admitted_native_tool_history_across_turns() {
+        assert_admitted_native_tool_history_across_turns(true).await;
+    }
+
+    async fn assert_admitted_native_tool_history_across_turns(streaming: bool) {
+        use zeroclaw_config::scattered_types::CloudEscalationPolicy;
+
+        let requests: RoundRequests = Arc::new(Mutex::new(Vec::new()));
+        let cloud_requests: CapturedToolProtocolRequests = Arc::new(Mutex::new(Vec::new()));
+        let reliable = zeroclaw_providers::reliable::ReliableModelProvider::new(
+            "custom.local",
+            vec![
+                (
+                    "custom.local".into(),
+                    Box::new(RoundPolicyProvider {
+                        responses: Mutex::new(vec![
+                            round_response("", &["local-call"], 10),
+                            round_response("first turn done", &[], 20),
+                            round_response("second turn done", &[], 30),
+                        ]),
+                        requests: Arc::clone(&requests),
+                        streaming,
+                        capable: true,
+                        fail_stream_after_calls: false,
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "custom.cloud".into(),
+                    Box::new(HookProtocolCaptureProvider {
+                        supports_native: false,
+                        requests: Arc::clone(&cloud_requests),
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            0,
+        );
+        let mut agent = effort_routing_test_agent_with_provider(
+            CloudEscalationPolicy::Never,
+            effort_routing_test_routes(),
+            Box::new(reliable),
+            vec![Box::new(MockTool)],
+        );
+
+        for (message, expected) in [
+            ("use echo", "first turn done"),
+            ("what was the result?", "second turn done"),
+        ] {
+            let response = if streaming {
+                let (event_tx, _event_rx) = tokio::sync::mpsc::channel(128);
+                agent
+                    .turn_streamed(message, event_tx, None)
+                    .await
+                    .unwrap()
+                    .0
+            } else {
+                agent.turn(message).await.unwrap()
+            };
+            assert_eq!(response, expected);
+        }
+
+        assert!(
+            cloud_requests.lock().is_empty(),
+            "the excluded non-native cloud fallback must receive no requests"
+        );
+        let requests = requests.lock();
+        assert_eq!(requests.len(), 3, "two turns must include one tool round");
+        let second_turn = &requests[2].1;
+        let call = second_turn
+            .iter()
+            .filter(|message| message.role == "assistant")
+            .filter_map(|message| serde_json::from_str::<serde_json::Value>(&message.content).ok())
+            .find(|message| message["tool_calls"][0]["id"] == "local-call")
+            .expect("the next turn must retain the structured assistant tool call");
+        let result = second_turn
+            .iter()
+            .find(|message| message.role == "tool")
+            .expect("the next turn must retain the structured tool result");
+        let result: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(result["tool_call_id"], call["tool_calls"][0]["id"]);
+        assert_eq!(result["content"], "tool-out");
     }
 
     #[tokio::test]

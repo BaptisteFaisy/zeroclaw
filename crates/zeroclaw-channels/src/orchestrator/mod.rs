@@ -3137,16 +3137,29 @@ fn get_route_selection(
     sender_key: &str,
     defaults_snapshot: &ChannelRuntimeDefaultsSnapshot,
 ) -> ChannelRouteSelection {
+    get_route_selection_with_scope(ctx, msg, sender_key, defaults_snapshot).0
+}
+
+fn get_route_selection_with_scope(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    sender_key: &str,
+    defaults_snapshot: &ChannelRuntimeDefaultsSnapshot,
+) -> (ChannelRouteSelection, bool) {
     // Precedence (most specific wins): user > agent scope override,
     // then the per-sender route override, then the config default.
-    scope_override_lookup(ctx, msg).unwrap_or_else(|| {
+    if let Some(route) = scope_override_lookup(ctx, msg) {
+        return (route, true);
+    }
+    (
         ctx.route_overrides
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(sender_key)
             .cloned()
-            .unwrap_or_else(|| default_route_selection_from_snapshot(defaults_snapshot))
-    })
+            .unwrap_or_else(|| default_route_selection_from_snapshot(defaults_snapshot)),
+        false,
+    )
 }
 
 fn set_route_selection(
@@ -9231,7 +9244,8 @@ async fn process_channel_message_body(
     }
 
     let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
-    let mut route = get_route_selection(ctx.as_ref(), &msg, &history_key, &runtime_defaults);
+    let (mut route, route_is_scoped) =
+        get_route_selection_with_scope(ctx.as_ref(), &msg, &history_key, &runtime_defaults);
     let mut attempt_allowlist: Option<Arc<HashSet<String>>> = None;
 
     let resolved_agent = runtime_defaults
@@ -10350,19 +10364,16 @@ async fn process_channel_message_body(
                             &route,
                             ctx.context_token_budget,
                         );
-                        // Persist the route override so subsequent messages
-                        // from this sender continue using the switched model.
-                        set_route_selection(
-                            ctx.as_ref(),
-                            &history_key,
-                            ChannelRouteSelection {
-                                model_provider: route.model_provider.clone(),
-                                model: route.model.clone(),
-                                automatic: route.automatic,
-                                api_key: route.api_key.clone(),
-                            },
-                            &runtime_defaults,
-                        );
+                        // A scoped switch belongs to this turn, not the
+                        // hidden sender choice exposed when the scope clears.
+                        if !route_is_scoped {
+                            set_route_selection(
+                                ctx.as_ref(),
+                                &history_key,
+                                route.clone(),
+                                &runtime_defaults,
+                            );
+                        }
 
                         let switched_native_tool_specs_present =
                             ::zeroclaw_runtime::agent::loop_::native_tool_specs_present_for_turn(
@@ -41551,6 +41562,89 @@ BTC is currently around $65,000 based on latest tool output."#
                     .as_slice(),
                 &[(true, true), (true, false)]
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_model_auto_after_model_switch_restores_underlying_sender_route() {
+        for scope_flag in ["--user", "--agent"] {
+            for manual_sender in [false, true] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let (ctx, provider, channel_impl) =
+                    effort_routing_channel_context(tmp.path(), true);
+                let mut ctx = Arc::try_unwrap(ctx).ok().unwrap();
+                let mut config = ctx.prompt_config.as_ref().clone();
+                config
+                    .providers
+                    .models
+                    .ensure("openrouter", "default")
+                    .unwrap();
+                let config = Arc::new(config);
+                ctx.prompt_config = Arc::clone(&config);
+                ctx.tools_registry = Arc::new(
+                    zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                        Box::new(zeroclaw_runtime::tools::ModelSwitchTool::new(
+                            Arc::clone(&ctx.security),
+                            config,
+                        )),
+                    ]),
+                );
+                ctx.approval_manager = Arc::new(ApprovalManager::for_non_interactive(
+                    &zeroclaw_config::schema::RiskProfileConfig {
+                        auto_approve: vec!["model_switch".into()],
+                        ..Default::default()
+                    },
+                ));
+                let switching = Arc::new(ModelSwitchRequestProvider::default());
+                ctx.provider_cache
+                    .lock()
+                    .unwrap()
+                    .insert("custom.cloud".into(), switching.clone());
+                ctx.provider_cache
+                    .lock()
+                    .unwrap()
+                    .insert("openrouter.default".into(), provider.clone());
+                let ctx = Arc::new(ctx);
+                let channel: Arc<dyn Channel> = channel_impl;
+                let mut command = scope_test_msg("alice", "chan-1", None);
+                if manual_sender {
+                    command.content = "/model local".into();
+                    assert!(handle_runtime_command_if_needed(&ctx, &command, Some(&channel)).await);
+                }
+                let sender_key = conversation_history_key(&command);
+                let snapshot = runtime_defaults_snapshot(&ctx);
+                let underlying = get_route_selection(&ctx, &command, &sender_key, &snapshot);
+
+                command.content = format!("/model {scope_flag} cloud");
+                assert!(handle_runtime_command_if_needed(&ctx, &command, Some(&channel)).await);
+                let mut turn = scope_test_msg("alice", "chan-1", None);
+                turn.id = "scoped-switch-turn".into();
+                turn.content = "hi".into();
+                process_channel_message(Arc::clone(&ctx), turn, CancellationToken::new()).await;
+                assert_eq!(switching.call_count.load(Ordering::SeqCst), 1);
+                assert_eq!(provider.call_count.load(Ordering::SeqCst), 1);
+
+                command.content = format!("/model {scope_flag} auto");
+                assert!(handle_runtime_command_if_needed(&ctx, &command, Some(&channel)).await);
+                assert_eq!(
+                    get_route_selection(&ctx, &command, &sender_key, &snapshot),
+                    underlying,
+                    "reset must expose the original sender choice, not the scoped switch: {scope_flag}, manual={manual_sender}"
+                );
+
+                let mut next = scope_test_msg("alice", "chan-1", None);
+                next.id = "after-scoped-switch-reset".into();
+                next.content = "hi".into();
+                process_channel_message(Arc::clone(&ctx), next, CancellationToken::new()).await;
+                assert_eq!(
+                    provider.models.lock().unwrap().as_slice(),
+                    &["switched-model".to_string(), "local-model".to_string()]
+                );
+                assert_eq!(
+                    provider.attempt_allowlists.lock().unwrap().as_slice(),
+                    &[(true, true), (true, manual_sender)]
+                );
+            }
         }
     }
 
