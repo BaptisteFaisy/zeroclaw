@@ -18580,8 +18580,6 @@ command = "rm independent-delegate-marker"
                         .allowed_tools
                         .push("file_read".to_string());
                     config.plugins.enabled = false;
-                    // `delegate` is not one of the eleven core tools.
-                    config.tools.optional = vec![DelegateTool::NAME.to_string()];
                 }
                 let caller = Arc::new(SecurityPolicy::for_agent(&config, "caller").unwrap());
                 assert!(caller.is_tool_allowed(DelegateTool::NAME));

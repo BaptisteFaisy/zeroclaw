@@ -21,32 +21,27 @@ section.
 
 ## Minimal and full tools
 
-Fresh configurations written by setup or config generation use **minimal** unless they explicitly select extras:
-eleven built-ins in Chat, or eight in Code/ACP, which retains its
-exclusion of persistent-memory tools. Chat's eleven are `shell`, `file_read`,
-`file_write`, `file_edit`, `glob_search`, `content_search`, `memory_recall`,
-`memory_store`, `memory_forget`, `web_fetch`, and `git_operations`. Existing
-policy can narrow either catalog.
-
-Existing configuration files without `[tools]` retain full eligible built-in
-availability when upgrading to v0.8.6. Their compatibility selection is
-`optional = ["*"]`; existing explicit selections, including an empty section or
-empty list, are preserved. Existing prerequisites and permission rules still
-apply.
-
-Both settings use the same configuration field:
+Configurations use **full** unless they select minimal: every built-in carried
+by this binary and allowed by its existing configuration, prerequisites and
+permission rules. Setup and config generation write `optional = ["*"]`. A file
+without `[tools]`, or a `[tools]` section without `optional`, also loads full,
+so upgrading to v0.8.6 keeps existing tool availability. Existing explicit
+selections are preserved.
 
 ```toml
 [tools]
-optional = [] # minimal; the persisted default for new installations
+optional = ["*"] # full; the default
 ```
 
-For **full**, restore all built-ins carried by this binary and allowed by their
-existing configuration, prerequisites and permission rules:
+**Minimal** is opt-in: eleven built-ins in Chat, or eight in Code/ACP, which
+retains its exclusion of persistent-memory tools. Chat's eleven are `shell`,
+`file_read`, `file_write`, `file_edit`, `glob_search`, `content_search`,
+`memory_recall`, `memory_store`, `memory_forget`, `web_fetch`, and
+`git_operations`. Existing policy can narrow either catalog.
 
 ```toml
 [tools]
-optional = ["*"] # full
+optional = [] # minimal
 ```
 
 For minimal plus selected extras, use their callable names:
@@ -69,27 +64,24 @@ path/network policy and receipts still apply. Explicit MCP servers, skills,
 plugins and peripherals retain their existing activation and authority paths.
 Progressive schema disclosure is a separate feature, not part of these settings.
 
-To select full availability explicitly, set `optional = ["*"]` in `[tools]`,
-or run:
+To select minimal, set `optional = []` in `[tools]`, or run:
 
 ```sh
-zeroclaw config set tools.optional '["*"]' --no-interactive
+zeroclaw config set tools.optional '[]' --no-interactive
 ```
 
 Reload the daemon after changing selection. Config schema stays version 3.
-`zeroclaw config migrate` records the compatibility selection for an existing
-file without `[tools]`; ordinary saves also retain selector intent. Choose
-minimal by setting `optional = []`. Moving existing installations to minimal
-is a v0.9.0 design decision; v0.8.6 upgrades preserve their selection.
+`zeroclaw config migrate` records `optional = ["*"]` for an existing file
+without `[tools]`; ordinary saves also retain selector intent.
 
 ### Builds and upgrade path
 
 | Channel | Compiled capability | Runtime selection |
 | --- | --- | --- |
-| Release archive | Standard `dist` includes the native `tools-compat` adapters | Minimal by default; full and named extras work without another download |
+| Release archive | Standard `dist` includes the native `tools-compat` adapters | Full by default; minimal and named extras work without another download |
 | Desktop sidecar | The same target-resolved `dist` CLI, plus requested desktop features | The same minimal/full settings and prerequisites |
-| Homebrew source build | Depends on the formula's feature selection; a Cargo-default build omits native adapters | Full reports missing adapters; use the standard source build below when the formula does not carry them |
-| Docker `dist` image | Standard `dist`, including native adapters | Baked configs currently omit `[tools]` and load full for compatibility; set `optional = []` for minimal |
+| Homebrew source build | Depends on the formula's feature selection; a Cargo-default build omits native adapters | Full includes only the adapters the formula carries; use the standard source build below when it omits them |
+| Docker `dist` image | Standard `dist`, including native adapters | Baked configs omit `[tools]` and load full, the default; set `optional = []` for minimal |
 
 One release matrix has ten target legs, with unchanged archive names. Android is
 experimental and allowed to fail; publication requires the other nine targets.
@@ -99,8 +91,9 @@ including additional channels and hardware features.
 
 `dist` includes `tools-compat` (`tools-saas`, `tools-coding-cli`, `tools-external`).
 `dist-compat` is a compatibility alias for the same build. Plain Cargo defaults
-remain smaller: custom source builds can omit adapters. With full or named
-selection, each compiled-out external adapter gets a clear diagnostic; enabled
+remain smaller: custom source builds can omit adapters. A compiled-out external
+adapter named in `optional` gets a clear diagnostic; full selects only the
+adapters this binary carries and reports nothing for the rest. Enabled
 vendor/CLI sections retain their existing missing-feature diagnostic. Runtime
 configuration cannot add compiled-out code. Build the standard selection to
 recover it:
@@ -132,13 +125,12 @@ compilation. Target policy comes from `package.metadata.zeroclaw` in `Cargo.toml
 Minimal is a runtime catalog selection. Standard `dist` still carries the
 compiled native adapters, so minimal alone is not binary-size evidence for
 [the tool extraction work](https://github.com/zeroclaw-labs/zeroclaw/issues/10998).
-Container, Kubernetes and Nix defaults that omit `[tools]` take the same
-full-availability compatibility path as existing files; explicit minimal
-configuration is needed for those artifacts.
+Container, Kubernetes and Nix defaults omit `[tools]` and load full like any
+other configuration; set `optional = []` in them for minimal.
 
 ## Built-in tools
 
-The following built-in capabilities are available when compiled and selected; the eleven-tool default is listed above. This list is not the core set; see [Tiers and the retained core set](../developing/tool-inventory.md#tiers-and-the-retained-core-set) for the core set and the tier of each tool the runtime registry builds.
+The following built-in capabilities are available when compiled and selected, which full does for all of them; the eleven-tool minimal set is listed above. This list is not the core set; see [Tiers and the retained core set](../developing/tool-inventory.md#tiers-and-the-retained-core-set) for the core set and the tier of each tool the runtime registry builds.
 
 | Tool | What it does |
 |---|---|
@@ -175,7 +167,7 @@ ZeroClaw sends it only as a Bearer authorization header; without a key, no
 queries to a third-party service even in anonymous mode. It does not change the
 default provider and is not used as an automatic fallback.
 
-Additional first-party built-ins require selection:
+Additional first-party built-ins, included in full but not in minimal:
 
 | Tool | Notes |
 |---|---|

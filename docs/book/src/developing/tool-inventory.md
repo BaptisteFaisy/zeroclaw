@@ -22,15 +22,16 @@ The shared tool implementations live primarily under `crates/zeroclaw-tools/`.
 
 ## Default model-visible selection
 
-The canonical default selection is `CORE_TOOL_NAMES` in
+The canonical minimal selection is `CORE_TOOL_NAMES` in
 `crates/zeroclaw-config/src/builtin_tools.rs`: eleven built-ins, narrowed by
-existing agent and caller policy. Additional built-ins require `[tools].optional`
-selection before construction; see [Selecting optional tools](../tools/overview.md#selecting-optional-tools)
+existing agent and caller policy. The default, `[tools].optional = ["*"]`, is
+full; under minimal, additional built-ins must be named in `[tools].optional`
+before construction. See [Minimal and full tools](../tools/overview.md#minimal-and-full-tools)
 for compiled availability and recovery instructions. Configured plugins, MCP
 servers, skills and peripherals keep their own activation and permission paths.
 
 The buckets below describe implementation ownership and possible future homes.
-They do not declare the default model catalog or authorize removing an existing
+They do not declare either model catalog or authorize removing an existing
 implementation. `git_operations` remains in the approved eleven while its
 long-term classification and replacement-first requirements remain below.
 

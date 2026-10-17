@@ -2005,10 +2005,10 @@ async fn late_tool_search_minimal_full_compiled_semantics() {
                 zeroclaw_config::migration::migrate_to_current("schema_version = 2\n").unwrap();
             assert_eq!(upgraded.tools.optional, vec!["*".to_owned()]);
             let fresh = Config::default();
-            assert!(fresh.tools.optional.is_empty());
+            assert_eq!(fresh.tools.optional, vec!["*".to_owned()]);
             let saved = toml::to_string(&fresh).unwrap();
             let roundtrip: Config = toml::from_str(&saved).unwrap();
-            assert!(roundtrip.tools.optional.is_empty());
+            assert_eq!(roundtrip.tools.optional, vec!["*".to_owned()]);
             let mut selected = Config::default();
             selected.tools.optional = vec!["weather".into()];
             let warnings = selected.collect_warnings();

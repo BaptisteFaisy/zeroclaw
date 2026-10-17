@@ -2123,20 +2123,20 @@ fn generate_every_version_migrates_and_validates() {
             .unwrap_or_else(|e| panic!("generate({target}) failed: {e:#}"));
         let parsed: toml::Value = toml::from_str(&raw).expect("generated config is TOML");
         assert_eq!(
-            parsed["tools"]["optional"].as_array().map(Vec::len),
-            Some(0),
+            parsed["tools"]["optional"],
+            toml::Value::Array(vec![toml::Value::String("*".into())]),
             "generate({target}) must explicitly record the new-install selection"
         );
         let cfg = migrate_to_current(&raw).unwrap_or_else(|e| {
             panic!("generate({target}) output failed to migrate to current schema: {e:#}")
         });
-        assert!(cfg.tools.optional.is_empty());
-        assert!(!cfg.tools.is_enabled("calculator"));
-        assert!(
+        assert_eq!(cfg.tools.optional, ["*"]);
+        assert!(cfg.tools.is_enabled("calculator"));
+        assert_eq!(
             zeroclaw_config::migration::migrate_to_current_resilient(&raw)
                 .tools
-                .optional
-                .is_empty()
+                .optional,
+            ["*"]
         );
         cfg.validate()
             .unwrap_or_else(|e| panic!("generate({target}) output fails Config::validate: {e:#}"));
@@ -2527,8 +2527,8 @@ fn generate_with_encrypt_produces_enc2_ciphertext_at_every_version() {
         // ciphertext is real (not just a literal `enc2:` prefix).
         let parsed: toml::Value = toml::from_str(&raw).expect("encrypted output parses");
         assert_eq!(
-            parsed["tools"]["optional"].as_array().map(Vec::len),
-            Some(0),
+            parsed["tools"]["optional"],
+            toml::Value::Array(vec![toml::Value::String("*".into())]),
             "encrypted generation must retain the new-install selection"
         );
         let api_key_ciphertext = find_first_string_at_key(&parsed, "api_key")

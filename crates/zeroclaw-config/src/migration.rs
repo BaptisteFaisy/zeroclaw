@@ -137,8 +137,8 @@ pub fn generate(target_version: u32, opts: &GenerateOptions<'_>) -> Result<Strin
 
     let mut value = value;
     // Generation creates a new installation, even when the requested schema
-    // is historical. Persist its selection so legacy-omission migration does
-    // not reinterpret this new document as an existing full-tool setup.
+    // is historical. Write its full default selection so the document states
+    // it and `config migrate` has nothing to normalize.
     let tools = toml::Value::try_from(crate::builtin_tools::BuiltinToolsConfig::default())
         .context("failed to serialize default tool selection")?;
     value
@@ -319,7 +319,7 @@ fn migrate_parsed_value(mut value: toml::Value) -> Result<toml::Value> {
     }
     // Legacy typed schemas may discard this new section. Carry the exact raw
     // value across their chain, including malformed values: strict deserialize
-    // must reject those and salvage must remain minimal, never infer wildcard.
+    // must reject those, and salvage drops them like any other invalid section.
     let original_tools = value
         .as_table_mut()
         .context("config root must be a TOML table")?
@@ -987,9 +987,9 @@ mod tests {
                 let strict = migrate_to_current(&raw).unwrap();
                 let resilient = migrate_to_current_resilient(&raw);
                 assert_eq!(strict.tools.optional, resilient.tools.optional);
-                if !section.contains("\"*\"") {
-                    assert!(!strict.tools.is_enabled("weather"));
-                }
+                // A section without `optional` takes the full default.
+                let full = section == "[tools]\n" || section.contains("\"*\"");
+                assert_eq!(strict.tools.is_enabled("weather"), full, "{raw}");
                 if let Some(disk) = migrate_file(&raw).unwrap() {
                     let written: toml::Value = toml::from_str(&disk).unwrap();
                     assert_eq!(written.get("tools"), original.get("tools"));
@@ -999,7 +999,7 @@ mod tests {
     }
 
     #[test]
-    fn compatibility_malformed_tools_never_become_implicit_wildcard() {
+    fn compatibility_malformed_tools_are_refused_then_salvaged_to_the_default() {
         for prefix in ["", "schema_version = 2\n", "schema_version = 3\n"] {
             for section in [
                 "tools = false\n",
@@ -1015,8 +1015,7 @@ mod tests {
                 );
                 assert!(migrate_to_current(&raw).is_err());
                 let salvaged = migrate_to_current_salvaged(&raw);
-                assert!(salvaged.config.tools.optional.is_empty());
-                assert!(!salvaged.config.tools.is_enabled("calculator"));
+                assert_eq!(salvaged.config.tools.optional, ["*"]);
                 assert!(salvaged.dropped.iter().any(|path| path == "tools"));
             }
         }

@@ -125,9 +125,9 @@ sudo usermod -aG gpio,spi,i2c $USER
 ## Update
 
 Standard release updates carry the native adapters for both minimal and full
-tool settings. In v0.8.6, existing configurations without `[tools]` retain full
-eligible built-in availability through `optional = ["*"]`. New installations
-use minimal: eleven tools in Chat, eight in Code/ACP. Explicit selections are
+tool settings. Full stays the default for new and existing installations,
+including configurations without `[tools]`. Minimal, eleven tools in Chat and
+eight in Code/ACP, is opt-in through `optional = []`. Explicit selections are
 preserved; named entries select individual extras. Full preserves existing
 integration prerequisites and
 permission gates. Plain Cargo-default source builds, including a Homebrew formula
