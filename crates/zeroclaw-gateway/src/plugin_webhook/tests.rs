@@ -540,6 +540,58 @@ async fn plugin_webhook_request_over_ingress_bounds_is_invalid_before_route_look
 }
 
 #[tokio::test]
+async fn plugin_webhook_bounds_record_keeps_a_secret_path_out() {
+    use zeroclaw_api::webhook::MAX_PLUGIN_WEBHOOK_HEADERS;
+
+    // Shaped like the unguessable path some vendors use as a shared secret.
+    const SECRET_PATH: &str = "s3cret-path-6f1d2c8a9b";
+    let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+    zeroclaw_log::try_install_capture_subscriber();
+    let mut records = zeroclaw_log::subscribe_or_install();
+    while records.try_recv().is_ok() {}
+
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let ingress = test_ingress();
+    let lease = ingress.registry().start_generation();
+    let (sink, _receiver) = tokio::sync::mpsc::channel(1);
+    assert!(lease.replace(HashMap::from([(
+        SECRET_PATH.to_string(),
+        fixture_route(sink)
+    )])));
+    let app = plugin_webhook_test_router(admin_paircode_state(&tmp, false, false), ingress);
+    let mut request = plugin_webhook_request(
+        SECRET_PATH,
+        "body",
+        SocketAddr::from(([127, 0, 0, 1], 31001)),
+        None,
+    );
+    for index in 0..=MAX_PLUGIN_WEBHOOK_HEADERS {
+        request.headers_mut().insert(
+            axum::http::HeaderName::try_from(format!("x-h-{index}")).expect("valid header name"),
+            HeaderValue::from_static("v"),
+        );
+    }
+    let response = app.oneshot(request).await.expect("route responds");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let mut refused = Vec::new();
+    while let Ok(record) = records.try_recv() {
+        assert!(
+            !record.to_string().contains(SECRET_PATH),
+            "the webhook path must not reach a record: {record:#?}"
+        );
+        if record["attributes"]["error_key"] == "plugin_webhook_request_invalid" {
+            refused.push(record);
+        }
+    }
+    assert!(!refused.is_empty(), "the bounds refusal is recorded");
+    for record in &refused {
+        assert_eq!(record["attributes"].get("path"), None, "{record:#?}");
+    }
+    zeroclaw_log::clear_broadcast_hook();
+}
+
+#[tokio::test]
 async fn plugin_webhook_dedup_state_outlives_a_gateway_router() {
     use zeroclaw_api::webhook::WebhookReservation;
 
