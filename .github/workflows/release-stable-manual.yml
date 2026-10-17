@@ -201,11 +201,11 @@ jobs:
     name: Build ${{ matrix.target }}
     needs: [validate, web]
     runs-on: ${{ matrix.os }}
-    # 90 min: the x86_64-apple-darwin leg needs ~45-50 min on GitHub's slower
-    # Intel macOS runners (v0.8.3 hit the old 40-min ceiling twice, killing the
-    # cache save each time and compounding the slowdown). Fast legs are
-    # unaffected; this is a ceiling, not an allocation.
-    timeout-minutes: 90
+    # 180 min for the two macOS legs, 90 for the rest, as in the manual
+    # Cross-Platform Build: with the plugin host its macOS dist jobs took
+    # 86 min (x86_64) and 99 min (aarch64) on 2026-10-17. This is a ceiling,
+    # not an allocation.
+    timeout-minutes: ${{ (matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-apple-darwin') && 180 || 90 }}
     strategy:
       fail-fast: false
       matrix:

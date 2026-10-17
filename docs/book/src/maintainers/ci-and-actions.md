@@ -254,7 +254,7 @@ inventory alone does not replace those results or maintainer review. Missing
 or uninterpretable evidence holds acceptance; it does not authorize an
 automatic budget, resource, feature, or ABI-policy change. Ubuntu24 ARM64
 execution is not Ubuntu22 ARM64 runtime proof. ARM32, companion execution,
-Darwin, MUSL, Android, Windows, Stable's full 90-minute matrix, and release
+Darwin, MUSL, Android, Windows, Stable's full matrix, and release
 readiness require their own evidence. A source change alone proves none of
 these runtime results.
 
