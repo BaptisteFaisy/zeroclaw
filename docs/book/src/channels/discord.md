@@ -180,11 +180,13 @@ zeroclaw config set plugins.entries.zpi1_WyJkaXNjb3JkIiwiY2hhbm5lbCIsIm1haW4iXQ.
 The other settings sit beside the token under `.config.` and are optional:
 `guild_ids` and `channel_ids` narrow where the bot listens (see
 [Narrowing where the bot listens](#narrowing-where-the-bot-listens)), and
-`mention_only` and `listen_to_bots` take `true` or `false`. Set a list as JSON
-text:
+`mention_only` and `listen_to_bots` take `true` or `false`. ZeroClaw stores
+every plugin setting encrypted, so `zeroclaw config set` prompts for each one
+as it does for the token; pass `--no-interactive` to give a setting that is not
+secret on the command line. Set a list as JSON text:
 
 ```sh
-zeroclaw config set plugins.entries.zpi1_WyJkaXNjb3JkIiwiY2hhbm5lbCIsIm1haW4iXQ.config.channel_ids '["123456789012345678"]'
+zeroclaw config set --no-interactive plugins.entries.zpi1_WyJkaXNjb3JkIiwiY2hhbm5lbCIsIm1haW4iXQ.config.channel_ids '["123456789012345678"]'
 ```
 
 ### 3. Turn it on and route it to an agent
