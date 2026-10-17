@@ -101,12 +101,13 @@ async fn handle_plugin_webhook(
     ) {
         Ok(request) => request,
         Err(error) => {
+            // No path: some vendors use an unguessable webhook path as their
+            // shared secret, and this record is persisted as written.
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
-                        "path": path,
                         "reason": error.reason(),
                         "error_key": "plugin_webhook_request_invalid",
                     })),
