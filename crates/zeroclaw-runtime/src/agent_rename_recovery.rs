@@ -1154,9 +1154,6 @@ enum Slot<T> {
 struct WorkspaceMove {
     source: PathBuf,
     destination: PathBuf,
-    /// Every spelling of `source` an ACP row may have recorded as its working
-    /// directory: as configured, and with symlinks resolved.
-    spellings: Vec<String>,
     /// The two aliases differ only in letter case, so on a case-insensitive
     /// filesystem `source` and `destination` are one directory.
     case_only: bool,
@@ -1245,6 +1242,9 @@ impl WorkspaceFollower {
 /// holds. Resolving opens only stores that already exist.
 struct FollowerPlan {
     workspace: WorkspaceFollower,
+    /// The spellings of the old default workspace that ACP rows are matched
+    /// against: see [`old_workspace_spellings`].
+    old_workspace_spellings: Vec<String>,
     memory: Slot<Arc<dyn Memory>>,
     acp: Slot<Arc<AcpSessionStore>>,
     sessions: Slot<Arc<dyn SessionBackend>>,
@@ -1260,6 +1260,7 @@ impl FollowerPlan {
     ) -> Self {
         Self {
             workspace: workspace_follower(config, from, to, record).await,
+            old_workspace_spellings: old_workspace_spellings(config, from).await,
             memory: memory_slot(config, stores).await,
             acp: match stores.acp {
                 Some(store) => Slot::Open(Arc::clone(store)),
@@ -1283,7 +1284,7 @@ impl FollowerPlan {
         }
     }
 
-    /// How much state `follower` still attributes to `from`.
+    /// How much state `follower` still keeps under `from`.
     async fn probe(
         &self,
         follower: FollowerKind,
@@ -1309,21 +1310,7 @@ impl FollowerPlan {
                     .map(Option::unwrap_or_default)
                     .map_err(|e| unreadable(format!("{e:#}"))),
             },
-            FollowerKind::Acp => match &self.acp {
-                Slot::OutOfScope => Ok(0),
-                Slot::Unreadable(reason) => Err(unreadable(reason.clone())),
-                Slot::Open(store) => {
-                    let mut residue = store
-                        .count_sessions_by_agent(from)
-                        .map_err(|e| unreadable(format!("{e:#}")))?;
-                    for spelling in self.workspace_spellings() {
-                        residue += store
-                            .count_sessions_under_workspace(spelling)
-                            .map_err(|e| unreadable(format!("{e:#}")))?;
-                    }
-                    Ok(residue)
-                }
-            },
+            FollowerKind::Acp => self.acp_residue(from).map(|acp| acp.total()),
             FollowerKind::Sessions => match &self.sessions {
                 Slot::OutOfScope => Ok(0),
                 Slot::Unreadable(reason) => Err(unreadable(reason.clone())),
@@ -1334,11 +1321,30 @@ impl FollowerPlan {
         }
     }
 
-    fn workspace_spellings(&self) -> &[String] {
-        match &self.workspace {
-            WorkspaceFollower::Move(workspace) => &workspace.spellings,
-            _ => &[],
+    /// The ACP sessions `from` still owns, and those saved with a working
+    /// directory in its old default workspace, whatever the workspace
+    /// follower does: either kind keeps the record open.
+    fn acp_residue(&self, from: &str) -> Result<AcpResidue, FollowerIssue> {
+        let unreadable =
+            |e: anyhow::Error| FollowerIssue::unreadable(FollowerKind::Acp, format!("{e:#}"));
+        let store = match &self.acp {
+            Slot::OutOfScope => return Ok(AcpResidue::default()),
+            Slot::Unreadable(reason) => {
+                return Err(FollowerIssue::unreadable(FollowerKind::Acp, reason.clone()));
+            }
+            Slot::Open(store) => store,
+        };
+        let owned = store.count_sessions_by_agent(from).map_err(unreadable)?;
+        let mut in_old_workspace = 0;
+        for spelling in &self.old_workspace_spellings {
+            in_old_workspace += store
+                .count_sessions_under_workspace(spelling)
+                .map_err(unreadable)?;
         }
+        Ok(AcpResidue {
+            owned,
+            in_old_workspace,
+        })
     }
 
     /// Probe every follower in order and move the ones holding state under
@@ -1351,9 +1357,9 @@ impl FollowerPlan {
         report: &mut ConvergeReport,
     ) -> Vec<(FollowerKind, Option<FollowerIssue>)> {
         let mut attempted = Vec::with_capacity(FollowerKind::ALL.len());
-        // ACP rows keep the old workspace's absolute path. They follow the
-        // workspace only once it has left the old location (moved now, moved
-        // earlier, or never there); while it stays there, so do they.
+        // Whether the workspace follower left nothing at the old default
+        // location, which decides whether ACP rows saved there follow a
+        // moving workspace: see `acp_destination`.
         let mut workspace_settled = true;
         for follower in FollowerKind::ALL {
             let issue = match self.probe(follower, config, from).await {
@@ -1438,11 +1444,12 @@ impl FollowerPlan {
                     Ok(rows) => report.acp_sessions = rows,
                     Err(e) => failure = Some(format!("acp rename: {e:#}")),
                 }
-                if let (WorkspaceFollower::Move(workspace), true) =
-                    (&self.workspace, workspace_settled)
+                if let Some(destination) = self
+                    .acp_destination(config, from, to, workspace_settled)
+                    .await
                 {
-                    let destination = workspace.destination.to_string_lossy();
-                    for spelling in &workspace.spellings {
+                    let destination = destination.to_string_lossy();
+                    for spelling in &self.old_workspace_spellings {
                         match store.relocate_session_workspaces(spelling, &destination) {
                             Ok(rows) => report.acp_workspaces += rows,
                             Err(e) => {
@@ -1471,6 +1478,36 @@ impl FollowerPlan {
         }
     }
 
+    /// Where ACP rows saved with a working directory in the old default
+    /// workspace of `from` are re-pointed, or `None` while they stay put.
+    ///
+    /// A workspace that moves takes them to the new alias's default location
+    /// once the workspace follower has left nothing at the old one in this
+    /// run. When nothing moves, they follow to the new alias's current
+    /// workspace once the old location is gone, as long as that workspace
+    /// does not overlap it. While the old files are still there, or whether
+    /// they are cannot be told, a resumed session belongs with them, and an
+    /// overlapping workspace is the workspace follower's conflict to report.
+    /// Rows left in place keep the record open until a later run can
+    /// re-point them.
+    async fn acp_destination(
+        &self,
+        config: &Config,
+        from: &str,
+        to: &str,
+        workspace_settled: bool,
+    ) -> Option<PathBuf> {
+        if let WorkspaceFollower::Move(workspace) = &self.workspace {
+            return workspace_settled.then(|| workspace.destination.clone());
+        }
+        let old = config.default_agent_workspace_dir(from);
+        if !matches!(inspect_lifecycle_path(&old).await, PathPresence::Absent) {
+            return None;
+        }
+        let current = config.agent_workspace_dir(to);
+        matches!(workspaces_overlap(&current, &old).await, Ok(false)).then_some(current)
+    }
+
     /// Re-probe every follower. The re-probe is authoritative: a follower
     /// holding nothing under `from` has converged whatever its move reported,
     /// one still holding state reports why its move did not take it, or that
@@ -1488,14 +1525,13 @@ impl FollowerPlan {
     ) -> Vec<FollowerIssue> {
         let mut outstanding = Vec::new();
         for (follower, issue) in attempted {
-            match self.probe(follower, config, from).await {
-                Ok(0) if follower == FollowerKind::Workspace => {
+            match self.probe_detail(follower, config, from, to).await {
+                Ok(None) if follower == FollowerKind::Workspace => {
                     outstanding.extend(sync_workspace_directories(config, from, to).await);
                 }
-                Ok(0) => {}
-                Ok(_) => outstanding.push(issue.unwrap_or_else(|| {
-                    FollowerIssue::lagging(follower, self.residue_detail(follower, from, to))
-                })),
+                Ok(None) => {}
+                Ok(Some(detail)) => outstanding
+                    .push(issue.unwrap_or_else(|| FollowerIssue::lagging(follower, detail))),
                 Err(unreadable) => outstanding.push(unreadable),
             }
         }
@@ -1507,25 +1543,71 @@ impl FollowerPlan {
     async fn residue(&self, config: &Config, from: &str, to: &str) -> Vec<FollowerIssue> {
         let mut residue = Vec::new();
         for follower in FollowerKind::ALL {
-            match self.probe(follower, config, from).await {
-                Ok(0) => {}
-                Ok(_) => residue.push(FollowerIssue::lagging(
-                    follower,
-                    self.residue_detail(follower, from, to),
-                )),
+            match self.probe_detail(follower, config, from, to).await {
+                Ok(None) => {}
+                Ok(Some(detail)) => residue.push(FollowerIssue::lagging(follower, detail)),
                 Err(unreadable) => residue.push(unreadable),
             }
         }
         residue
     }
 
-    /// The warning line for `follower` still holding state under `from`.
-    fn residue_detail(&self, follower: FollowerKind, from: &str, to: &str) -> String {
-        match follower {
+    /// Probe `follower` as [`Self::probe`] does and, while it still holds
+    /// state under `from`, return the warning line saying what; `None` once
+    /// it holds nothing.
+    async fn probe_detail(
+        &self,
+        follower: FollowerKind,
+        config: &Config,
+        from: &str,
+        to: &str,
+    ) -> Result<Option<String>, FollowerIssue> {
+        if follower == FollowerKind::Acp {
+            return Ok(self.acp_residue(from)?.detail(from));
+        }
+        let held = self.probe(follower, config, from).await?;
+        Ok((held > 0).then(|| match follower {
             FollowerKind::Workspace => self.workspace.residue_detail(from, to),
-            _ => format!("{follower} still attributes state to `{from}`"),
+            _ => attributed_detail(follower, from),
+        }))
+    }
+}
+
+/// The ACP sessions a rename still has to re-point.
+#[derive(Default)]
+struct AcpResidue {
+    /// Sessions the old alias still owns.
+    owned: usize,
+    /// Sessions, whoever owns them, saved with a working directory that is
+    /// the old default workspace or lies beneath it. A resumed session runs
+    /// there, in whatever an agent re-created under the old alias keeps.
+    in_old_workspace: usize,
+}
+
+impl AcpResidue {
+    fn total(&self) -> usize {
+        self.owned + self.in_old_workspace
+    }
+
+    /// The warning line for the sessions still to re-point, or `None` once
+    /// there are none.
+    fn detail(&self, from: &str) -> Option<String> {
+        let owned = (self.owned > 0).then(|| attributed_detail(FollowerKind::Acp, from));
+        let in_old_workspace = (self.in_old_workspace > 0).then(|| {
+            format!(
+                "saved session working directories still point at the old default workspace of `{from}`"
+            )
+        });
+        match (owned, in_old_workspace) {
+            (Some(owned), Some(in_old_workspace)) => Some(format!("{owned}; {in_old_workspace}")),
+            (owned, in_old_workspace) => owned.or(in_old_workspace),
         }
     }
+}
+
+/// The warning line for `follower` still attributing state to `from`.
+fn attributed_detail(follower: FollowerKind, from: &str) -> String {
+    format!("{follower} still attributes state to `{from}`")
 }
 
 /// Decide what the workspace follower does for renaming `from` to `to`,
@@ -1564,22 +1646,29 @@ async fn workspace_follower(
         Some(Some(recorded)) if lexically_normalized(recorded) != lexically_normalized(&old) => {
             WorkspaceFollower::RecordMismatch(recorded.clone())
         }
-        _ => {
-            let mut spellings = vec![old.to_string_lossy().into_owned()];
-            if let Some(canonical) = canonical_spelling(&old).await {
-                let canonical = canonical.to_string_lossy().into_owned();
-                if !spellings.contains(&canonical) {
-                    spellings.push(canonical);
-                }
-            }
-            WorkspaceFollower::Move(WorkspaceMove {
-                source: old,
-                destination,
-                spellings,
-                case_only: from.to_lowercase() == to.to_lowercase(),
-            })
+        _ => WorkspaceFollower::Move(WorkspaceMove {
+            source: old,
+            destination,
+            case_only: from.to_lowercase() == to.to_lowercase(),
+        }),
+    }
+}
+
+/// Every spelling of the old default workspace of `from` that an ACP row may
+/// have recorded as its working directory: as configured, and with symlinks
+/// resolved. A row keeps pointing there whatever the workspace follower does,
+/// and after the directory is gone, which [`canonical_spelling`] resolves
+/// through its nearest existing ancestor.
+async fn old_workspace_spellings(config: &Config, from: &str) -> Vec<String> {
+    let old = config.default_agent_workspace_dir(from);
+    let mut spellings = vec![old.to_string_lossy().into_owned()];
+    if let Some(canonical) = canonical_spelling(&old).await {
+        let canonical = canonical.to_string_lossy().into_owned();
+        if !spellings.contains(&canonical) {
+            spellings.push(canonical);
         }
     }
+    spellings
 }
 
 /// `path` with `.` components dropped and each `..` folded into the
@@ -3574,7 +3663,10 @@ mod tests {
         assert_eq!(outstanding(&outcome)[0].kind, FollowerIssueKind::Unreadable);
         assert_eq!(
             outstanding(&outcome)[1].to_string(),
-            format!("acp still attributes state to `{FROM}`")
+            format!(
+                "saved session working directories still point at the old default workspace of `{FROM}`"
+            ),
+            "the session changed owner, but not its working directory"
         );
         assert_eq!(outcome.warnings().len(), 2);
         assert!(!outcome.report().workspace_moved);
@@ -3851,6 +3943,226 @@ mod tests {
             acp_row(&after, "canonical"),
             (TO.to_string(), destination.join("proj"))
         );
+    }
+
+    /// A recorded rename whose first converge stopped on a non-empty
+    /// destination, after which the operator gave the new alias the custom
+    /// workspace `custom`. ACP sessions were saved in the old default
+    /// workspace, beneath it, and in `unrelated`. Returns the config with the
+    /// custom path, and the old default workspace, which still holds its
+    /// files.
+    async fn conflicted_rename_given_a_custom_workspace(
+        tmp: &TempDir,
+        custom: &Path,
+        unrelated: &Path,
+    ) -> (Config, PathBuf) {
+        let before = fixture(tmp, &[FROM]);
+        let old = seed_workspace(&before, FROM);
+        std::fs::create_dir(old.join("sub")).unwrap();
+        seed_acp(&before, "at-old", FROM, &old);
+        seed_acp(&before, "under-old", FROM, &old.join("sub"));
+        seed_acp(&before, "unrelated", "other", unrelated);
+        let mut after = arm_and_commit(&before).await;
+        let destination = after.default_agent_workspace_dir(TO);
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(destination.join("keep.md"), "theirs").unwrap();
+
+        let first = converge(&after, FROM, TO, &SurfaceStores::none())
+            .await
+            .unwrap();
+        assert_eq!(outstanding(&first)[0].kind, FollowerIssueKind::Conflict);
+        assert_eq!(
+            acp_row(&after, "at-old"),
+            (TO.to_string(), old.clone()),
+            "the session changed owner, but stays with the files that did not move"
+        );
+        after.agents.get_mut(TO).unwrap().workspace.path = Some(custom.to_path_buf());
+        (after, old)
+    }
+
+    #[tokio::test]
+    async fn saved_sessions_follow_files_moved_by_hand_to_a_custom_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let custom = tmp.path().join("custom");
+        let unrelated = tmp.path().join("unrelated");
+        let (after, old) =
+            conflicted_rename_given_a_custom_workspace(&tmp, &custom, &unrelated).await;
+        // The operator moves the old files into the custom workspace by hand,
+        // which leaves no old default workspace behind, then re-runs the
+        // rename.
+        std::fs::rename(&old, &custom).unwrap();
+
+        let outcome = converge(&after, FROM, TO, &SurfaceStores::none())
+            .await
+            .unwrap();
+        assert!(outcome.is_converged(), "{:?}", outcome.warnings());
+        assert_eq!(outcome.report().acp_workspaces, 2);
+        assert_eq!(acp_row(&after, "at-old"), (TO.to_string(), custom.clone()));
+        assert_eq!(
+            acp_row(&after, "under-old"),
+            (TO.to_string(), custom.join("sub"))
+        );
+        assert_eq!(
+            acp_row(&after, "unrelated"),
+            ("other".to_string(), unrelated)
+        );
+        assert!(custom.join("MEMORY.md").is_file());
+        assert!(records(&after).is_empty());
+        assert_eq!(retired_alias(&after, FROM).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn saved_sessions_stay_with_files_left_in_the_old_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let custom = tmp.path().join("custom");
+        let unrelated = tmp.path().join("unrelated");
+        let (after, old) =
+            conflicted_rename_given_a_custom_workspace(&tmp, &custom, &unrelated).await;
+
+        // Re-run before the old files have moved: a resumed session still
+        // belongs with them, and the old alias stays retired.
+        let outcome = converge(&after, FROM, TO, &SurfaceStores::none())
+            .await
+            .unwrap();
+        let issues: Vec<(FollowerKind, FollowerIssueKind, String)> = outstanding(&outcome)
+            .iter()
+            .map(|issue| (issue.follower, issue.kind, issue.to_string()))
+            .collect();
+        assert_eq!(
+            issues,
+            vec![
+                (
+                    FollowerKind::Workspace,
+                    FollowerIssueKind::Conflict,
+                    format!(
+                        "the old default workspace of `{FROM}` still exists at {}; move its contents by hand, then re-run the rename",
+                        old.display()
+                    ),
+                ),
+                (
+                    FollowerKind::Acp,
+                    FollowerIssueKind::Lagging,
+                    format!(
+                        "saved session working directories still point at the old default workspace of `{FROM}`"
+                    ),
+                ),
+            ]
+        );
+        assert_eq!(outcome.report().acp_workspaces, 0);
+        assert_eq!(acp_row(&after, "at-old"), (TO.to_string(), old.clone()));
+        assert_eq!(
+            acp_row(&after, "under-old"),
+            (TO.to_string(), old.join("sub"))
+        );
+        assert_eq!(
+            acp_row(&after, "unrelated"),
+            ("other".to_string(), unrelated)
+        );
+        assert!(old.join("MEMORY.md").is_file());
+        assert_eq!(records(&after).len(), 1);
+        assert!(retired_alias(&after, FROM).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn saved_sessions_stay_while_the_new_workspace_overlaps_the_old_one() {
+        let tmp = TempDir::new().unwrap();
+        let before = fixture(&tmp, &[FROM]);
+        let old = before.default_agent_workspace_dir(FROM);
+        let unrelated = tmp.path().join("unrelated");
+        seed_acp(&before, "at-old", FROM, &old);
+        seed_acp(&before, "under-old", FROM, &old.join("sub"));
+        seed_acp(&before, "unrelated", "other", &unrelated);
+        let mut after = arm_and_commit(&before).await;
+        // Nothing is at the old default workspace, so only the overlap keeps
+        // the saved working directories where they are.
+        after.agents.get_mut(TO).unwrap().workspace.path = Some(old.join("proj"));
+        assert!(!old.exists());
+        let stores = SurfaceStores::none();
+
+        let outcome = converge(&after, FROM, TO, &stores).await.unwrap();
+        let issues: Vec<(FollowerKind, String)> = outstanding(&outcome)
+            .iter()
+            .map(|issue| (issue.follower, issue.to_string()))
+            .collect();
+        assert_eq!(
+            issues,
+            vec![
+                (
+                    FollowerKind::Workspace,
+                    format!(
+                        "the workspace.path of agent `{TO}` is or overlaps the old default workspace of `{FROM}`; point workspace.path elsewhere, then re-run the rename"
+                    ),
+                ),
+                (
+                    FollowerKind::Acp,
+                    format!(
+                        "saved session working directories still point at the old default workspace of `{FROM}`"
+                    ),
+                ),
+            ],
+            "no relocation into the overlapping workspace was attempted"
+        );
+        assert_eq!(outcome.report().acp_sessions, 2, "the owner still follows");
+        assert_eq!(outcome.report().acp_workspaces, 0);
+        assert_eq!(acp_row(&after, "at-old"), (TO.to_string(), old.clone()));
+        assert_eq!(
+            acp_row(&after, "under-old"),
+            (TO.to_string(), old.join("sub"))
+        );
+        assert_eq!(
+            acp_row(&after, "unrelated"),
+            ("other".to_string(), unrelated.clone())
+        );
+        assert_eq!(records(&after).len(), 1);
+
+        // Pointed elsewhere, the next run re-points them and finishes.
+        let elsewhere = tmp.path().join("elsewhere");
+        after.agents.get_mut(TO).unwrap().workspace.path = Some(elsewhere.clone());
+        let outcome = converge(&after, FROM, TO, &stores).await.unwrap();
+        assert!(outcome.is_converged(), "{:?}", outcome.warnings());
+        assert_eq!(outcome.report().acp_workspaces, 2);
+        assert_eq!(
+            acp_row(&after, "at-old"),
+            (TO.to_string(), elsewhere.clone())
+        );
+        assert_eq!(
+            acp_row(&after, "under-old"),
+            (TO.to_string(), elsewhere.join("sub"))
+        );
+        assert_eq!(
+            acp_row(&after, "unrelated"),
+            ("other".to_string(), unrelated)
+        );
+        assert!(records(&after).is_empty());
+    }
+
+    #[tokio::test]
+    async fn saved_sessions_outside_the_old_workspace_are_never_touched() {
+        let tmp = TempDir::new().unwrap();
+        let before = fixture(&tmp, &[FROM]);
+        let old = before.default_agent_workspace_dir(FROM);
+        // One session of the old alias's saved elsewhere, and one of another
+        // agent's in a sibling whose name merely starts like the old default
+        // workspace; beside them, one saved in the old default workspace.
+        let unrelated = tmp.path().join("unrelated");
+        let sibling = old.parent().unwrap().join("workspace2");
+        seed_acp(&before, "unrelated", FROM, &unrelated);
+        seed_acp(&before, "sibling", "other", &sibling);
+        seed_acp(&before, "at-old", "other", &old);
+        let mut after = arm_and_commit(&before).await;
+        let custom = tmp.path().join("custom");
+        after.agents.get_mut(TO).unwrap().workspace.path = Some(custom.clone());
+
+        let outcome = converge(&after, FROM, TO, &SurfaceStores::none())
+            .await
+            .unwrap();
+        assert!(outcome.is_converged(), "{:?}", outcome.warnings());
+        assert_eq!(outcome.report().acp_sessions, 1);
+        assert_eq!(outcome.report().acp_workspaces, 1);
+        assert_eq!(acp_row(&after, "unrelated"), (TO.to_string(), unrelated));
+        assert_eq!(acp_row(&after, "sibling"), ("other".to_string(), sibling));
+        assert_eq!(acp_row(&after, "at-old"), ("other".to_string(), custom));
+        assert!(records(&after).is_empty());
     }
 
     #[tokio::test]
