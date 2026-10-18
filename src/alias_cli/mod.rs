@@ -683,16 +683,16 @@ pub async fn handle_agents(cmd: AgentsCommands, config: &mut Config) -> Result<(
 
 /// Memory + optional session-backend handles opened from `data_dir` for the
 /// owned-state cascade.
-#[cfg(all(feature = "gateway", feature = "agent-runtime"))]
+#[cfg(feature = "agent-runtime")]
 type OwnedStateHandles = (
     std::sync::Arc<dyn zeroclaw_memory::Memory>,
     Option<std::sync::Arc<dyn zeroclaw_infra::session_backend::SessionBackend>>,
 );
 
-#[cfg(not(all(feature = "gateway", feature = "agent-runtime")))]
+#[cfg(not(feature = "agent-runtime"))]
 type OwnedStateHandles = ();
 
-#[cfg(all(feature = "gateway", feature = "agent-runtime"))]
+#[cfg(feature = "agent-runtime")]
 fn build_owned_state_handles(config: &Config) -> Result<OwnedStateHandles> {
     use std::sync::Arc;
     let mem: Arc<dyn zeroclaw_memory::Memory> = if config.agents.is_empty() {
@@ -717,16 +717,16 @@ fn build_owned_state_handles(config: &Config) -> Result<OwnedStateHandles> {
     Ok((mem, session_backend))
 }
 
-#[cfg(not(all(feature = "gateway", feature = "agent-runtime")))]
+#[cfg(not(feature = "agent-runtime"))]
 fn build_owned_state_handles(_config: &Config) -> Result<OwnedStateHandles> {
     Ok(())
 }
 
-#[cfg(all(feature = "gateway", feature = "agent-runtime"))]
+#[cfg(feature = "agent-runtime")]
 fn agent_delete_precheck(config: &Config, alias: &str) -> Result<()> {
     // Fail closed: refuse if live ACP sessions exist, or if the store can't be
     // read to verify (mirrors the gateway delete gate).
-    let live = crate::gateway::agent_owned_state::live_acp_session_count(config, alias)
+    let live = zeroclaw_runtime::agent_lifecycle::live_acp_session_count(config, alias)
         .context("could not verify live ACP sessions")?;
     if live > 0 {
         let count = live.to_string();
@@ -742,12 +742,12 @@ fn agent_delete_precheck(config: &Config, alias: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(all(feature = "gateway", feature = "agent-runtime")))]
+#[cfg(not(feature = "agent-runtime"))]
 fn agent_delete_precheck(_config: &Config, _alias: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(feature = "gateway", feature = "agent-runtime"))]
+#[cfg(feature = "agent-runtime")]
 async fn agent_delete_owned_state(
     config: &Config,
     alias: &str,
@@ -767,7 +767,7 @@ async fn agent_delete_owned_state(
         );
     }
     let archive_dir = archive.archive_dir;
-    let report = crate::gateway::agent_owned_state::cascade_owned_state(
+    let report = zeroclaw_runtime::agent_lifecycle::cascade_owned_state(
         config,
         &mem,
         session_backend.as_ref(),
@@ -807,7 +807,7 @@ async fn agent_delete_owned_state(
     Ok(())
 }
 
-#[cfg(not(all(feature = "gateway", feature = "agent-runtime")))]
+#[cfg(not(feature = "agent-runtime"))]
 async fn agent_delete_owned_state(
     _config: &Config,
     _alias: &str,
@@ -818,7 +818,7 @@ async fn agent_delete_owned_state(
     Ok(())
 }
 
-#[cfg(all(feature = "gateway", feature = "agent-runtime"))]
+#[cfg(feature = "agent-runtime")]
 async fn agent_rename_owned_state(
     config: &Config,
     from: &str,
@@ -845,7 +845,7 @@ async fn agent_rename_owned_state(
         }
     }
     let (mem, session_backend) = build_owned_state_handles(config)?;
-    let report = crate::gateway::agent_owned_state::cascade_rename_agent(
+    let report = zeroclaw_runtime::agent_lifecycle::cascade_rename_agent(
         config,
         Some(&mem),
         session_backend.as_ref(),
@@ -883,7 +883,7 @@ async fn agent_rename_owned_state(
     Ok(())
 }
 
-#[cfg(not(all(feature = "gateway", feature = "agent-runtime")))]
+#[cfg(not(feature = "agent-runtime"))]
 async fn agent_rename_owned_state(
     _config: &Config,
     _from: &str,
@@ -894,7 +894,7 @@ async fn agent_rename_owned_state(
     Ok(())
 }
 
-#[cfg(not(all(feature = "gateway", feature = "agent-runtime")))]
+#[cfg(not(feature = "agent-runtime"))]
 fn warn_agent_owned_state() {
     eprintln!(
         "{}",
@@ -1121,7 +1121,7 @@ mod tests {
         assert!(!config.agents.contains_key("blocked"));
     }
 
-    #[cfg(all(feature = "gateway", feature = "agent-runtime"))]
+    #[cfg(feature = "agent-runtime")]
     #[tokio::test]
     async fn final_agent_delete_retains_the_predelete_memory_backend_for_cleanup() {
         use std::sync::Arc;
