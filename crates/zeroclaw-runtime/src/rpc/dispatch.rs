@@ -42404,6 +42404,94 @@ mod tests {
         );
     }
 
+    /// The request form of `session/prompt` answers `{}` after the turn ends,
+    /// and the turn's text travels on `turn_complete`. The contract declares
+    /// that reply as `SessionPromptAck`, not the internal `SessionPromptResult`.
+    #[tokio::test]
+    async fn session_prompt_request_reply_is_the_declared_empty_ack() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let chat_backend = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let sid = "rpc-prompt-ack";
+        install_state_test_session_with_owner(
+            &sessions,
+            &chat_backend,
+            sid,
+            GatedProvider {
+                started: started_tx,
+                release: tokio::sync::Mutex::new(Some(release_rx)),
+            },
+            None,
+        )
+        .await;
+
+        let ctx = RpcContext::for_persistence_tests(
+            zeroclaw_config::schema::Config::default(),
+            sessions,
+            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            None,
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-prompt-ack:pid=1".into());
+        dispatcher.set_authenticated_for_test();
+
+        dispatcher
+            .process_line_for_test(
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 7,
+                    "method": "session/prompt",
+                    "params": { "session_id": sid, "prompt": "hello" },
+                })
+                .to_string(),
+            )
+            .await;
+        started_rx
+            .recv()
+            .await
+            .expect("the prompt must reach its gated provider");
+        release_tx
+            .send(())
+            .expect("the provider must still be waiting for release");
+
+        let (response, notifications) = response_and_notifications(&mut rx, 7).await;
+        assert_eq!(response["result"], json!({}), "{response}");
+        let turn_complete = notifications
+            .iter()
+            .find(|frame| {
+                frame["method"] == notification::SESSION_UPDATE
+                    && frame["params"]["type"] == "turn_complete"
+            })
+            .unwrap_or_else(|| panic!("the turn must end with turn_complete: {notifications:?}"));
+        assert!(
+            turn_complete["params"]["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("turn finished")),
+            "{turn_complete}"
+        );
+
+        assert_eq!(
+            Method::SessionPrompt.contract().result,
+            zeroclaw_rpc_proto::Shape::Typed("SessionPromptAck")
+        );
+        serde_json::from_value::<crate::rpc::types::SessionPromptAck>(response["result"].clone())
+            .expect("the reply is the declared acknowledgement");
+        assert!(
+            serde_json::from_value::<crate::rpc::types::SessionPromptResult>(
+                response["result"].clone()
+            )
+            .is_err(),
+            "the reply carries none of SessionPromptResult's required fields"
+        );
+    }
+
     #[tokio::test]
     async fn session_prompt_reports_running_during_turn_and_idle_after() {
         let tmp = tempfile::TempDir::new().unwrap();

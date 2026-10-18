@@ -317,7 +317,7 @@ impl Method {
             // Sessions
             M::SessionNew => (Typed("SessionNewParams"), Typed("SessionNewResult")),
             M::SessionClose => (Typed("SessionIdParams"), Typed("SessionCloseResult")),
-            M::SessionPrompt => (Typed("SessionPromptParams"), Typed("SessionPromptResult")),
+            M::SessionPrompt => (Typed("SessionPromptParams"), Typed("SessionPromptAck")),
             M::SessionConfigure => (
                 Typed("SessionConfigureParams"),
                 Typed("SessionConfigureResult"),

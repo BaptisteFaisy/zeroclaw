@@ -249,11 +249,21 @@ rpc_type! {
 }
 
 rpc_type! {
+    /// The outcome of a prompt turn inside the daemon. It is not what the
+    /// request form of `session/prompt` answers; that reply is
+    /// [`SessionPromptAck`].
     pub struct SessionPromptResult {
         pub session_id: String,
         pub stop_reason: String,
         pub content: String,
     }
+}
+
+rpc_type! {
+    /// The reply to the request form of `session/prompt`: an empty object,
+    /// sent once the turn has ended. The turn's text and outcome arrive on
+    /// the `turn_complete` `session/update` notification, not in this reply.
+    pub struct SessionPromptAck {}
 }
 
 rpc_type! {

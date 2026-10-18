@@ -3693,6 +3693,10 @@
         },
         "type": "object"
       },
+      "SessionPromptAck": {
+        "description": "The reply to the request form of `session/prompt`: an empty object,\nsent once the turn has ended. The turn's text and outcome arrive on\nthe `turn_complete` `session/update` notification, not in this reply.",
+        "type": "object"
+      },
       "SessionPromptParams": {
         "properties": {
           "attachments": {
@@ -3721,25 +3725,6 @@
         "required": [
           "session_id",
           "prompt"
-        ],
-        "type": "object"
-      },
-      "SessionPromptResult": {
-        "properties": {
-          "content": {
-            "type": "string"
-          },
-          "session_id": {
-            "type": "string"
-          },
-          "stop_reason": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "session_id",
-          "stop_reason",
-          "content"
         ],
         "type": "object"
       },
@@ -5017,7 +5002,7 @@
       "result": {
         "name": "result",
         "schema": {
-          "$ref": "#/components/schemas/SessionPromptResult"
+          "$ref": "#/components/schemas/SessionPromptAck"
         },
         "x-zeroclaw-shape": "typed"
       },

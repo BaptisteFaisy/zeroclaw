@@ -40,7 +40,8 @@ catalog! {
     TuiListEntry, TuiListResult,
     // Sessions
     SessionIdParams, ChatMode, SessionNewResult, SessionCloseResult, SessionKillParams,
-    SessionKillResult, SessionPromptParams, SessionPromptResult, SessionConfigureParams,
+    SessionKillResult, SessionPromptParams, SessionPromptResult, SessionPromptAck,
+    SessionConfigureParams,
     SessionConfigureResult, SessionCancelResult, SessionGitBranchResult, SessionListParams,
     SessionListResult, SessionEntry, SessionMessagesResult, SessionMessagesParams,
     MessageEntryKind, MessageEntry, SessionStateResult, SessionDeleteResult, SessionOverrides,
