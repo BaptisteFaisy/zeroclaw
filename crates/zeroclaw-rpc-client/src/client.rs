@@ -218,7 +218,7 @@ impl Drop for AbortOnDrop {
 ///
 /// The protocol version is always this crate's [`RPC_PROTOCOL_VERSION`];
 /// callers choose only the credential and the client-side facts.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct ConnectOptions {
     /// Explicit credential: a pairing token or an OIDC access token.
     pub auth_token: Option<String>,
@@ -233,6 +233,28 @@ pub struct ConnectOptions {
     pub client_capabilities: Option<Value>,
     /// Ceiling for the handshake; [`DEFAULT_HANDSHAKE_TIMEOUT`] when unset.
     pub handshake_timeout: Option<Duration>,
+}
+
+// Hand-written so a stray `{:?}` cannot log a credential: the auth token and
+// TUI signature print only whether they are set, and the forwarded
+// environment prints its variable names without their values.
+impl fmt::Debug for ConnectOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut env_names: Vec<&str> = self.env.keys().map(String::as_str).collect();
+        env_names.sort_unstable();
+        f.debug_struct("ConnectOptions")
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("auth_provider", &self.auth_provider)
+            .field("tui_id", &self.tui_id)
+            .field("tui_sig", &self.tui_sig.as_ref().map(|_| "<redacted>"))
+            .field("env", &env_names)
+            .field("client_capabilities", &self.client_capabilities)
+            .field("handshake_timeout", &self.handshake_timeout)
+            .finish()
+    }
 }
 
 impl ConnectOptions {
@@ -634,6 +656,29 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tokio::io::DuplexStream;
+
+    #[test]
+    fn connect_options_debug_redacts_credentials_and_env_values() {
+        let options = ConnectOptions {
+            auth_token: Some("zc-pairing-secret".into()),
+            auth_provider: Some("native".into()),
+            tui_id: Some("tui-1".into()),
+            tui_sig: Some("hmac-secret".into()),
+            env: HashMap::from([("API_KEY".to_string(), "env-secret".to_string())]),
+            ..ConnectOptions::default()
+        };
+        let printed = format!("{options:?}");
+        for secret in ["zc-pairing-secret", "hmac-secret", "env-secret"] {
+            assert!(!printed.contains(secret), "{secret} leaked: {printed}");
+        }
+        for visible in ["native", "tui-1", "API_KEY", "<redacted>"] {
+            assert!(printed.contains(visible), "{visible} missing: {printed}");
+        }
+        assert!(
+            format!("{:?}", ConnectOptions::default()).contains("auth_token: None"),
+            "an unset credential reads as None"
+        );
+    }
 
     /// A scripted daemon: answers `initialize`, then serves `status`, pushes
     /// one notification and one server-initiated request, and echoes the
