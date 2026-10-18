@@ -117,7 +117,7 @@ Move or merge that state by hand, then re-run the same rename.
 
 If `[agents.researcher]` is back in the config while the record is open (a hand edit, say), re-running the rename is refused and moves nothing, since that entry would take over the state the rename still owes `analyst`. Remove `[agents.researcher]` by hand and re-run the rename, or abandon it.
 
-If a rename cannot be finished, `zeroclaw agents rename researcher analyst --abandon` drops its recovery record without moving anything. `researcher` can then be created again, and the new agent adopts whatever state is still kept under that name, so check the warnings the command prints first.
+If a rename cannot be finished, `zeroclaw agents rename researcher analyst --abandon` drops its recovery record without moving anything. `researcher` can then be created again, and the new agent adopts whatever state is still kept under that name, so check the warnings the command prints first. Abandoning needs exclusive ownership of the configuration, so stop the daemon first; the command refuses while the daemon or another command owns it.
 
 ## Delete an agent
 

@@ -1406,6 +1406,7 @@ cli-alias-rename-recovery-error = agent rename recovery failed: {$error}
 cli-alias-rename-source-reconfigured = agent `{$from}` is configured again while its rename to `{$to}` is unfinished; remove `[agents.{$from}]` from the config by hand, or run `zeroclaw agents rename {$from} {$to} --abandon`
 cli-alias-rename-abandoned = dropped the unfinished rename of {$from} to {$to}; `{$from}` can be created again and will adopt any state still listed above
 cli-alias-rename-abandon-none = there is no unfinished rename of `{$from}` to `{$to}` to abandon
+cli-alias-rename-abandon-owned = cannot abandon the rename of {$from} to {$to} while another process owns this configuration ({$error}); stop the daemon, or wait for the running command to finish, then retry
 cli-alias-rename-abandon-unavailable = abandoning an unfinished agent rename needs a build with the agent runtime
 cli-alias-unknown-provider-category = unknown provider category `{$category}` (expected models | tts | transcription)
 cli-alias-no-such-section = no such config section: {$section}

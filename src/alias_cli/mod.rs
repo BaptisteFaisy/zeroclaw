@@ -637,9 +637,10 @@ pub async fn handle_agents(cmd: AgentsCommands, config: &mut Config) -> Result<(
             export::run(config, &alias, &out, force).await
         }
         AgentsCommands::Rename { from, to, abandon } => {
-            // Abandoning changes no config, only the recovery journal, whose
-            // own lock serializes it with a running daemon: it needs neither
-            // the daemon route nor config ownership.
+            // Abandoning changes no config, only the recovery journal, so it
+            // never goes through the daemon. It runs only under exclusive
+            // config ownership instead, which a running daemon or another
+            // command converging the rename would hold.
             if abandon {
                 return Box::pin(abandon_agent_rename(config, &from, &to)).await;
             }
@@ -944,8 +945,30 @@ async fn agent_delete_recovery_refusal(_config: &Config, _alias: &str) -> Option
 /// Drop the recovery record of the unfinished rename of `from` to `to`
 /// without moving anything, after listing the state still kept under `from`,
 /// which an agent created under it adopts.
+///
+/// The daemon holds config ownership for its whole lifetime, and an offline
+/// rename holds it while it runs, so owning it proves nothing else is moving
+/// this rename's state and the state listed is settled. It is held until the
+/// record is dropped and the state reported. While another process holds it
+/// the abandon is refused and the journal is left alone.
 #[cfg(feature = "agent-runtime")]
 async fn abandon_agent_rename(config: &Config, from: &str, to: &str) -> Result<()> {
+    let ownership = match zeroclaw_runtime::live_config_authority::ConfigOwnershipGuard::acquire(
+        &config.data_dir,
+    ) {
+        Ok(ownership) => ownership,
+        Err(error) => {
+            let detail = error.to_string();
+            bail!(
+                "{}",
+                mta(
+                    "cli-alias-rename-abandon-owned",
+                    &[("from", from), ("to", to), ("error", detail.as_str())],
+                    "cannot abandon the rename of {$from} to {$to} while another process owns this configuration ({$error}); stop the daemon, or wait for the running command to finish, then retry"
+                )
+            )
+        }
+    };
     let abandoned = match rename_recovery::abandon_rename(config, from, to).await {
         Ok(abandoned) => abandoned,
         // For an abandon, nothing to rename means no record to drop.
@@ -978,6 +1001,7 @@ async fn abandon_agent_rename(config: &Config, from: &str, to: &str) -> Result<(
             "dropped the unfinished rename of {$from} to {$to}; `{$from}` can be created again and will adopt any state still listed above"
         )
     );
+    drop(ownership);
     Ok(())
 }
 

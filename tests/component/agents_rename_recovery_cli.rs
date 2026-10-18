@@ -508,6 +508,49 @@ async fn agents_rename_abandon_drops_the_record_and_frees_the_old_alias() {
 }
 
 #[tokio::test]
+async fn agents_rename_abandon_refuses_while_another_process_owns_the_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (old_ws, _blocker) = leave_rename_unfinished(tmp.path()).await;
+    assert!(rename_is_recorded(tmp.path()));
+
+    // A running daemon holds config ownership for its whole lifetime; this
+    // test process stands in for one.
+    let owner = zeroclaw_runtime::live_config_authority::ConfigOwnershipGuard::acquire(
+        &tmp.path().join("data"),
+    )
+    .unwrap();
+    let refused = run_agents(tmp.path(), &["rename", "agent_a", "agent_b", "--abandon"]);
+    let refused_text = text_of(&refused);
+    assert!(!refused.status.success(), "{refused_text}");
+    assert!(
+        refused_text.contains(
+            "cannot abandon the rename of agent_a to agent_b while another process owns this configuration"
+        ),
+        "{refused_text}"
+    );
+    assert!(
+        refused_text
+            .contains("stop the daemon, or wait for the running command to finish, then retry"),
+        "the refusal says how to get ownership: {refused_text}"
+    );
+    assert!(
+        rename_is_recorded(tmp.path()),
+        "a refused abandon leaves the record in place"
+    );
+    assert!(old_ws.join("marker").is_file());
+
+    drop(owner);
+    let abandoned = run_agents(tmp.path(), &["rename", "agent_a", "agent_b", "--abandon"]);
+    let abandoned_text = text_of(&abandoned);
+    assert!(abandoned.status.success(), "{abandoned_text}");
+    assert!(
+        abandoned_text.contains("dropped the unfinished rename of agent_a to agent_b"),
+        "{abandoned_text}"
+    );
+    assert!(!rename_is_recorded(tmp.path()), "the record is gone");
+}
+
+#[tokio::test]
 async fn agents_rename_of_an_old_alias_configured_again_points_at_abandon() {
     let tmp = tempfile::tempdir().unwrap();
     let (old_ws, _blocker) = leave_rename_unfinished(tmp.path()).await;

@@ -1002,7 +1002,7 @@ impl ModelRoutingConfigTool {
         // unfinished rename retired. Checked before any provider or profile
         // entry is keyed by the name.
         if !cfg.agents.contains_key(&name) {
-            zeroclaw_config::alias_refs::create_map_key_checked(&mut cfg, "agents", &name)?;
+            Self::create_agent_checked(&mut cfg, &name)?;
         }
 
         // Validate the provider route before mutating any provider, profile, or agent state.
@@ -1334,6 +1334,41 @@ impl ModelRoutingConfigTool {
             .into(),
             error: None,
         })
+    }
+
+    /// Create the agent `name` through the create guard every agent surface
+    /// shares, and localize each refusal: an alias an unfinished rename
+    /// retired names the rename to finish first, and a journal that cannot be
+    /// read may hold such a rename, so that refuses too.
+    fn create_agent_checked(cfg: &mut Config, name: &str) -> anyhow::Result<()> {
+        use zeroclaw_config::alias_refs::{CreateError, create_map_key_checked};
+        match create_map_key_checked(cfg, "agents", name) {
+            Ok(_) => Ok(()),
+            Err(CreateError::Retired { alias, pending_to }) => {
+                anyhow::bail!(crate::i18n::get_required_tool_string_with_args(
+                    "tool-model-routing-config-error-agent-alias-retired",
+                    &[("name", alias.as_str()), ("to", pending_to.as_str())],
+                ))
+            }
+            Err(CreateError::RecoveryUnreadable(detail)) => {
+                anyhow::bail!(crate::i18n::get_required_tool_string_with_args(
+                    "tool-model-routing-config-error-agent-create-recovery-unreadable",
+                    &[("name", name), ("error", detail.as_str())],
+                ))
+            }
+            Err(CreateError::Reserved(alias)) => {
+                anyhow::bail!(crate::i18n::get_required_tool_string_with_args(
+                    "tool-model-routing-config-error-agent-alias-reserved",
+                    &[("name", alias.as_str())],
+                ))
+            }
+            Err(CreateError::Invalid(message)) => {
+                anyhow::bail!(crate::i18n::get_required_tool_string_with_args(
+                    "tool-model-routing-config-error-agent-alias-invalid",
+                    &[("name", name), ("error", message.as_str())],
+                ))
+            }
+        }
     }
 
     /// Refuse to remove an agent an unfinished rename still involves: its
@@ -1815,9 +1850,9 @@ mod tests {
         let refused = tool.execute(upsert_agent_args("scout")).await.unwrap();
         assert!(!refused.success);
         let error = refused.error.unwrap_or_default();
-        assert!(
-            error.contains("alias `scout` is retired by an unfinished agent rename"),
-            "{error}"
+        assert_eq!(
+            error,
+            "agent 'scout' is retired by an unfinished rename to 'ranger'; run `zeroclaw agents rename scout ranger` to finish it before creating this agent"
         );
         assert_eq!(saved_agents(&cfg_path), before, "nothing was saved");
 
@@ -1880,14 +1915,51 @@ mod tests {
         let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
         let before = saved_agents(&cfg_path);
 
-        for name in ["Bad/Name", "default"] {
-            let refused = tool.execute(upsert_agent_args(name)).await.unwrap();
-            assert!(!refused.success, "{name}");
-            assert!(refused.error.is_some(), "{name}");
-        }
+        let invalid = tool.execute(upsert_agent_args("Bad/Name")).await.unwrap();
+        assert!(!invalid.success);
+        let error = invalid.error.unwrap_or_default();
+        let prefix = "invalid agent alias 'Bad/Name': ";
+        assert!(
+            error.starts_with(prefix) && error.len() > prefix.len(),
+            "the refusal names the alias and why it is invalid: {error}"
+        );
+
+        let reserved = tool.execute(upsert_agent_args("default")).await.unwrap();
+        assert!(!reserved.success);
+        assert_eq!(
+            reserved.error.unwrap_or_default(),
+            "agent alias 'default' is reserved and cannot be created"
+        );
+
         assert_eq!(saved_agents(&cfg_path), before, "nothing was saved");
         let contents = std::fs::read_to_string(&cfg_path).unwrap();
         assert!(!contents.contains("Bad/Name"), "{contents}");
+    }
+
+    #[tokio::test]
+    async fn upsert_agent_refuses_to_create_while_the_recovery_journal_is_unreadable() {
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
+        let before = saved_agents(&cfg_path);
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(
+            data_dir.join(zeroclaw_config::agent_recovery_journal::JOURNAL_FILE_NAME),
+            "{not json",
+        )
+        .unwrap();
+
+        let refused = tool.execute(upsert_agent_args("scout")).await.unwrap();
+        assert!(!refused.success);
+        let error = refused.error.unwrap_or_default();
+        let prefix =
+            "cannot create agent 'scout': the agent lifecycle recovery journal could not be read: ";
+        assert!(
+            error.starts_with(prefix) && error.len() > prefix.len(),
+            "the refusal names the agent and why the journal could not be read: {error}"
+        );
+        assert_eq!(saved_agents(&cfg_path), before, "nothing was saved");
     }
 
     #[tokio::test]
