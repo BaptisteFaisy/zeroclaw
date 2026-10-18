@@ -3279,7 +3279,7 @@ dependencies = [
 
 [[package]]
 name = "fill-translations"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "anyhow",
  "clap",
@@ -13590,7 +13590,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "anyhow",
  "axum",
@@ -13756,7 +13756,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -13788,6 +13788,7 @@ dependencies = [
  "rustls",
  "schemars 1.2.2",
  "scopeguard",
+ "semver",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -13826,7 +13827,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-api"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -13845,7 +13846,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-buildinfo"
-version = "0.8.5"
+version = "0.8.6"
 
 [[package]]
 name = "zeroclaw-channel-egress-plugin-fixture"
@@ -13873,7 +13874,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-channels"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "aes 0.8.4",
  "anyhow",
@@ -13959,14 +13960,14 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-commands"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "zeroclaw-config"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -14013,7 +14014,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-desktop"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -14034,7 +14035,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-dist"
-version = "0.8.5"
+version = "0.8.6"
 
 [[package]]
 name = "zeroclaw-egress-plugin-fixture"
@@ -14046,7 +14047,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-eval"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -14063,7 +14064,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-gateway"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -14119,7 +14120,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-hardware"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -14154,7 +14155,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-infra"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "anyhow",
  "chrono",
@@ -14174,7 +14175,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-log"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "anyhow",
  "chrono",
@@ -14196,7 +14197,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-log-attribution-macro-consumer"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "zeroclaw-log",
  "zeroclaw-log-attribution-macro-support",
@@ -14204,14 +14205,14 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-log-attribution-macro-support"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "zeroclaw-api",
 ]
 
 [[package]]
 name = "zeroclaw-macros"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -14220,7 +14221,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-memory"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -14255,7 +14256,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-plugins"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -14284,7 +14285,7 @@ dependencies = [
  "wasmtime-wasi",
  "wasmtime-wasi-http",
  "webpki-roots 1.0.9",
- "windows 0.61.3",
+ "windows",
  "winx",
  "zeroclaw-api",
  "zeroclaw-config",
@@ -14296,7 +14297,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-providers"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -14340,7 +14341,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-relay-proto"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -14348,7 +14349,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-rpc-proto"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "schemars 1.2.2",
  "serde",
@@ -14360,7 +14361,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-runtime"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -14457,7 +14458,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-sop-graph"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "schemars 1.2.2",
  "serde",
@@ -14468,7 +14469,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-spawn"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "serde_json",
  "tokio",
@@ -14479,7 +14480,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-tls"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "anyhow",
  "chacha20poly1305 0.10.1",
@@ -14502,7 +14503,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-tool-call-parser"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "regex",
  "serde",
@@ -14564,7 +14565,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-tools"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "anyhow",
  "async-imap",
@@ -14625,7 +14626,7 @@ dependencies = [
 
 [[package]]
 name = "zerocode"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "anyhow",
  "chrono",
@@ -14728,7 +14729,7 @@ dependencies = [
 
 [[package]]
 name = "zerorelay"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
