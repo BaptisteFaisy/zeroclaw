@@ -218,6 +218,22 @@ zeroclaw plugin install ./my-plugin
 zeroclaw plugin install ./my-plugin/manifest.toml
 ```
 
+`zeroclaw plugin update` replaces an installed package through the same
+admission (`PluginHost::admit_update`) with the identity decided the other way
+round: the named package must be installed, and the source must carry its
+name. The CLI refuses authority the new manifest adds unless `--allow` accepts
+it, runs the same load check with no way to skip it, and
+`PluginHost::update_admitted` builds the replacement in a staging directory
+before renaming it into the installed package's place. The operator-facing
+contract is in [Updating a plugin](../plugins/index.md#updating-a-plugin).
+
+```bash
+zeroclaw plugin update team-calendar
+zeroclaw plugin update team-calendar@0.2.0 --registry https://example.invalid/registry.json
+zeroclaw plugin update --all
+zeroclaw plugin update my-plugin --from ./my-plugin
+```
+
 The default registry URL is:
 
 ```text
@@ -793,9 +809,11 @@ plugin that declares its destinations works without the operator transcribing
 hosts, and the seeded values are printed. It never extends a row that already
 exists: an upgrade whose declaration grew prints the difference plus the exact
 `zeroclaw config set` command, and the operator applies it. `zeroclaw plugin
-list` reports the same gap as a standing diagnostic. Declare the destinations
-your code actually contacts, and treat a growing declaration as something every
-operator has to approve on every upgrade.
+update` seeds nothing at all, not even into a row it creates, and prints the
+same difference. `zeroclaw plugin list` reports the same gap as a standing
+diagnostic. Declare the destinations your code actually contacts, and treat a
+growing declaration as something every operator has to approve on every
+upgrade.
 
 A channel instance's row is created when an operator binds its alias, with
 `zeroclaw plugin bind <package> --channel-alias <alias>` or with
@@ -858,12 +876,17 @@ The five bounds are operator-tunable and every value is validated as non-zero:
 only be built with explicit limits, so no load path can construct an
 unsandboxed plugin. Guest `wasi:http` request options may end a call sooner but
 cannot extend the host deadline. An interrupted warm store is never resumed,
-and a channel never reuses a store whose call trapped: channels recreate the
-instance from host-owned inputs on the next call, waiting when traps and
-missed deadlines, other than in approval and choice prompts, outrun a rebuild
-budget of three at once and one per five minutes after that, while memory
-instances remain unavailable until their owner rebuilds them. The canonical
-fields and defaults live in the
+and neither a channel nor a memory backend reuses a store whose call failed
+inside Wasmtime: after a guest trap, exhausted fuel, or a failed host import,
+Wasmtime refuses every later call into the store, and a result it could not
+lift skips the export's post-return cleanup. Channels recreate the instance
+from host-owned inputs on the next call, waiting when traps and missed
+deadlines, other than in approval and choice prompts, outrun a rebuild budget
+of three at once and one per five minutes after that. Memory instances remain
+unavailable until their owner rebuilds them, and later calls that reach the
+plugin fail with the error a missed deadline leaves. A rebuilt memory instance
+starts empty, because the memory world gives a plugin no storage outside its
+own instance. The canonical fields and defaults live in the
 [Config reference](../reference/index.md).
 
 ### 32-bit address space (wasip2 is wasm32)

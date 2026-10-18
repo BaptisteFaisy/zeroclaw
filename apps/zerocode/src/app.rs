@@ -1945,6 +1945,9 @@ pub async fn run(
             chrome_status.tick(&rpc);
             sidebar.drain_picker_fetch();
         }
+        config_app.tick_application_status(
+            mode == Mode::Config && !matches!(conn_state, ConnectionState::Disconnected { .. }),
+        );
         inbound_router.drain(&mut chat_pane, &mut acp_pane);
         acp_pane.tick_transport_events();
         chat_pane.tick_transport_events();
@@ -2801,7 +2804,7 @@ pub async fn run(
                         match mode {
                             Mode::Chat => chat_pane.handle_paste(&text),
                             Mode::Acp => acp_pane.handle_paste(&text),
-                            Mode::Config => config_app.handle_paste(&text),
+                            Mode::Config => config_app.handle_paste(&text).await,
                             Mode::Doctor => doctor_pane.handle_paste(&text),
                             Mode::Quickstart => quickstart.handle_paste(&text),
                             Mode::Dashboard => dashboard_pane.handle_paste(&text),
