@@ -163,6 +163,13 @@
             "format": "uint",
             "minimum": 0,
             "type": "integer"
+          },
+          "runtime_profile": {
+            "description": "Current configured profile, not a running session's retained generation.\nAbsent when no configured runtime profile resolves for this agent.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -211,6 +218,14 @@
           "skill_bundles",
           "knowledge_bundles",
           "mcp_bundles"
+        ],
+        "type": "string"
+      },
+      "BudgetWarningPeriod": {
+        "description": "The cost-limit period a [`TurnEvent::BudgetWarning`] refers to.",
+        "enum": [
+          "day",
+          "month"
         ],
         "type": "string"
       },
@@ -4160,6 +4175,37 @@
               "session_id",
               "outcome",
               "content"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Recorded spend reached `cost.warn_at_percent` of a shared daily or\nmonthly limit. Non-blocking and at most once per turn; the turn\ncontinues. `period` is `\"day\"` or `\"month\"`.",
+            "properties": {
+              "current_usd": {
+                "format": "double",
+                "type": "number"
+              },
+              "limit_usd": {
+                "format": "double",
+                "type": "number"
+              },
+              "period": {
+                "$ref": "#/components/schemas/BudgetWarningPeriod"
+              },
+              "session_id": {
+                "type": "string"
+              },
+              "type": {
+                "const": "budget_warning",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "session_id",
+              "current_usd",
+              "limit_usd",
+              "period"
             ],
             "type": "object"
           },
