@@ -945,68 +945,84 @@ fn config_admin_router(inbound_auth: &Arc<principal_gate::GatewayInboundAuth>) -
 
 /// How long a stopping gateway lets its connections finish the requests in
 /// flight. With [`RETIRE_JOIN`] it stays inside the daemon's 500 ms grace for
-/// the gateway, so retirement is over before that grace runs out.
+/// the gateway, so what is left is cancelled before that grace runs out.
 const CONNECTION_DRAIN: Duration = Duration::from_millis(300);
 
-/// How long retirement waits for the tasks it aborted to actually end.
-/// Aborting only asks: a task ends, and drops what it owns, when it is next
-/// polled.
+/// How long retirement waits for the tasks it cancelled to end. Cancelling
+/// only asks: a task ends, and drops what it owns, when it is next polled.
 const RETIRE_JOIN: Duration = Duration::from_millis(100);
 
-/// How long a new gateway waits for an aborted gateway's tasks to end.
-const RETIRE_BARRIER: Duration = Duration::from_secs(2);
-
 /// Every task one gateway's serving runs: one per connection, and the
-/// stream tasks hyper's HTTP/2 spawns through its executor. A task leaves
-/// the set when it ends, however it ends, so a stop can abort what is left
-/// and wait for it.
+/// stream tasks hyper's HTTP/2 spawns through its executor. A stop cancels
+/// them all at once, and the set counts each task until it has been
+/// destroyed.
 #[derive(Clone, Default)]
 struct ServeTasks(Arc<ServeTasksInner>);
 
 #[derive(Default)]
 struct ServeTasksInner {
-    running: parking_lot::Mutex<HashMap<u64, tokio::task::AbortHandle>>,
-    next: std::sync::atomic::AtomicU64,
+    live: std::sync::atomic::AtomicUsize,
     idle: tokio::sync::Notify,
+    cancelled: tokio_util::sync::CancellationToken,
 }
 
-/// Takes its task out of the set when the task ends, finished or aborted.
-struct ServeTaskDone {
-    tasks: Arc<ServeTasksInner>,
-    id: u64,
+/// A task of the set. Fields drop in declaration order, so the future, and
+/// everything it owns, is destroyed before `_done` takes the task off the
+/// count, also when the task is dropped before its first poll.
+struct ServeTask {
+    future: std::pin::Pin<Box<dyn Future<Output = ()> + Send>>,
+    _done: ServeTaskDone,
 }
+
+/// Takes its task off the count.
+struct ServeTaskDone(Arc<ServeTasksInner>);
 
 impl Drop for ServeTaskDone {
     fn drop(&mut self) {
-        let mut running = self.tasks.running.lock();
-        running.remove(&self.id);
-        if running.is_empty() {
-            self.tasks.idle.notify_waiters();
+        if self
+            .0
+            .live
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            == 1
+        {
+            self.0.idle.notify_waiters();
         }
     }
 }
 
 impl ServeTasks {
-    fn spawn<F>(&self, task: F)
+    fn spawn<F>(&self, future: F)
     where
-        F: std::future::Future<Output = ()> + Send + 'static,
+        F: Future<Output = ()> + Send + 'static,
     {
-        let id = self
-            .0
-            .next
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let done = ServeTaskDone {
-            tasks: Arc::clone(&self.0),
-            id,
+        self.0
+            .live
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let task = ServeTask {
+            future: Box::pin(future),
+            _done: ServeTaskDone(Arc::clone(&self.0)),
         };
-        // Held while spawning, so the task cannot end, and leave the set,
-        // before it is in it.
-        let mut running = self.0.running.lock();
-        let handle = zeroclaw_spawn::spawn!(async move {
-            let _done = done;
-            task.await;
+        let cancelled = self.0.cancelled.clone();
+        // No lock is held here: spawning can drop the task at once (a runtime
+        // that has shut down does), and that only updates the count.
+        zeroclaw_spawn::spawn!(async move {
+            // Moves the whole task in. Naming only `task.future` below would
+            // capture just that field, and `_done` would take the task off the
+            // count as soon as `spawn` returned.
+            let mut task = task;
+            // The cancel is checked first, so a task spawned after it never
+            // runs.
+            tokio::select! {
+                biased;
+                () = cancelled.cancelled() => {}
+                () = task.future.as_mut() => {}
+            }
         });
-        running.insert(id, handle.abort_handle());
+    }
+
+    /// How many tasks are running, or not yet destroyed.
+    fn live(&self) -> usize {
+        self.0.live.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Resolves once no task is running.
@@ -1015,26 +1031,31 @@ impl ServeTasks {
             let notified = self.0.idle.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if self.0.running.lock().is_empty() {
+            if self.live() == 0 {
                 return;
             }
             notified.await;
         }
     }
 
-    fn abort_all(&self) {
-        for task in self.0.running.lock().values() {
-            task.abort();
-        }
+    /// Cancel every task, and any spawned later: each ends at its next poll.
+    fn cancel(&self) {
+        self.0.cancelled.cancel();
     }
 
-    /// Wait up to `within` for every task to finish, then abort the rest and
-    /// wait until they have ended too. Whether all finished in time.
+    fn is_cancelled(&self) -> bool {
+        self.0.cancelled.is_cancelled()
+    }
+
+    /// Wait up to `within` for every task to finish, then cancel the rest and
+    /// wait a little for them to end. Whether all finished in time. A task in
+    /// code that never yields can outlast this; it admits no request, and
+    /// ends at its next poll.
     async fn retire_within(&self, within: Duration) -> bool {
         if tokio::time::timeout(within, self.idle()).await.is_ok() {
             return true;
         }
-        self.abort_all();
+        self.cancel();
         if tokio::time::timeout(RETIRE_JOIN, self.idle())
             .await
             .is_err()
@@ -1042,8 +1063,9 @@ impl ServeTasks {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                "gateway tasks were still running after they were aborted"
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"remaining": self.live()})),
+                "gateway tasks were still running after they were cancelled; each ends at its next poll"
             );
         }
         false
@@ -1052,7 +1074,7 @@ impl ServeTasks {
 
 impl<F> hyper::rt::Executor<F> for ServeTasks
 where
-    F: std::future::Future + Send + 'static,
+    F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
     fn execute(&self, future: F) {
@@ -1063,58 +1085,83 @@ where
 }
 
 /// Owned by a gateway's serve loop. If the gateway is dropped before its
-/// drain ran (the daemon aborted it), its tasks are aborted here, and left
-/// for the next gateway to wait on: aborting alone does not prove they have
-/// ended.
-struct ServeTasksGuard(ServeTasks, &'static Retiring);
+/// drain ran (the daemon aborted it), its tasks are cancelled here.
+struct ServeTasksGuard(ServeTasks);
+
+impl ServeTasksGuard {
+    fn new(tasks: ServeTasks) -> Self {
+        Self(tasks)
+    }
+}
 
 impl Drop for ServeTasksGuard {
     fn drop(&mut self) {
-        self.0.abort_all();
-        if !self.0.0.running.lock().is_empty() {
-            self.1.add(self.0.clone());
-        }
+        self.0.cancel();
     }
 }
 
-/// Aborted gateways whose tasks may still be winding down.
-struct Retiring(parking_lot::Mutex<Vec<ServeTasks>>);
+/// Whether the gateway that accepted a connection still admits requests on
+/// it: not once it has been told to stop, and not once its tasks were
+/// cancelled (it was dropped without a stop).
+#[derive(Clone)]
+struct Admission {
+    stopping: tokio::sync::watch::Receiver<bool>,
+    tasks: ServeTasks,
+}
 
-impl Retiring {
-    const fn new() -> Self {
-        Self(parking_lot::Mutex::new(Vec::new()))
-    }
-
-    fn add(&self, tasks: ServeTasks) {
-        self.0.lock().push(tasks);
-    }
-
-    /// Wait until the tasks of every gateway left here have ended.
-    async fn wait(&self) {
-        let retiring = std::mem::take(&mut *self.0.lock());
-        for tasks in retiring {
-            if tokio::time::timeout(RETIRE_BARRIER, tasks.idle())
-                .await
-                .is_err()
-            {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                    "an earlier gateway's tasks were still running when this one started"
-                );
-            }
-        }
+impl Admission {
+    fn admits(&self) -> bool {
+        // The stop is a value, not a change: a receiver made after it still
+        // reads it.
+        !*self.stopping.borrow() && !self.tasks.is_cancelled()
     }
 }
 
-/// The gateways of this process that were aborted before their drain ran.
-static RETIRING: Retiring = Retiring::new();
+/// Serve one request on a connection the gateway accepted, unless the
+/// gateway has stopped since. So nothing reaches a stopped gateway's
+/// router, whichever connection or HTTP/2 stream it arrives on, an upgrade
+/// request included.
+async fn serve_while_current<S, B>(
+    mut svc: S,
+    admission: &Admission,
+    req: axum::http::Request<B>,
+) -> Result<Response, std::convert::Infallible>
+where
+    S: tower::Service<
+            axum::http::Request<B>,
+            Response = Response,
+            Error = std::convert::Infallible,
+        >,
+{
+    if !admission.admits() {
+        return Ok(gateway_restarting(req.version()));
+    }
+    tower::Service::call(&mut svc, req).await
+}
 
-/// Wait for the tasks of the gateways before this one to end, so a new
-/// gateway never serves while an aborted one's tasks are still running.
-async fn previous_gateways_retired() {
-    RETIRING.wait().await;
+/// What a stopped gateway answers: try again on a new connection, which the
+/// next gateway serves. Nothing in it comes from the stopped gateway's
+/// configuration or state.
+fn gateway_restarting(version: axum::http::Version) -> Response {
+    let mut response = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::RETRY_AFTER, "1")],
+        Json(serde_json::json!({
+            "error": "The gateway is restarting. Try again.",
+            "reason": "gateway_restarting",
+        })),
+    )
+        .into_response();
+    // HTTP/1 closes the connection after this response. HTTP/2 has no
+    // Connection header: its connection gets GOAWAY from the graceful
+    // shutdown.
+    if version < axum::http::Version::HTTP_2 {
+        response.headers_mut().insert(
+            header::CONNECTION,
+            axum::http::HeaderValue::from_static("close"),
+        );
+    }
+    response
 }
 
 /// What the accept loop does after `accept()` failed.
@@ -1333,9 +1380,6 @@ pub async fn run_gateway_with_plugin_webhooks(
             zeroclaw_infra::fallback_gateway_bind_socket_addr(port)
         }
     };
-    // A gateway the daemon aborted may still have tasks winding down; this
-    // one serves only after they have ended.
-    previous_gateways_retired().await;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let actual_addr = listener.local_addr()?;
     let actual_port = actual_addr.port();
@@ -2803,11 +2847,16 @@ pub async fn run_gateway_with_plugin_webhooks(
     }
 
     // One accept loop for plain and TLS connections. Every connection
-    // watches this gateway's stop, and its task is owned by `connections`,
-    // so a stop reaches all of them and none outlives this gateway.
+    // watches this gateway's stop and serves through `admission`, so after
+    // the stop no request reaches this gateway's router. Its tasks are in
+    // `tasks`, so the stop also cancels whatever outlasts the drain.
     let mut app = app.into_make_service_with_connect_info::<SocketAddr>();
     let tasks = ServeTasks::default();
-    let _abort_on_drop = ServeTasksGuard(tasks.clone(), &RETIRING);
+    let _cancel_on_drop = ServeTasksGuard::new(tasks.clone());
+    let admission = Admission {
+        stopping: shutdown_rx.clone(),
+        tasks: tasks.clone(),
+    };
     loop {
         tokio::select! {
             conn = listener.accept() => {
@@ -2842,13 +2891,13 @@ pub async fn run_gateway_with_plugin_webhooks(
                 // connection is being handed over too.
                 let mut stopping = shutdown_rx.clone();
                 let executor = tasks.clone();
+                let admission = admission.clone();
 
                 tasks.spawn(async move {
                     let hyper_svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
-                        let mut svc = svc.clone();
-                        async move {
-                            tower::Service::call(&mut svc, req).await
-                        }
+                        let svc = svc.clone();
+                        let admission = admission.clone();
+                        async move { serve_while_current(svc, &admission, req).await }
                     });
                     let builder = hyper_util::server::conn::auto::Builder::new(executor);
                     // Serve until the connection ends or the gateway stops; then
@@ -2901,8 +2950,8 @@ pub async fn run_gateway_with_plugin_webhooks(
     }
     // Every connection finishes the request in flight and closes; whatever
     // is still open after the drain (an event stream, a connection that
-    // ignored the shutdown) is aborted, so it cannot go on serving this
-    // generation's router after a reload.
+    // ignored the shutdown) is cancelled. Nothing waits on it beyond that:
+    // it admits no request, and the next gateway can serve.
     if !tasks.retire_within(CONNECTION_DRAIN).await {
         ::zeroclaw_log::record!(
             DEBUG,
@@ -7570,7 +7619,7 @@ path = "{trigger_path}"
         driver.abort();
     }
 
-    /// Retiring waits until the tasks it aborted have actually ended, so
+    /// Retiring waits until the tasks it cancelled have actually ended, so
     /// nothing they owned outlives it.
     #[tokio::test]
     async fn retiring_waits_until_the_aborted_tasks_have_ended() {
@@ -7611,7 +7660,7 @@ path = "{trigger_path}"
         );
     }
 
-    /// Retiring takes at most the drain plus the join of what it aborted,
+    /// Retiring takes at most the drain plus the join of what it cancelled,
     /// which together fit inside the daemon's 500 ms grace.
     #[tokio::test]
     async fn retiring_ends_within_the_daemons_grace() {
@@ -7627,10 +7676,10 @@ path = "{trigger_path}"
         );
     }
 
-    /// A gateway the daemon aborted before its drain ran leaves its tasks
-    /// aborted but possibly not yet ended; the next gateway waits for them.
+    /// A gateway dropped before its drain ran (the daemon aborted it)
+    /// cancels its tasks, so they end at their next poll.
     #[tokio::test]
-    async fn the_next_gateway_waits_for_an_aborted_gateways_tasks() {
+    async fn dropping_the_serve_loop_cancels_its_tasks() {
         let tasks = ServeTasks::default();
         let owned = Arc::new(());
         let held = Arc::clone(&owned);
@@ -7638,16 +7687,576 @@ path = "{trigger_path}"
             let _held = held;
             std::future::pending::<()>().await;
         });
-        // A registry of its own, so gateways other tests start cannot take
-        // these tasks off it first.
-        static RETIRING_HERE: Retiring = Retiring::new();
-        drop(ServeTasksGuard(tasks.clone(), &RETIRING_HERE));
-        RETIRING_HERE.wait().await;
+        drop(ServeTasksGuard::new(tasks.clone()));
+        tokio::time::timeout(std::time::Duration::from_secs(1), tasks.idle())
+            .await
+            .expect("a task of the dropped serve loop kept running");
         assert_eq!(
             Arc::strong_count(&owned),
             1,
-            "the next gateway started before the aborted one's tasks had ended"
+            "a cancelled task still holds what it owned"
         );
+    }
+
+    /// Records how many tasks its set counts at the moment it is dropped.
+    struct CountAtDrop(ServeTasks, Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Drop for CountAtDrop {
+        fn drop(&mut self) {
+            self.1
+                .store(self.0.live(), std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// A gateway that has stopped admits no request on a connection it
+    /// accepted earlier. HTTP/1.1 (an upgrade request too) and HTTP/2 get a
+    /// 503 `gateway_restarting` with `Retry-After`, and the router never sees
+    /// them. HTTP/1.1 is told to close; HTTP/2 gets no `Connection` header,
+    /// since its connection gets GOAWAY. The same once the gateway's tasks
+    /// were cancelled without a stop.
+    #[tokio::test]
+    async fn a_stopped_generation_admits_no_request() {
+        use axum::http::Version;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let routed = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&routed);
+        let router = axum::Router::new().route(
+            "/",
+            axum::routing::get(move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                async { StatusCode::OK }
+            }),
+        );
+        let request = |version: Version, upgrade: bool| {
+            let mut request = axum::http::Request::get("/").version(version);
+            if upgrade {
+                request = request
+                    .header(header::CONNECTION, "upgrade")
+                    .header(header::UPGRADE, "websocket");
+            }
+            request.body(axum::body::Body::empty()).unwrap()
+        };
+        async fn assert_gateway_restarting(response: Response, version: Version) {
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "a stopped generation served {version:?}"
+            );
+            let headers = response.headers();
+            assert_eq!(
+                headers
+                    .get(header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok()),
+                Some("1"),
+                "{version:?}"
+            );
+            let connection = headers
+                .get(header::CONNECTION)
+                .and_then(|v| v.to_str().ok());
+            if version == Version::HTTP_2 {
+                assert_eq!(connection, None, "HTTP/2 has no Connection header");
+            } else {
+                assert_eq!(connection, Some("close"), "{version:?}");
+            }
+            let mut names: Vec<_> = headers.keys().map(|name| name.as_str()).collect();
+            names.sort_unstable();
+            names.retain(|name| *name != "connection");
+            assert_eq!(names, ["content-type", "retry-after"], "{version:?}");
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                body,
+                serde_json::json!({
+                    "error": "The gateway is restarting. Try again.",
+                    "reason": "gateway_restarting",
+                }),
+                "{version:?}"
+            );
+        }
+
+        let (stop, stopping) = tokio::sync::watch::channel(false);
+        let admission = Admission {
+            stopping,
+            tasks: ServeTasks::default(),
+        };
+        let response =
+            serve_while_current(router.clone(), &admission, request(Version::HTTP_11, false))
+                .await
+                .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "admitted while current");
+        assert_eq!(routed.load(Ordering::SeqCst), 1);
+
+        stop.send_replace(true);
+        for (version, upgrade) in [
+            (Version::HTTP_11, false),
+            (Version::HTTP_11, true),
+            (Version::HTTP_2, false),
+        ] {
+            let response =
+                serve_while_current(router.clone(), &admission, request(version, upgrade))
+                    .await
+                    .unwrap();
+            assert_gateway_restarting(response, version).await;
+        }
+        assert_eq!(
+            routed.load(Ordering::SeqCst),
+            1,
+            "a request reached a stopped generation's router"
+        );
+
+        let (_stop, stopping) = tokio::sync::watch::channel(false);
+        let tasks = ServeTasks::default();
+        let admission = Admission {
+            stopping,
+            tasks: tasks.clone(),
+        };
+        tasks.cancel();
+        let response =
+            serve_while_current(router.clone(), &admission, request(Version::HTTP_11, false))
+                .await
+                .unwrap();
+        assert_gateway_restarting(response, Version::HTTP_11).await;
+        assert_eq!(
+            routed.load(Ordering::SeqCst),
+            1,
+            "a request reached a cancelled generation's router"
+        );
+    }
+
+    /// A task submitted after the set was cancelled (an HTTP/2 stream
+    /// racing the stop) never runs: it is dropped, without another cancel.
+    /// Sixteen of them, so a cancel checked in random order would let one
+    /// run.
+    #[tokio::test]
+    async fn a_task_spawned_after_the_cancel_never_runs() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let tasks = ServeTasks::default();
+        tasks.cancel();
+        let polled = Arc::new(AtomicUsize::new(0));
+        let owned = Arc::new(());
+        for _ in 0..16 {
+            let (count, held) = (Arc::clone(&polled), Arc::clone(&owned));
+            hyper::rt::Executor::execute(&tasks, async move {
+                let _held = held;
+                count.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<()>().await;
+            });
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(1), tasks.idle())
+            .await
+            .expect("a task spawned after the cancel was left running");
+        assert_eq!(
+            polled.load(Ordering::SeqCst),
+            0,
+            "a task spawned after the cancel ran"
+        );
+        assert_eq!(
+            Arc::strong_count(&owned),
+            1,
+            "a task spawned after the cancel still holds what it owned"
+        );
+    }
+
+    /// The set counts a task until everything the task owns has been
+    /// destroyed: one cancelled before its first poll, and one that panics.
+    #[tokio::test]
+    async fn a_task_is_counted_until_it_has_been_destroyed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let tasks = ServeTasks::default();
+        let seen = Arc::new(AtomicUsize::new(usize::MAX));
+        let sentinel = CountAtDrop(tasks.clone(), Arc::clone(&seen));
+        tasks.spawn(async move {
+            let _sentinel = sentinel;
+            std::future::pending::<()>().await;
+        });
+        tasks.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), tasks.idle())
+            .await
+            .expect("the cancelled task ends");
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            1,
+            "a task cancelled before its first poll was counted as gone before it was destroyed"
+        );
+
+        let tasks = ServeTasks::default();
+        let seen = Arc::new(AtomicUsize::new(usize::MAX));
+        let sentinel = CountAtDrop(tasks.clone(), Arc::clone(&seen));
+        tasks.spawn(async move {
+            let _sentinel = sentinel;
+            tokio::task::yield_now().await;
+            panic!("a serve task panics");
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), tasks.idle())
+            .await
+            .expect("the panicked task ends");
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            1,
+            "a task that panicked was counted as gone before it was destroyed"
+        );
+    }
+
+    /// Spawning on a runtime that has shut down drops the task inside the
+    /// spawn. That must not deadlock, and the count must stay right.
+    #[test]
+    fn spawning_on_a_shut_down_runtime_drops_the_task_without_a_deadlock() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let handle = runtime.handle().clone();
+        drop(runtime);
+        let tasks = ServeTasks::default();
+        let seen = Arc::new(AtomicUsize::new(usize::MAX));
+        let sentinel = CountAtDrop(tasks.clone(), Arc::clone(&seen));
+        let spawner = tasks.clone();
+        let (spawned, returned) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _entered = handle.enter();
+            hyper::rt::Executor::execute(&spawner, async move {
+                let _sentinel = sentinel;
+                std::future::pending::<()>().await;
+            });
+            let _ = spawned.send(());
+        });
+        returned
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("spawning on a shut-down runtime deadlocked");
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            1,
+            "the dropped task was counted as gone before it was destroyed"
+        );
+        assert_eq!(tasks.live(), 0, "the dropped task is still counted");
+    }
+
+    /// A task stuck in code that never yields outlasts retirement, which
+    /// returns within its bound anyway and leaves the task counted. The task
+    /// ends at its next poll.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_task_in_non_yielding_code_ends_at_its_next_poll() {
+        let tasks = ServeTasks::default();
+        let (release, stuck) = std::sync::mpsc::channel::<()>();
+        let (entered, entering) = tokio::sync::oneshot::channel();
+        tasks.spawn(async move {
+            let _ = entered.send(());
+            let _ = stuck.recv();
+            std::future::pending::<()>().await;
+        });
+        entering.await.unwrap();
+        let started = std::time::Instant::now();
+        assert!(!tasks.retire_within(Duration::from_millis(50)).await);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "retiring waited on a stuck task: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(tasks.live(), 1, "the stuck task is still counted");
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), tasks.idle())
+            .await
+            .expect("the released task ends at its next poll");
+    }
+
+    /// A certificate and key for `localhost` written under `dir`, and a
+    /// client that trusts them.
+    fn drain_test_tls(
+        dir: &std::path::Path,
+    ) -> (
+        std::path::PathBuf,
+        std::path::PathBuf,
+        tokio_rustls::TlsConnector,
+    ) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".into()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let cert_path = dir.join("gateway.crt");
+        let key_path = dir.join("gateway.key");
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, key.serialize_pem()).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.der().clone()).unwrap();
+        let client = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        (
+            cert_path,
+            key_path,
+            tokio_rustls::TlsConnector::from(Arc::new(client)),
+        )
+    }
+
+    trait DrainTestIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+
+    impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> DrainTestIo for T {}
+
+    /// A new connection to `addr`, over TLS when `tls` is given.
+    async fn drain_test_connect(
+        addr: SocketAddr,
+        tls: Option<&tokio_rustls::TlsConnector>,
+    ) -> Box<dyn DrainTestIo> {
+        match tls {
+            Some(connector) => Box::new(drain_test_tls_connect(connector, addr).await),
+            None => Box::new(tokio::net::TcpStream::connect(addr).await.unwrap()),
+        }
+    }
+
+    fn h2_frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+        let len = u32::try_from(payload.len()).unwrap().to_be_bytes();
+        let mut frame = vec![len[1], len[2], len[3], kind, flags];
+        frame.extend_from_slice(&stream.to_be_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    /// An HTTP/2 client written frame by frame. It never acknowledges a
+    /// PING, so a server's graceful shutdown stays in its first phase:
+    /// GOAWAY sent, and streams the client sends meanwhile still accepted.
+    struct RawH2(Box<dyn DrainTestIo>);
+
+    const H2_HEADERS: u8 = 0x1;
+    const H2_RST_STREAM: u8 = 0x3;
+    const H2_SETTINGS: u8 = 0x4;
+    const H2_GOAWAY: u8 = 0x7;
+
+    impl RawH2 {
+        async fn open(mut io: Box<dyn DrainTestIo>) -> Self {
+            use tokio::io::AsyncWriteExt;
+            io.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+                .await
+                .unwrap();
+            io.write_all(&h2_frame(H2_SETTINGS, 0, 0, &[]))
+                .await
+                .unwrap();
+            let mut raw = Self(io);
+            raw.next_frame_of(|kind, flags, _| kind == H2_SETTINGS && flags & 0x1 == 0)
+                .await
+                .expect("the server's settings");
+            raw.0
+                .write_all(&h2_frame(H2_SETTINGS, 0x1, 0, &[]))
+                .await
+                .unwrap();
+            raw
+        }
+
+        /// Send `GET path` on `stream`, header block and end of stream in
+        /// one frame. Literal fields without indexing, so no table state.
+        async fn get(&mut self, stream: u32, path: &str) {
+            use tokio::io::AsyncWriteExt;
+            // :method GET and :scheme http, from the static table.
+            let mut block = vec![0x82, 0x86];
+            for (name_index, value) in [(4u8, path), (1, "localhost")] {
+                block.push(name_index);
+                block.push(u8::try_from(value.len()).unwrap());
+                block.extend_from_slice(value.as_bytes());
+            }
+            self.0
+                .write_all(&h2_frame(H2_HEADERS, 0x5, stream, &block))
+                .await
+                .unwrap();
+        }
+
+        /// Read frames until one matches `(type, flags, stream)`; `None` if
+        /// the connection ends first.
+        async fn next_frame_of(&mut self, matches: impl Fn(u8, u8, u32) -> bool) -> Option<u8> {
+            use tokio::io::AsyncReadExt;
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let mut head = [0u8; 9];
+                    self.0.read_exact(&mut head).await.ok()?;
+                    let len = u32::from_be_bytes([0, head[0], head[1], head[2]]);
+                    let mut payload = vec![0u8; usize::try_from(len).unwrap()];
+                    self.0.read_exact(&mut payload).await.ok()?;
+                    let stream =
+                        u32::from_be_bytes([head[5], head[6], head[7], head[8]]) & 0x7fff_ffff;
+                    if matches(head[3], head[4], stream) {
+                        return Some(head[3]);
+                    }
+                }
+            })
+            .await
+            .expect("frame deadline")
+        }
+    }
+
+    /// Once stopped, a gateway admits no new HTTP/2 stream, though HTTP/2's
+    /// graceful shutdown still accepts the streams a client sent before it
+    /// saw GOAWAY: such a stream is answered without reaching the router.
+    /// Over plain HTTP (h2c) and TLS.
+    #[tokio::test]
+    async fn a_stopped_gateway_admits_no_http2_stream_after_its_goaway() {
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (cert_path, key_path, connector) = drain_test_tls(tmp.path());
+        for over_tls in [false, true] {
+            let bus = zeroclaw_runtime::observability::EventBus::new();
+            let events = bus.sender().clone();
+            let (addr, shutdown_tx, server) = start_drain_test_gateway_with(
+                &tmp.path().join(if over_tls { "tls" } else { "plain" }),
+                0,
+                over_tls.then_some((cert_path.as_path(), key_path.as_path())),
+                Some(bus),
+            )
+            .await;
+            let before = events.receiver_count();
+            let mut h2 =
+                RawH2::open(drain_test_connect(addr, over_tls.then_some(&connector)).await).await;
+            h2.get(1, "/health").await;
+            h2.next_frame_of(|kind, _, stream| kind == H2_HEADERS && stream == 1)
+                .await
+                .expect("a response on the kept connection");
+
+            shutdown_tx.send(true).unwrap();
+            h2.next_frame_of(|kind, _, _| kind == H2_GOAWAY)
+                .await
+                .expect("the kept HTTP/2 connection gets GOAWAY");
+            h2.get(3, "/api/events").await;
+            let answer = h2
+                .next_frame_of(|kind, _, stream| {
+                    stream == 3 && (kind == H2_HEADERS || kind == H2_RST_STREAM)
+                })
+                .await;
+            assert!(
+                events.receiver_count() <= before,
+                "a stream sent after GOAWAY reached the stopped gateway's router (TLS: {over_tls})"
+            );
+            assert_eq!(
+                answer,
+                Some(H2_HEADERS),
+                "the stream sent after GOAWAY is answered (TLS: {over_tls})"
+            );
+
+            drop(h2);
+            tokio::time::timeout(std::time::Duration::from_secs(2), server)
+                .await
+                .expect("the gateway returns")
+                .expect("the gateway task does not panic")
+                .expect("the gateway stops cleanly");
+        }
+    }
+
+    /// Kept clients of a stopped gateway end up on a fresh connection that
+    /// reaches the next gateway. A kept HTTP/1.1 connection is closed; a
+    /// kept HTTP/2 client's connection ends after GOAWAY and it can open no
+    /// stream on it. The request each sends next, on a new connection, is
+    /// served by the next gateway's router: its event stream subscribes to
+    /// the next gateway's bus. Over plain HTTP and TLS.
+    #[tokio::test]
+    async fn kept_clients_reach_the_next_generation_on_a_fresh_connection() {
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (cert_path, key_path, connector) = drain_test_tls(tmp.path());
+        for over_tls in [false, true] {
+            let certs = over_tls.then_some((cert_path.as_path(), key_path.as_path()));
+            let tls = over_tls.then_some(&connector);
+            let label = if over_tls { "tls" } else { "plain" };
+            let (addr, shutdown_tx, server) = start_drain_test_gateway_with(
+                &tmp.path().join(format!("{label}-first")),
+                0,
+                certs,
+                None,
+            )
+            .await;
+            let mut kept_h1 = drain_test_connect(addr, tls).await;
+            let head = drain_test_request(&mut kept_h1, "/health").await;
+            assert!(head.starts_with("HTTP/1.1 200"), "{label}: {head}");
+            let (kept_h2, connection) = h2::client::handshake(drain_test_connect(addr, tls).await)
+                .await
+                .expect("HTTP/2 handshake");
+            let kept_h2_driver = zeroclaw_spawn::spawn!(async move {
+                let _ = connection.await;
+            });
+            let mut kept_h2 = kept_h2.ready().await.expect("the h2 connection is ready");
+            let (response, _) = kept_h2
+                .send_request(
+                    axum::http::Request::get(format!("http://{addr}/health"))
+                        .body(())
+                        .unwrap(),
+                    true,
+                )
+                .expect("send the request");
+            let response = tokio::time::timeout(std::time::Duration::from_secs(5), response)
+                .await
+                .expect("response deadline")
+                .expect("response");
+            assert_eq!(response.status(), 200, "{label}");
+
+            shutdown_tx.send(true).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), server)
+                .await
+                .expect("the gateway returns")
+                .expect("the gateway task does not panic")
+                .expect("the gateway stops cleanly");
+            assert!(
+                drain_test_closed(&mut kept_h1).await.is_some(),
+                "{label}: the kept HTTP/1.1 connection is closed"
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(2), kept_h2_driver)
+                .await
+                .expect("the kept HTTP/2 connection ends")
+                .expect("the connection driver does not panic");
+            assert!(
+                kept_h2.ready().await.is_err(),
+                "{label}: the kept HTTP/2 client can still open a stream"
+            );
+
+            let bus = zeroclaw_runtime::observability::EventBus::new();
+            let events = bus.sender().clone();
+            let (_, next_shutdown, next) = start_drain_test_gateway_with(
+                &tmp.path().join(format!("{label}-next")),
+                addr.port(),
+                certs,
+                Some(bus),
+            )
+            .await;
+            let before = events.receiver_count();
+            let mut fresh_h1 = drain_test_connect(addr, tls).await;
+            let head = drain_test_request(&mut fresh_h1, "/api/events").await;
+            assert!(head.starts_with("HTTP/1.1 200"), "{label}: {head}");
+            let (fresh_h2, connection) = h2::client::handshake(drain_test_connect(addr, tls).await)
+                .await
+                .expect("HTTP/2 handshake with the next gateway");
+            let fresh_h2_driver = zeroclaw_spawn::spawn!(async move {
+                let _ = connection.await;
+            });
+            let mut fresh_h2 = fresh_h2.ready().await.expect("the h2 connection is ready");
+            let (response, _) = fresh_h2
+                .send_request(
+                    axum::http::Request::get(format!("http://{addr}/api/events"))
+                        .body(())
+                        .unwrap(),
+                    true,
+                )
+                .expect("send the request");
+            let response = tokio::time::timeout(std::time::Duration::from_secs(5), response)
+                .await
+                .expect("response deadline")
+                .expect("response");
+            assert_eq!(response.status(), 200, "{label}");
+            let _body = response.into_body();
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while events.receiver_count() < before + 2 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!("{label}: the fresh connections reach the next gateway's router")
+            });
+
+            next_shutdown.send(true).unwrap();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), next).await;
+            fresh_h2_driver.abort();
+        }
     }
 
     /// The plain listener keeps the rule it had: a failed connection is
