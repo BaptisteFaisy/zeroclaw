@@ -62,16 +62,18 @@ test("a page that fails to load reloads once after a second and stays loading", 
 
 test("a second failure soon after the reload shows the error instead of looping", async () => {
   const h = harness();
-  void loadPageOrReload(failed, h.deps);
-  await settled(Promise.resolve());
+  assert.equal(await settled(loadPageOrReload(failed, h.deps)), false);
   h.advance(5_000);
-  await assert.rejects(loadPageOrReload(failed, h.deps), /dynamically imported module/);
+  const second = loadPageOrReload(failed, h.deps);
+  // It fails at once instead of waiting for another reload.
+  assert.equal(await settled(second), true);
+  await assert.rejects(second, /dynamically imported module/);
   assert.equal(h.calls.reloads, 1);
 });
 
 test("a failure long after the last reload may reload again", async () => {
   const h = harness();
-  void loadPageOrReload(failed, h.deps);
+  assert.equal(await settled(loadPageOrReload(failed, h.deps)), false);
   h.advance(PAGE_RELOAD_GUARD_MS + 1);
   const pending = loadPageOrReload(failed, h.deps);
   assert.equal(await settled(pending), false);
@@ -89,7 +91,9 @@ test("without storage to guard it, a failure shows the error and never reloads",
     },
   ]) {
     const h = harness({ storage });
-    await assert.rejects(loadPageOrReload(failed, h.deps), /dynamically imported module/);
+    const loading = loadPageOrReload(failed, h.deps);
+    assert.equal(await settled(loading), true);
+    await assert.rejects(loading, /dynamically imported module/);
     assert.equal(h.calls.reloads, 0);
   }
 });
