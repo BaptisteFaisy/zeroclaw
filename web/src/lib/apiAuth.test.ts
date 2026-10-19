@@ -241,3 +241,69 @@ test("a CSRF refusal after the session expired asks for re-auth instead of retry
   assert.equal(events.reauth, 1);
   assert.equal(requests.filter((r) => r.method === "POST").length, 1);
 });
+
+// ---------------------------------------------------------------------------
+// Gateway reloads
+// ---------------------------------------------------------------------------
+
+const restarting = () =>
+  new Response('{"error":"The gateway is restarting. Try again.","reason":"gateway_restarting"}', {
+    status: 503,
+    headers: { "Retry-After": "0" },
+  });
+
+test("signed in: a reload's 503 gateway_restarting is tried again, with no auth event", async () => {
+  auth.setOidcSession(session());
+  let refused = 0;
+  responder = (url) => {
+    if (url.endsWith("/api/status") && refused < 2) {
+      refused += 1;
+      return restarting();
+    }
+    return json(200, { ok: true });
+  };
+  const events = countEvents();
+  assert.deepEqual(await api.apiFetch("/api/status"), { ok: true });
+  events.stop();
+  assert.equal(requests.filter((r) => r.url.endsWith("/api/status")).length, 3);
+  assert.equal(events.unauthorized + events.reauth + events.resumed, 0);
+});
+
+test("signed in: an unsafe request refused by a reload is sent again, with its CSRF header", async () => {
+  auth.setOidcSession(session());
+  let refused = false;
+  responder = (_url, method) => {
+    if (method === "PUT" && !refused) {
+      refused = true;
+      return restarting();
+    }
+    return json(200, { ok: true });
+  };
+  await api.apiFetch("/api/config/prop", { method: "PUT", body: "{}" });
+  const puts = requests.filter((r) => r.method === "PUT");
+  assert.equal(puts.length, 2);
+  assert.ok(puts.every((r) => r.headers.get(auth.CSRF_HEADER) === "csrf-1"));
+
+  refused = false;
+  requests = [];
+  responder = (_url, method) => {
+    if (method === "PUT" && !refused) {
+      refused = true;
+      return restarting();
+    }
+    return json(200, { mtime_ms: 1 });
+  };
+  await api.putPersonalityFile("SOUL.md", "hi", null);
+  assert.equal(requests.filter((r) => r.method === "PUT").length, 2);
+});
+
+test("a 503 with another reason is not tried again", async () => {
+  auth.setOidcSession(session());
+  responder = () => json(503, { error: "down", reason: "core_unavailable" });
+  await assert.rejects(api.apiFetch("/api/status"), (err: unknown) => {
+    assert.ok(err instanceof api.HttpError);
+    assert.equal(err.status, 503);
+    return true;
+  });
+  assert.equal(requests.length, 1);
+});

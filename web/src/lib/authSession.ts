@@ -145,6 +145,42 @@ type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
 const gatewayUrl = (path: string) => `${apiOrigin}${basePath}${path}`;
 
+/** Tries per request while a gateway reload finishes. */
+export const RESTART_ATTEMPTS = 4;
+const MAX_RESTART_WAIT_MS = 5_000;
+
+/** The wait a `gateway_restarting` answer asks for: its `Retry-After`, bounded. */
+export function restartRetryDelayMs(response: Pick<Response, 'headers'>): number {
+  const seconds = Number(response.headers.get('Retry-After') ?? Number.NaN);
+  if (!Number.isFinite(seconds) || seconds < 0) return 1_000;
+  return Math.min(seconds * 1_000, MAX_RESTART_WAIT_MS);
+}
+
+/**
+ * `fetch` that waits out a gateway reload. A cookie request that reaches a
+ * gateway generation already told to stop is refused before any handler runs
+ * (503 `gateway_restarting`), so sending it again, to the next generation, is
+ * safe for every method. Every other answer is returned as it came.
+ */
+export async function fetchThroughRestart(
+  input: string,
+  init?: RequestInit,
+  fetchImpl: FetchLike = fetch,
+): Promise<Response> {
+  for (let attempt = 1; ; attempt += 1) {
+    const response = await fetchImpl(input, init);
+    if (response.status !== 503 || attempt >= RESTART_ATTEMPTS) return response;
+    let reason: unknown = null;
+    try {
+      reason = (JSON.parse(await response.clone().text()) as { reason?: unknown } | null)?.reason;
+    } catch {
+      // Not the gateway's JSON body: not a reload.
+    }
+    if (reason !== 'gateway_restarting') return response;
+    await new Promise((resolve) => setTimeout(resolve, restartRetryDelayMs(response)));
+  }
+}
+
 /**
  * `GET /api/auth/methods`. Null when the gateway doesn't answer it, which the
  * caller treats as "no sign-in providers".
@@ -152,9 +188,11 @@ const gatewayUrl = (path: string) => `${apiOrigin}${basePath}${path}`;
 export async function fetchAuthMethods(
   fetchImpl: FetchLike = fetch,
 ): Promise<AuthMethods | null> {
-  const response = await fetchImpl(gatewayUrl('/api/auth/methods'), {
-    cache: 'no-store',
-  });
+  const response = await fetchThroughRestart(
+    gatewayUrl('/api/auth/methods'),
+    { cache: 'no-store' },
+    fetchImpl,
+  );
   if (!response.ok) return null;
   return parseAuthMethods(await response.json().catch(() => null));
 }
@@ -175,10 +213,11 @@ export async function fetchAuthSession(
 ): Promise<SessionProbe> {
   let response: Response;
   try {
-    response = await fetchImpl(gatewayUrl('/api/auth/session'), {
-      cache: 'no-store',
-      credentials: 'same-origin',
-    });
+    response = await fetchThroughRestart(
+      gatewayUrl('/api/auth/session'),
+      { cache: 'no-store', credentials: 'same-origin' },
+      fetchImpl,
+    );
   } catch {
     return { kind: 'error' };
   }
@@ -237,11 +276,15 @@ export async function postSignOut(
   csrfToken: string,
   fetchImpl: FetchLike = fetch,
 ): Promise<void> {
-  const response = await fetchImpl(gatewayUrl('/auth/sign-out'), {
-    method: 'POST',
-    credentials: 'same-origin',
-    headers: { [CSRF_HEADER]: csrfToken },
-  });
+  const response = await fetchThroughRestart(
+    gatewayUrl('/auth/sign-out'),
+    {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { [CSRF_HEADER]: csrfToken },
+    },
+    fetchImpl,
+  );
   if (response.ok || response.status === 401) return;
   throw new Error(`Sign-out failed (${response.status})`);
 }

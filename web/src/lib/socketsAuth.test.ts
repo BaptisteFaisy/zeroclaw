@@ -298,3 +298,20 @@ test("pairing mode keeps retrying a refused stream, as before", async () => {
   assert.ok(sseRequests.length >= 2);
   assert.equal(sseRequests[0]?.get("Authorization"), "Bearer tok");
 });
+
+test("signed in: a reload's 503 gateway_restarting reconnects the stream, with no auth event", async () => {
+  auth.setOidcSession(session);
+  sseResponder = () =>
+    new Response('{"error":"restarting","reason":"gateway_restarting"}', {
+      status: 503,
+      headers: { "Retry-After": "1" },
+    });
+  const events = countEvents();
+  const client = new SSEClient({ reconnectDelay: 1 });
+  client.connect();
+  await settle();
+  client.disconnect();
+  events.stop();
+  assert.ok(sseRequests.length >= 2);
+  assert.equal(events.unauthorized + events.reauth + events.sessionEnded + events.accessLost, 0);
+});
