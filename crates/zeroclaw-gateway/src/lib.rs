@@ -947,37 +947,140 @@ fn config_admin_router(inbound_auth: &Arc<principal_gate::GatewayInboundAuth>) -
 /// the drain is over before that grace runs out.
 const CONNECTION_DRAIN: Duration = Duration::from_millis(300);
 
-/// The connection tasks of one gateway's accept loop. Dropping this aborts
-/// every one still running, so no connection outlives its gateway, also when
-/// the daemon aborts the gateway before the drain ends.
+/// Every task one gateway's serving runs: one per connection, and the
+/// stream tasks hyper's HTTP/2 spawns through its executor. A task leaves
+/// the set when it ends, however it ends, so a stop can abort what is left
+/// and wait for it.
+#[derive(Clone, Default)]
+struct ServeTasks(Arc<ServeTasksInner>);
+
 #[derive(Default)]
-struct ConnectionTasks(Vec<tokio::task::JoinHandle<()>>);
+struct ServeTasksInner {
+    running: parking_lot::Mutex<HashMap<u64, tokio::task::AbortHandle>>,
+    next: std::sync::atomic::AtomicU64,
+    idle: tokio::sync::Notify,
+}
 
-impl ConnectionTasks {
-    fn add(&mut self, task: tokio::task::JoinHandle<()>) {
-        self.0.retain(|task| !task.is_finished());
-        self.0.push(task);
-    }
+/// Takes its task out of the set when the task ends, finished or aborted.
+struct ServeTaskDone {
+    tasks: Arc<ServeTasksInner>,
+    id: u64,
+}
 
-    /// Wait up to `within` for every connection to finish, then abort the
-    /// rest. Whether all finished in time.
-    async fn drain(mut self, within: Duration) -> bool {
-        let deadline = tokio::time::Instant::now() + within;
-        for task in &mut self.0 {
-            if tokio::time::timeout_at(deadline, task).await.is_err() {
-                return false;
-            }
+impl Drop for ServeTaskDone {
+    fn drop(&mut self) {
+        let mut running = self.tasks.running.lock();
+        running.remove(&self.id);
+        if running.is_empty() {
+            self.tasks.idle.notify_waiters();
         }
-        true
     }
 }
 
-impl Drop for ConnectionTasks {
-    fn drop(&mut self) {
-        for task in &self.0 {
+impl ServeTasks {
+    fn spawn<F>(&self, task: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let id = self
+            .0
+            .next
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let done = ServeTaskDone {
+            tasks: Arc::clone(&self.0),
+            id,
+        };
+        // Held while spawning, so the task cannot end, and leave the set,
+        // before it is in it.
+        let mut running = self.0.running.lock();
+        let handle = zeroclaw_spawn::spawn!(async move {
+            let _done = done;
+            task.await;
+        });
+        running.insert(id, handle.abort_handle());
+    }
+
+    /// Resolves once no task is running.
+    async fn idle(&self) {
+        loop {
+            let notified = self.0.idle.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.0.running.lock().is_empty() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn abort_all(&self) {
+        for task in self.0.running.lock().values() {
             task.abort();
         }
     }
+
+    /// Wait up to `within` for every task to finish, then abort the rest.
+    /// Whether all finished in time.
+    async fn retire_within(&self, within: Duration) -> bool {
+        if tokio::time::timeout(within, self.idle()).await.is_ok() {
+            return true;
+        }
+        self.abort_all();
+        false
+    }
+}
+
+impl<F> hyper::rt::Executor<F> for ServeTasks
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    fn execute(&self, future: F) {
+        drop(zeroclaw_spawn::spawn!(async move {
+            let _ = future.await;
+        }));
+    }
+}
+
+/// Owned by a gateway's serve loop. If the gateway is dropped before its
+/// drain ran (the daemon aborted it), its tasks are aborted here.
+struct ServeTasksGuard(ServeTasks);
+
+impl Drop for ServeTasksGuard {
+    fn drop(&mut self) {
+        self.0.abort_all();
+    }
+}
+
+/// Wait for the tasks of the gateways before this one to end.
+async fn previous_gateways_retired() {}
+
+/// What the accept loop does after `accept()` failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AcceptErrorAction {
+    /// Accept again at once.
+    Retry,
+    /// Accept again after this long, unless the gateway is stopped first.
+    RetryAfter(Duration),
+    /// The listener cannot recover: stop serving.
+    Fail,
+}
+
+fn accept_error_action(error: &std::io::Error, tls: bool) -> AcceptErrorAction {
+    let _ = tls;
+    if is_recoverable_accept_error(error) {
+        AcceptErrorAction::RetryAfter(Duration::from_millis(ACCEPT_ERROR_BACKOFF_MS))
+    } else {
+        AcceptErrorAction::Fail
+    }
+}
+
+/// Wait `delay` before accepting again. Whether the gateway was told to stop
+/// meanwhile.
+async fn accept_backoff(delay: Duration, stopping: &mut tokio::sync::watch::Receiver<bool>) -> bool {
+    let _ = stopping;
+    tokio::time::sleep(delay).await;
+    false
 }
 
 /// Resolves when the gateway is told to stop; never, if it no longer can be.
@@ -1150,6 +1253,9 @@ pub async fn run_gateway_with_plugin_webhooks(
             zeroclaw_infra::fallback_gateway_bind_socket_addr(port)
         }
     };
+    // A gateway the daemon aborted may still have tasks winding down; this
+    // one serves only after they have ended.
+    previous_gateways_retired().await;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let actual_addr = listener.local_addr()?;
     let actual_port = actual_addr.port();
@@ -2598,24 +2704,29 @@ pub async fn run_gateway_with_plugin_webhooks(
     // watches this gateway's stop, and its task is owned by `connections`,
     // so a stop reaches all of them and none outlives this gateway.
     let mut app = app.into_make_service_with_connect_info::<SocketAddr>();
-    let mut connections = ConnectionTasks::default();
+    let tasks = ServeTasks::default();
+    let _abort_on_drop = ServeTasksGuard(tasks.clone());
     loop {
         tokio::select! {
             conn = listener.accept() => {
                 let (tcp_stream, remote_addr) = match conn {
                     Ok(pair) => pair,
-                    Err(e) => {
-                        if is_recoverable_accept_error(&e) {
+                    Err(e) => match accept_error_action(&e, tls_acceptor.is_some()) {
+                        AcceptErrorAction::Retry => continue,
+                        AcceptErrorAction::RetryAfter(delay) => {
                             // Transient (e.g. EMFILE under fd pressure):
                             // the listener is still valid. Back off
                             // briefly to avoid hot-spinning, then keep
                             // serving rather than killing the daemon
                             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": format!("{}", e)})), "gateway accept() failed with a transient error; backing off and continuing");
-                            tokio::time::sleep(Duration::from_millis(ACCEPT_ERROR_BACKOFF_MS)).await;
+                            if accept_backoff(delay, &mut shutdown_rx).await {
+                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "ZeroClaw Gateway shutting down");
+                                break;
+                            }
                             continue;
                         }
-                        return Err(e.into());
-                    }
+                        AcceptErrorAction::Fail => return Err(e.into()),
+                    },
                 };
                 let tls_acceptor = tls_acceptor.clone();
                 let svc = tower::MakeService::<
@@ -2628,17 +2739,16 @@ pub async fn run_gateway_with_plugin_webhooks(
                 // the gateway started: it sees a stop that lands while the
                 // connection is being handed over too.
                 let mut stopping = shutdown_rx.clone();
+                let executor = tasks.clone();
 
-                connections.add(zeroclaw_spawn::spawn!(async move {
+                tasks.spawn(async move {
                     let hyper_svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
                         let mut svc = svc.clone();
                         async move {
                             tower::Service::call(&mut svc, req).await
                         }
                     });
-                    let builder = hyper_util::server::conn::auto::Builder::new(
-                        hyper_util::rt::TokioExecutor::new(),
-                    );
+                    let builder = hyper_util::server::conn::auto::Builder::new(executor);
                     // Serve until the connection ends or the gateway stops; then
                     // finish the request in flight and close (HTTP/1 closes
                     // once its response is done). The drain below bounds it.
@@ -2679,7 +2789,7 @@ pub async fn run_gateway_with_plugin_webhooks(
                     if let Err(e) = served {
                         ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": format!("{}", e), "remote_addr": remote_addr})), "connection error from");
                     }
-                }));
+                });
             }
             _ = shutdown_rx.changed() => {
                 ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "ZeroClaw Gateway shutting down");
@@ -2691,7 +2801,7 @@ pub async fn run_gateway_with_plugin_webhooks(
     // is still open after the drain (an event stream, a connection that
     // ignored the shutdown) is aborted, so it cannot go on serving this
     // generation's router after a reload.
-    if !connections.drain(CONNECTION_DRAIN).await {
+    if !tasks.retire_within(CONNECTION_DRAIN).await {
         ::zeroclaw_log::record!(
             DEBUG,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
