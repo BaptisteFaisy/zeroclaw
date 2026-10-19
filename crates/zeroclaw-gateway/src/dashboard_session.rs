@@ -796,7 +796,16 @@ impl DashboardAuth {
         previous: &ConnectionAuth,
     ) -> Option<ConnectionAuth> {
         let provider = format!("oidc.{alias}");
-        let refusal = match self.inbound.authenticate_scoped(bearer, &provider).await {
+        let published = self.inbound.generation();
+        let mut verified = self.inbound.authenticate_scoped(bearer, &provider).await;
+        // A policy published during the identity provider's round trip fails
+        // the verification closed, as it should; that is no reason to sign
+        // somebody out. Verify once more with the token held, as the grants
+        // check does, then fail closed.
+        if verified.is_err() && self.inbound.generation() != published {
+            verified = self.inbound.authenticate_scoped(bearer, &provider).await;
+        }
+        let refusal = match verified {
             Ok(fresh)
                 if fresh.principal.id == previous.principal.id
                     && fresh.principal.actor != ActorKind::Service =>
