@@ -742,7 +742,18 @@ impl DashboardAuth {
             Err(_) => match self.reverify(&key, &alias, &bearer, &auth).await {
                 Some(fresh) => match self.inbound.current_grants(&fresh) {
                     Ok(grants) => grants,
-                    Err(_) => {
+                    Err(denied) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({
+                                    "alias": alias,
+                                    "principal_id": fresh.principal.id.as_str(),
+                                    "refusal": {"code": denied.code, "reason": denied.message},
+                                })),
+                            "dashboard session ended: the current policy grants it nothing"
+                        );
                         self.sessions.expire_key(&key);
                         return DashboardCaller::Rejected(SessionRejection::Expired);
                     }
@@ -781,23 +792,35 @@ impl DashboardAuth {
         previous: &ConnectionAuth,
     ) -> Option<ConnectionAuth> {
         let provider = format!("oidc.{alias}");
-        let fresh = match self.inbound.authenticate_scoped(bearer, &provider).await {
+        let refusal = match self.inbound.authenticate_scoped(bearer, &provider).await {
             Ok(fresh)
                 if fresh.principal.id == previous.principal.id
                     && fresh.principal.actor != ActorKind::Service =>
             {
-                fresh
+                let mut sessions = self.sessions.sessions.lock();
+                let session = sessions.get_mut(key)?;
+                session.auth = fresh.clone();
+                session.authority = self.inbound.authority_ref();
+                return Some(fresh);
             }
-            _ => {
-                self.sessions.expire_key(key);
-                return None;
-            }
+            Ok(_) => ::serde_json::json!({"reason": "the token now names another principal"}),
+            Err(denied) => ::serde_json::json!({"code": denied.code, "reason": denied.message}),
         };
-        let mut sessions = self.sessions.sessions.lock();
-        let session = sessions.get_mut(key)?;
-        session.auth = fresh.clone();
-        session.authority = self.inbound.authority_ref();
-        Some(fresh)
+        // Why a session ended is otherwise invisible: the browser only learns
+        // that it expired. The token itself is never logged.
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "alias": alias,
+                    "principal_id": previous.principal.id.as_str(),
+                    "refusal": refusal,
+                })),
+            "dashboard session ended: verifying its token again failed"
+        );
+        self.sessions.expire_key(key);
+        None
     }
 
     /// End the session behind `session` (sign-out).
