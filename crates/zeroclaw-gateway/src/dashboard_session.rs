@@ -745,13 +745,16 @@ impl DashboardAuth {
                     Err(denied) => {
                         ::zeroclaw_log::record!(
                             WARN,
-                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                .with_attrs(::serde_json::json!({
-                                    "alias": alias,
-                                    "principal_id": fresh.principal.id.as_str(),
-                                    "refusal": {"code": denied.code, "reason": denied.message},
-                                })),
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Reject
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "alias": alias,
+                                "principal_id": fresh.principal.id.as_str(),
+                                "refusal": {"code": denied.code, "reason": denied.message},
+                            })),
                             "dashboard session ended: the current policy grants it nothing"
                         );
                         self.sessions.expire_key(&key);
