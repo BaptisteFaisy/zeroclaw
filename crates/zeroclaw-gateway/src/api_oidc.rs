@@ -430,6 +430,14 @@ fn enrollment_for(state: &AppState, alias: &str) -> Result<Enrollment, Box<Respo
             "unknown oidc provider alias",
         )));
     };
+    enrollment_from(alias, entry)
+}
+
+/// Build the enrollment client for `alias` from an entry already read.
+fn enrollment_from(
+    alias: &str,
+    entry: zeroclaw_config::schema::OidcConfig,
+) -> Result<Enrollment, Box<Response>> {
     Enrollment::new(alias, entry).map_err(|_| {
         Box::new(error_json(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1175,9 +1183,9 @@ async fn handle_pkce_callback(
                     .offers(&pending.alias)
                     .then(|| config.oidc.get(&pending.alias))
                     .flatten()
-                    .map(|entry| (ProviderPin::of(entry), sign_in.session_lifetime_secs))
+                    .map(|entry| (entry.clone(), sign_in.session_lifetime_secs))
             };
-            let Some((provider, lifetime_secs)) = offered else {
+            let Some((entry, lifetime_secs)) = offered else {
                 return sign_in_refused_page();
             };
             // Refused before the code exchange, so the refusal costs the
@@ -1186,16 +1194,26 @@ async fn handle_pkce_callback(
                 relay.flows.restore(pending);
                 return sessions_full_page();
             }
-            Some((dashboard, provider, lifetime_secs))
+            Some((dashboard, entry, lifetime_secs))
         }
     };
     #[cfg(test)]
     before_exchange_client(&pending.flow.state).await;
-    let enrollment = match enrollment_for(&state, &pending.alias) {
+    // A dashboard sign-in takes its pin and its exchange client from the one
+    // reading above. The exchange checks that configuration against the
+    // flow, so a successful exchange vouches for the pin as well.
+    let built = match &dashboard {
+        Some((_, entry, _)) => enrollment_from(&pending.alias, entry.clone()),
+        None => enrollment_for(&state, &pending.alias),
+    };
+    let enrollment = match built {
         Ok(enrollment) => enrollment,
         // The alias was removed while the flow was in flight: fail closed.
         Err(_) => return unproductive_callback(&relay, &key, StatusCode::BAD_REQUEST),
     };
+    let dashboard = dashboard.map(|(dashboard, entry, lifetime_secs)| {
+        (dashboard, ProviderPin::of(&entry), lifetime_secs)
+    });
     let Some(_permit) = outbound_permit(&relay) else {
         // The busy page carries a short `Retry-After`. That invitation is
         // only honest if the retry can still finish the sign-in: the state
