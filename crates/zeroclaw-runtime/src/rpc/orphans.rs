@@ -7,10 +7,10 @@
 //! restart. Once the owning identity has had no live connection for
 //! `wss.orphaned_session_timeout_secs`, each of its sessions that has been idle
 //! as long, has no turn running and has no approval pending is closed, as
-//! `session/close` would close it. A chat session's history must already be in
-//! its store, or be added to it without rewriting what is stored, and a
-//! session whose history can't be reconciled with its store stays live; only
-//! the live session goes.
+//! `session/close` would close it. Retirement never writes a transcript: a chat
+//! session goes only when its store already holds all of its history, and one
+//! whose store lacks part of it, differs from it or can't be read stays live.
+//! Only the live session goes.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -151,24 +151,21 @@ async fn retire(
     true
 }
 
-/// Whether the live history of `session` is held by its durable store, adding
-/// a chat session's missing messages to it if needed.
+/// Whether the live history of `session` is already held by its durable
+/// store. Nothing is written here.
 ///
 /// An ACP session's turns each commit through its checkpoint, and a turn whose
 /// checkpoint fails removes its live session, so a live ACP session's history
 /// is already in the ACP store.
 ///
 /// A chat session's post-turn write can fail, a daemon can run without a chat
-/// store, and other writers (the gateway's message route) can append to the
-/// stored transcript without the live session. So the stored transcript is
-/// compared with the live one by role and content, and nothing stored is ever
-/// rewritten:
-/// - the store already holds everything live (alone, or followed by messages
-///   another writer stored later): nothing to write;
-/// - the store holds an earlier part of it: the missing messages are appended,
-///   unless the row is gone (a deleted session is never recreated);
-/// - the two differ: the session stays live, as it does when the store can't be
-///   read or written.
+/// store, and other writers (the gateway's message and delete routes) change
+/// the stored transcript without the live session. So the stored transcript is
+/// compared with the live one by role and content. Retirement goes ahead only
+/// when the store holds everything live, alone or followed by messages another
+/// writer added. A store that lacks part of the live history, differs from it,
+/// or can't be read keeps the session live. Retirement writes nothing, so it
+/// can't recreate a deleted session or reorder another writer's messages.
 async fn transcript_is_stored(ctx: &RpcContext, session: &OwnedSession) -> bool {
     if matches!(
         ctx.sessions.chat_mode(&session.id).await,
@@ -187,20 +184,16 @@ async fn transcript_is_stored(ctx: &RpcContext, session: &OwnedSession) -> bool 
     let Some(backend) = ctx.session_backend.as_ref() else {
         return live.is_empty();
     };
-    let key = format!("rpc_{}", session.id);
-    let stored = match backend.try_load(&key) {
+    let stored = match backend.try_load(&format!("rpc_{}", session.id)) {
         Ok(stored) => stored,
         Err(error) => return keep_live(session, "could not read its stored history", &error),
     };
-    let common = stored
-        .iter()
-        .zip(&live)
-        .take_while(|(stored, live)| stored.role == live.role && stored.content == live.content)
-        .count();
-    if common == live.len() {
-        return true;
-    }
-    if common < stored.len() {
+    let held = stored.len() >= live.len()
+        && stored
+            .iter()
+            .zip(&live)
+            .all(|(stored, live)| stored.role == live.role && stored.content == live.content);
+    if !held {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -211,25 +204,16 @@ async fn transcript_is_stored(ctx: &RpcContext, session: &OwnedSession) -> bool 
                     "stored_messages": stored.len(),
                     "live_messages": live.len(),
                 })),
-            "An orphaned session's history differs from its store; keeping it live"
+            "An orphaned session's store does not hold all of its history; keeping it live"
         );
-        return false;
     }
-    if !backend.session_exists(&key) {
-        return false;
-    }
-    for message in &live[common..] {
-        if let Err(error) = backend.append(&key, message) {
-            return keep_live(session, "could not store its history", &error);
-        }
-    }
-    true
+    held
 }
 
 fn keep_live(session: &OwnedSession, what: &str, error: &std::io::Error) -> bool {
     ::zeroclaw_log::record!(
         WARN,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Write)
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Read)
             .with_category(::zeroclaw_log::EventCategory::Agent)
             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
             .with_attrs(::serde_json::json!({

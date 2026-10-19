@@ -862,6 +862,25 @@ impl SessionBackend for SqliteSessionBackend {
         rows.filter_map(|r| r.ok()).collect()
     }
 
+    /// Like `load`, but a transcript that can't be read, or a row that can't be
+    /// decoded, is an error rather than a shorter history.
+    fn try_load(&self, session_key: &str) -> std::io::Result<Vec<ChatMessage>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare("SELECT role, content FROM sessions WHERE session_key = ?1 ORDER BY id ASC")
+            .map_err(std::io::Error::other)?;
+        let rows = stmt
+            .query_map(params![session_key], |row| {
+                Ok(ChatMessage {
+                    role: row.get(0)?,
+                    content: row.get(1)?,
+                })
+            })
+            .map_err(std::io::Error::other)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(std::io::Error::other)
+    }
+
     fn load_with_timestamps(
         &self,
         session_key: &str,
