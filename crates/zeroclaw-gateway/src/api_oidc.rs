@@ -919,13 +919,29 @@ async fn handle_sign_out(
     caller: Option<Extension<DashboardCaller>>,
     headers: HeaderMap,
 ) -> Response {
+    let scope = CookieScope {
+        https: request_is_https(&state, &headers),
+        path_prefix: &state.path_prefix,
+    };
     let (Some(Extension(dashboard)), Some(Extension(caller))) = (dashboard, caller) else {
         return dashboard_session::rejection_response(SessionRejection::Invalid);
     };
     let session = match caller {
         DashboardCaller::Session(session) => session,
         DashboardCaller::Rejected(rejection) => {
-            return dashboard_session::rejection_response(rejection);
+            let mut response = dashboard_session::rejection_response(rejection);
+            // An ended session's cookie is kept so every tab hears why it
+            // ended; signing out is when it goes. The layer has already
+            // refused a request from another origin.
+            if matches!(
+                rejection,
+                SessionRejection::Expired | SessionRejection::Invalid
+            ) {
+                for value in scope.clear_session_cookies() {
+                    response.headers_mut().append(header::SET_COOKIE, value);
+                }
+            }
+            return response;
         }
     };
     dashboard.end(&session);
@@ -939,10 +955,6 @@ async fn handle_sign_out(
             })),
         "dashboard sign-out"
     );
-    let scope = CookieScope {
-        https: request_is_https(&state, &headers),
-        path_prefix: &state.path_prefix,
-    };
     let mut response = StatusCode::NO_CONTENT.into_response();
     for value in scope.clear_session_cookies() {
         response.headers_mut().append(header::SET_COOKIE, value);
