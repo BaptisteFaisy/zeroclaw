@@ -347,7 +347,7 @@ export async function pair(code: string): Promise<{ token: string }> {
   // device in the device_registry so it shows up in the paired-devices list and
   // can be revoked. /pair only persists the bearer token, leaving the device
   // invisible/unmanageable in the UI. Both are unauthenticated (code-gated).
-  const response = await fetch(`${basePath}/api/pair`, {
+  const response = await fetchThroughRestart(`${basePath}/api/pair`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -377,7 +377,7 @@ export async function getAdminPairCode(): Promise<{
   // no HTTP caller can prove it is on the gateway host. The operator reads the
   // code from the gateway log or `zeroclaw gateway get-paircode` and types it in.
   // The admin fallback only answers callers holding the gateway admin token.
-  const publicResp = await fetch(`${basePath}/pair/code`);
+  const publicResp = await fetchThroughRestart(`${basePath}/pair/code`);
   if (publicResp.ok) {
     return publicResp.json() as Promise<{
       pairing_code: string | null;
@@ -385,7 +385,7 @@ export async function getAdminPairCode(): Promise<{
     }>;
   }
 
-  const response = await fetch("/admin/paircode");
+  const response = await fetchThroughRestart("/admin/paircode");
   if (!response.ok) {
     throw new Error(`Failed to fetch pairing code (${response.status})`);
   }
@@ -420,7 +420,7 @@ export async function generatePairCode(): Promise<{
   pairing_required: boolean;
   message?: string;
 }> {
-  const response = await fetch(`${basePath}/admin/paircode/new`, { method: 'POST' });
+  const response = await fetchThroughRestart(`${basePath}/admin/paircode/new`, { method: 'POST' });
   if (response.status === 403) {
     throw new PairCodeForbiddenError();
   }

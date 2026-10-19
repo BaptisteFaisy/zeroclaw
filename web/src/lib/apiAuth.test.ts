@@ -307,3 +307,27 @@ test("a 503 with another reason is not tried again", async () => {
   });
   assert.equal(requests.length, 1);
 });
+
+test("pairing: the pair, pair-code and new-code requests wait out a reload too", async () => {
+  // A stopped gateway refuses every request, bearer or not, with the same 503.
+  const refused = new Set<string>();
+  responder = (url) => {
+    const path = new URL(url, "https://zc.example").pathname;
+    if (!refused.has(path)) {
+      refused.add(path);
+      return restarting();
+    }
+    if (path === "/api/pair") return json(200, { token: "tok-new" });
+    return json(200, { pairing_code: "123456", pairing_required: true });
+  };
+  assert.deepEqual(await api.pair("123456"), { token: "tok-new" });
+  assert.equal(auth.getToken(), "tok-new");
+  assert.equal((await api.getAdminPairCode()).pairing_code, "123456");
+  assert.equal((await api.generatePairCode()).pairing_code, "123456");
+  const paths = requests.map((r) => new URL(r.url, "https://zc.example").pathname);
+  assert.deepEqual(paths, [
+    "/api/pair", "/api/pair",
+    "/pair/code", "/pair/code",
+    "/admin/paircode/new", "/admin/paircode/new",
+  ]);
+});

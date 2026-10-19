@@ -157,10 +157,10 @@ export function restartRetryDelayMs(response: Pick<Response, 'headers'>): number
 }
 
 /**
- * `fetch` that waits out a gateway reload. A cookie request that reaches a
- * gateway generation already told to stop is refused before any handler runs
- * (503 `gateway_restarting`), so sending it again, to the next generation, is
- * safe for every method. Every other answer is returned as it came.
+ * `fetch` that waits out a gateway reload. A request that reaches a gateway
+ * generation already told to stop is refused before it is routed (503
+ * `gateway_restarting`), so sending it again, to the next generation, is safe
+ * for every method. Every other answer is returned as it came.
  */
 export async function fetchThroughRestart(
   input: string,

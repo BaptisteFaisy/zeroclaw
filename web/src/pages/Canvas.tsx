@@ -67,12 +67,14 @@ export default function Canvas() {
   }, []);
 
   // Canvas the socket stopped for under dashboard sign-in, reconnected once the
-  // session is usable again; and the pending reconnect after a gateway reload.
+  // session is usable again; and the pending reconnect after a gateway reload
+  // or a refused upgrade.
   const haltedCanvasRef = useRef<string | null>(null);
   const reloadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Connect to canvas WebSocket
-  const connectWs = useCallback((id: string) => {
+  // Connect to canvas WebSocket. `retrying` marks the one retry of a socket
+  // that never opened.
+  const connectWs = useCallback((id: string, retrying = false) => {
     haltedCanvasRef.current = null;
     if (reloadTimerRef.current) clearTimeout(reloadTimerRef.current);
     reloadTimerRef.current = null;
@@ -84,7 +86,11 @@ export default function Canvas() {
     const protocols = token ? ['zeroclaw.v1', `bearer.${token}`] : ['zeroclaw.v1'];
     const ws = new WebSocket(getWsUrl(id), protocols);
 
-    ws.onopen = () => setConnected(true);
+    let opened = false;
+    ws.onopen = () => {
+      opened = true;
+      setConnected(true);
+    };
     ws.onclose = (event: CloseEvent) => {
       setConnected(false);
       // A socket this page replaced or closed on unmount needs nothing more.
@@ -94,6 +100,10 @@ export default function Canvas() {
       } else if (event.code === 1001) {
         // The gateway reloaded: connect to the new one.
         reloadTimerRef.current = setTimeout(() => connectWs(id), 1000);
+      } else if (!opened && !retrying) {
+        // Refused before it opened (a gateway in the middle of a reload
+        // refuses the upgrade): try once more.
+        reloadTimerRef.current = setTimeout(() => connectWs(id, true), 1000);
       }
     };
     ws.onerror = () => setConnected(false);
