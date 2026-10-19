@@ -1127,10 +1127,18 @@ impl SessionWatch {
         self.session.principal().id.as_str()
     }
 
+    /// The ends a stream can see by itself, without waiting for the task
+    /// that watches it: the session's own cancellation (sign-out, eviction,
+    /// revocation) and its generation's stop. Neither holds anything of the
+    /// session's credentials.
+    pub(crate) fn direct_ends(&self) -> (CancellationToken, tokio::sync::watch::Receiver<bool>) {
+        (self.session.ended.clone(), self.stopping.clone())
+    }
+
     /// Resolves when this generation is told to stop. Waits for a new signal
     /// rather than reading the current value, like the gateway's listener;
     /// never resolves if the signal can no longer arrive.
-    async fn generation_stopped(stopping: &mut tokio::sync::watch::Receiver<bool>) {
+    pub(crate) async fn generation_stopped(stopping: &mut tokio::sync::watch::Receiver<bool>) {
         if stopping.changed().await.is_err() {
             std::future::pending::<()>().await;
         }

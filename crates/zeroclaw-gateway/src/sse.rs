@@ -74,6 +74,9 @@ pub async fn handle_sse_events(
     // keeps only the cancellation that ends it, and the guard that stops the
     // watching task when the stream is dropped.
     let session_ended = tokio_util::sync::CancellationToken::new();
+    let direct_ends = session_watch
+        .as_ref()
+        .map(crate::dashboard_session::SessionWatch::direct_ends);
     let watcher = session_watch.map(|watch| {
         let ended = session_ended.clone();
         let watch_state = state.clone();
@@ -99,8 +102,20 @@ pub async fn handle_sse_events(
         },
     );
 
-    // Ends with the dashboard session that opened it; never, otherwise.
-    let stream = futures_util::StreamExt::take_until(stream, session_ended.cancelled_owned());
+    // Ends with the dashboard session that opened it; never, otherwise. What
+    // the stream can see by itself ends it at once; the rest (expiry, a
+    // recheck the policy fails) arrives through the watching task.
+    let ended = async move {
+        match direct_ends {
+            Some((session_cancelled, mut stopping)) => tokio::select! {
+                () = session_ended.cancelled() => {}
+                () = session_cancelled.cancelled() => {}
+                () = crate::dashboard_session::SessionWatch::generation_stopped(&mut stopping) => {}
+            },
+            None => session_ended.cancelled().await,
+        }
+    };
+    let stream = futures_util::StreamExt::take_until(stream, ended);
     let stream = futures_util::StreamExt::map(stream, move |event| {
         let _watching = &watcher;
         event
