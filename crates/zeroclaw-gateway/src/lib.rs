@@ -8331,9 +8331,17 @@ path = "{trigger_path}"
                 fields.contains(&("retry-after".into(), "1".into())),
                 "TLS: {over_tls}: {fields:?}"
             );
-            let allowed = [":status", "content-length", "content-type", "date", "retry-after"];
+            let allowed = [
+                ":status",
+                "content-length",
+                "content-type",
+                "date",
+                "retry-after",
+            ];
             assert!(
-                fields.iter().all(|(name, _)| allowed.contains(&name.as_str())),
+                fields
+                    .iter()
+                    .all(|(name, _)| allowed.contains(&name.as_str())),
                 "no other header, and no Connection (TLS: {over_tls}): {fields:?}"
             );
             let mut body = Vec::new();
