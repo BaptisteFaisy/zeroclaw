@@ -4129,10 +4129,17 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         let mut fixture = ParkedTurnFixture::spawn_signed_in(&idp.uri()).await;
         let (cookie, _) = fixture.sign_in(3600).await;
         // One socket past its connect frame, one whose message is its first.
-        let (mut connected, _) = fixture.connect_signed_in("signin-revoked-connected", &cookie).await;
+        let (mut connected, _) = fixture
+            .connect_signed_in("signin-revoked-connected", &cookie)
+            .await;
         send_raw(&mut connected, serde_json::json!({"type": "connect"})).await;
-        assert_eq!(next_frame_of(&mut connected, "connected").await["type"], "connected");
-        let (mut fresh, _) = fixture.connect_signed_in("signin-revoked-fresh", &cookie).await;
+        assert_eq!(
+            next_frame_of(&mut connected, "connected").await["type"],
+            "connected"
+        );
+        let (mut fresh, _) = fixture
+            .connect_signed_in("signin-revoked-fresh", &cookie)
+            .await;
 
         fixture.revoke_admin();
         for client in [&mut connected, &mut fresh] {
@@ -4147,7 +4154,10 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         let started = tokio::time::timeout(Duration::from_millis(500), fixture.request_seen.recv())
             .await
             .is_ok();
-        assert!(!started, "a message sent after the account lost admin started a turn");
+        assert!(
+            !started,
+            "a message sent after the account lost admin started a turn"
+        );
         fixture.shutdown();
     }
 
