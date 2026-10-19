@@ -944,68 +944,77 @@ fn config_admin_router(inbound_auth: &Arc<principal_gate::GatewayInboundAuth>) -
 
 /// How long a stopping gateway lets its connections finish the requests in
 /// flight. With [`RETIRE_JOIN`] it stays inside the daemon's 500 ms grace for
-/// the gateway, so retirement is over before that grace runs out.
+/// the gateway, so what is left is cancelled before that grace runs out.
 const CONNECTION_DRAIN: Duration = Duration::from_millis(300);
 
-/// How long retirement waits for the tasks it aborted to actually end.
-/// Aborting only asks: a task ends, and drops what it owns, when it is next
-/// polled.
+/// How long retirement waits for the tasks it cancelled to end. Cancelling
+/// only asks: a task ends, and drops what it owns, when it is next polled.
 const RETIRE_JOIN: Duration = Duration::from_millis(100);
 
-/// How long a new gateway waits for an aborted gateway's tasks to end.
-const RETIRE_BARRIER: Duration = Duration::from_secs(2);
-
 /// Every task one gateway's serving runs: one per connection, and the
-/// stream tasks hyper's HTTP/2 spawns through its executor. A task leaves
-/// the set when it ends, however it ends, so a stop can abort what is left
-/// and wait for it.
+/// stream tasks hyper's HTTP/2 spawns through its executor. A stop cancels
+/// them all at once, and the set counts each task until it has been
+/// destroyed.
 #[derive(Clone, Default)]
 struct ServeTasks(Arc<ServeTasksInner>);
 
 #[derive(Default)]
 struct ServeTasksInner {
-    running: parking_lot::Mutex<HashMap<u64, tokio::task::AbortHandle>>,
-    next: std::sync::atomic::AtomicU64,
+    live: std::sync::atomic::AtomicUsize,
     idle: tokio::sync::Notify,
+    cancelled: tokio_util::sync::CancellationToken,
 }
 
-/// Takes its task out of the set when the task ends, finished or aborted.
-struct ServeTaskDone {
-    tasks: Arc<ServeTasksInner>,
-    id: u64,
+/// A task of the set. Fields drop in declaration order, so the future, and
+/// everything it owns, is destroyed before `_done` takes the task off the
+/// count, also when the task is dropped before its first poll.
+struct ServeTask {
+    future: std::pin::Pin<Box<dyn Future<Output = ()> + Send>>,
+    _done: ServeTaskDone,
 }
+
+/// Takes its task off the count.
+struct ServeTaskDone(Arc<ServeTasksInner>);
 
 impl Drop for ServeTaskDone {
     fn drop(&mut self) {
-        let mut running = self.tasks.running.lock();
-        running.remove(&self.id);
-        if running.is_empty() {
-            self.tasks.idle.notify_waiters();
+        if self.0.live.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+            self.0.idle.notify_waiters();
         }
     }
 }
 
 impl ServeTasks {
-    fn spawn<F>(&self, task: F)
+    fn spawn<F>(&self, future: F)
     where
-        F: std::future::Future<Output = ()> + Send + 'static,
+        F: Future<Output = ()> + Send + 'static,
     {
-        let id = self
-            .0
-            .next
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let done = ServeTaskDone {
-            tasks: Arc::clone(&self.0),
-            id,
+        self.0.live.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let task = ServeTask {
+            future: Box::pin(future),
+            _done: ServeTaskDone(Arc::clone(&self.0)),
         };
-        // Held while spawning, so the task cannot end, and leave the set,
-        // before it is in it.
-        let mut running = self.0.running.lock();
-        let handle = zeroclaw_spawn::spawn!(async move {
-            let _done = done;
-            task.await;
+        let cancelled = self.0.cancelled.clone();
+        // No lock is held here: spawning can drop the task at once (a runtime
+        // that has shut down does), and that only updates the count.
+        zeroclaw_spawn::spawn!(async move {
+            // Moves the whole task in. Naming only `task.future` below would
+            // capture just that field, and `_done` would take the task off the
+            // count as soon as `spawn` returned.
+            let mut task = task;
+            // The cancel is checked first, so a task spawned after it never
+            // runs.
+            tokio::select! {
+                biased;
+                () = cancelled.cancelled() => {}
+                () = task.future.as_mut() => {}
+            }
         });
-        running.insert(id, handle.abort_handle());
+    }
+
+    /// How many tasks are running, or not yet destroyed.
+    fn live(&self) -> usize {
+        self.0.live.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Resolves once no task is running.
@@ -1014,26 +1023,26 @@ impl ServeTasks {
             let notified = self.0.idle.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if self.0.running.lock().is_empty() {
+            if self.live() == 0 {
                 return;
             }
             notified.await;
         }
     }
 
-    /// How many tasks are running.
-    fn live(&self) -> usize {
-        self.0.running.lock().len()
-    }
-
+    /// Cancel every task, and any spawned later: each ends at its next poll.
     fn cancel(&self) {
-        for task in self.0.running.lock().values() {
-            task.abort();
-        }
+        self.0.cancelled.cancel();
     }
 
-    /// Wait up to `within` for every task to finish, then abort the rest and
-    /// wait until they have ended too. Whether all finished in time.
+    fn is_cancelled(&self) -> bool {
+        self.0.cancelled.is_cancelled()
+    }
+
+    /// Wait up to `within` for every task to finish, then cancel the rest and
+    /// wait a little for them to end. Whether all finished in time. A task in
+    /// code that never yields can outlast this; it admits no request, and
+    /// ends at its next poll.
     async fn retire_within(&self, within: Duration) -> bool {
         if tokio::time::timeout(within, self.idle()).await.is_ok() {
             return true;
@@ -1046,8 +1055,9 @@ impl ServeTasks {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                "gateway tasks were still running after they were aborted"
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"remaining": self.live()})),
+                "gateway tasks were still running after they were cancelled; each ends at its next poll"
             );
         }
         false
@@ -1056,7 +1066,7 @@ impl ServeTasks {
 
 impl<F> hyper::rt::Executor<F> for ServeTasks
 where
-    F: std::future::Future + Send + 'static,
+    F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
     fn execute(&self, future: F) {
@@ -1067,68 +1077,24 @@ where
 }
 
 /// Owned by a gateway's serve loop. If the gateway is dropped before its
-/// drain ran (the daemon aborted it), its tasks are aborted here, and left
-/// for the next gateway to wait on: aborting alone does not prove they have
-/// ended.
-struct ServeTasksGuard(ServeTasks, &'static Retiring);
+/// drain ran (the daemon aborted it), its tasks are cancelled here.
+struct ServeTasksGuard(ServeTasks);
 
 impl ServeTasksGuard {
     fn new(tasks: ServeTasks) -> Self {
-        Self(tasks, &RETIRING)
+        Self(tasks)
     }
 }
 
 impl Drop for ServeTasksGuard {
     fn drop(&mut self) {
         self.0.cancel();
-        if !self.0.0.running.lock().is_empty() {
-            self.1.add(self.0.clone());
-        }
     }
-}
-
-/// Aborted gateways whose tasks may still be winding down.
-struct Retiring(parking_lot::Mutex<Vec<ServeTasks>>);
-
-impl Retiring {
-    const fn new() -> Self {
-        Self(parking_lot::Mutex::new(Vec::new()))
-    }
-
-    fn add(&self, tasks: ServeTasks) {
-        self.0.lock().push(tasks);
-    }
-
-    /// Wait until the tasks of every gateway left here have ended.
-    async fn wait(&self) {
-        let retiring = std::mem::take(&mut *self.0.lock());
-        for tasks in retiring {
-            if tokio::time::timeout(RETIRE_BARRIER, tasks.idle())
-                .await
-                .is_err()
-            {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                    "an earlier gateway's tasks were still running when this one started"
-                );
-            }
-        }
-    }
-}
-
-/// The gateways of this process that were aborted before their drain ran.
-static RETIRING: Retiring = Retiring::new();
-
-/// Wait for the tasks of the gateways before this one to end, so a new
-/// gateway never serves while an aborted one's tasks are still running.
-async fn previous_gateways_retired() {
-    RETIRING.wait().await;
 }
 
 /// Whether the gateway that accepted a connection still admits requests on
-/// it.
+/// it: not once it has been told to stop, and not once its tasks were
+/// cancelled (it was dropped without a stop).
 #[derive(Clone)]
 struct Admission {
     stopping: tokio::sync::watch::Receiver<bool>,
@@ -1137,13 +1103,16 @@ struct Admission {
 
 impl Admission {
     fn admits(&self) -> bool {
-        // Every request is admitted, as before.
-        let _ = (&self.stopping, &self.tasks);
-        true
+        // The stop is a value, not a change: a receiver made after it still
+        // reads it.
+        !*self.stopping.borrow() && !self.tasks.is_cancelled()
     }
 }
 
-/// Serve one request on a connection the gateway accepted.
+/// Serve one request on a connection the gateway accepted, unless the
+/// gateway has stopped since. So nothing reaches a stopped gateway's
+/// router, whichever connection or HTTP/2 stream it arrives on, an upgrade
+/// request included.
 async fn serve_while_current<S, B>(
     mut svc: S,
     admission: &Admission,
@@ -1152,8 +1121,35 @@ async fn serve_while_current<S, B>(
 where
     S: tower::Service<axum::http::Request<B>, Response = Response, Error = std::convert::Infallible>,
 {
-    let _ = admission.admits();
+    if !admission.admits() {
+        return Ok(gateway_restarting(req.version()));
+    }
     tower::Service::call(&mut svc, req).await
+}
+
+/// What a stopped gateway answers: try again on a new connection, which the
+/// next gateway serves. Nothing in it comes from the stopped gateway's
+/// configuration or state.
+fn gateway_restarting(version: axum::http::Version) -> Response {
+    let mut response = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::RETRY_AFTER, "1")],
+        Json(serde_json::json!({
+            "error": "The gateway is restarting. Try again.",
+            "reason": "gateway_restarting",
+        })),
+    )
+        .into_response();
+    // HTTP/1 closes the connection after this response. HTTP/2 has no
+    // Connection header: its connection gets GOAWAY from the graceful
+    // shutdown.
+    if version < axum::http::Version::HTTP_2 {
+        response.headers_mut().insert(
+            header::CONNECTION,
+            axum::http::HeaderValue::from_static("close"),
+        );
+    }
+    response
 }
 
 /// What the accept loop does after `accept()` failed.
@@ -1372,9 +1368,6 @@ pub async fn run_gateway_with_plugin_webhooks(
             zeroclaw_infra::fallback_gateway_bind_socket_addr(port)
         }
     };
-    // A gateway the daemon aborted may still have tasks winding down; this
-    // one serves only after they have ended.
-    previous_gateways_retired().await;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let actual_addr = listener.local_addr()?;
     let actual_port = actual_addr.port();
@@ -2820,11 +2813,12 @@ pub async fn run_gateway_with_plugin_webhooks(
     }
 
     // One accept loop for plain and TLS connections. Every connection
-    // watches this gateway's stop, and its task is owned by `connections`,
-    // so a stop reaches all of them and none outlives this gateway.
+    // watches this gateway's stop and serves through `admission`, so after
+    // the stop no request reaches this gateway's router. Its tasks are in
+    // `tasks`, so the stop also cancels whatever outlasts the drain.
     let mut app = app.into_make_service_with_connect_info::<SocketAddr>();
     let tasks = ServeTasks::default();
-    let _abort_on_drop = ServeTasksGuard::new(tasks.clone());
+    let _cancel_on_drop = ServeTasksGuard::new(tasks.clone());
     let admission = Admission {
         stopping: shutdown_rx.clone(),
         tasks: tasks.clone(),
@@ -2922,8 +2916,8 @@ pub async fn run_gateway_with_plugin_webhooks(
     }
     // Every connection finishes the request in flight and closes; whatever
     // is still open after the drain (an event stream, a connection that
-    // ignored the shutdown) is aborted, so it cannot go on serving this
-    // generation's router after a reload.
+    // ignored the shutdown) is cancelled. Nothing waits on it beyond that:
+    // it admits no request, and the next gateway can serve.
     if !tasks.retire_within(CONNECTION_DRAIN).await {
         ::zeroclaw_log::record!(
             DEBUG,
@@ -7591,7 +7585,7 @@ path = "{trigger_path}"
         driver.abort();
     }
 
-    /// Retiring waits until the tasks it aborted have actually ended, so
+    /// Retiring waits until the tasks it cancelled have actually ended, so
     /// nothing they owned outlives it.
     #[tokio::test]
     async fn retiring_waits_until_the_aborted_tasks_have_ended() {
@@ -7632,7 +7626,7 @@ path = "{trigger_path}"
         );
     }
 
-    /// Retiring takes at most the drain plus the join of what it aborted,
+    /// Retiring takes at most the drain plus the join of what it cancelled,
     /// which together fit inside the daemon's 500 ms grace.
     #[tokio::test]
     async fn retiring_ends_within_the_daemons_grace() {
