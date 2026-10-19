@@ -39,18 +39,23 @@ export const CSRF_HEADER = 'X-ZeroClaw-CSRF';
 
 /**
  * Window events the auth layer dispatches. `unauthorized` drops to the sign-in
- * screen; `reauth` asks for a new sign-in while keeping the page; `accessLost`
- * asks the auth provider to re-check the session; `resumed` tells stopped
- * sockets and streams that a session is usable again.
+ * screen; `reauth` asks for a new sign-in while keeping the page;
+ * `sessionEnded` (a socket's session ended) and `accessLost` ask the auth
+ * provider to re-check the session first; `resumed` tells stopped sockets and
+ * streams that a session is usable again.
  */
 export const AUTH_EVENTS = {
   unauthorized: 'zeroclaw-unauthorized',
   reauth: 'zeroclaw-reauth',
+  sessionEnded: 'zeroclaw-session-ended',
   accessLost: 'zeroclaw-access-lost',
   resumed: 'zeroclaw-auth-resumed',
 } as const;
 
 let oidcSession: OidcSession | null = null;
+// The session expired and the page waits for a new sign-in. Sockets and
+// streams don't retry on a timer meanwhile: every attempt would be refused.
+let reauthPending = false;
 // Server clock minus browser clock, in ms, measured when the session was read.
 // Expiry is computed on the server's clock so a skewed browser clock can't
 // make a fresh session look expired.
@@ -72,10 +77,20 @@ export function getClockOffsetMs(): number {
   return clockOffsetMs;
 }
 
+/** True while the page waits for a new sign-in after the session expired. */
+export function isReauthPending(): boolean {
+  return reauthPending;
+}
+
+export function markReauthPending(pending: boolean): void {
+  reauthPending = pending;
+}
+
 /** Enter (or refresh) OIDC mode, or leave it with `null`. */
 export function setOidcSession(session: OidcSession | null, offsetMs = 0): void {
   oidcSession = session;
   clockOffsetMs = session ? offsetMs : 0;
+  reauthPending = false;
   for (const listener of [...sessionListeners]) listener(session);
 }
 

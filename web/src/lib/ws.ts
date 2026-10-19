@@ -1,5 +1,5 @@
 import type { ApprovalDecision, WsMessage } from '../types/api';
-import { AUTH_EVENTS, getToken } from './auth';
+import { AUTH_EVENTS, getToken, isReauthPending } from './auth';
 import { apiOrigin, basePath } from './basePath';
 import { isTauri } from './tauri';
 
@@ -33,6 +33,30 @@ const MAX_RECONNECT_DELAY = 30000;
 export const WS_CLOSE_SESSION_ENDED = 4401;
 /** The gateway closed a signed-in session's socket: its access was removed. */
 export const WS_CLOSE_ACCESS_LOST = 4403;
+
+/**
+ * Route a socket close under dashboard sign-in. Returns true when the socket
+ * must wait for `AUTH_EVENTS.resumed` instead of reconnecting on a timer:
+ *
+ * - 4401: the session the socket was opened under ended. The auth layer
+ *   re-reads the current session first, since an early re-auth may already
+ *   have replaced it, and prompts only if there is none.
+ * - 4403: the session lost access to this socket.
+ * - any code while a re-auth is pending: every attempt would be refused.
+ *
+ * Other closes (1001 when the gateway reloads, network drops) reconnect.
+ */
+export function routeSessionClose(code: number): boolean {
+  if (code === WS_CLOSE_SESSION_ENDED) {
+    window.dispatchEvent(new Event(AUTH_EVENTS.sessionEnded));
+    return true;
+  }
+  if (code === WS_CLOSE_ACCESS_LOST) {
+    window.dispatchEvent(new Event(AUTH_EVENTS.accessLost));
+    return true;
+  }
+  return isReauthPending();
+}
 
 export class WebSocketClient {
   private ws: WebSocket | null = null;
@@ -107,13 +131,9 @@ export class WebSocketClient {
 
     this.ws.onclose = (ev: CloseEvent) => {
       this.onClose?.(ev);
-      if (ev.code === WS_CLOSE_SESSION_ENDED || ev.code === WS_CLOSE_ACCESS_LOST) {
+      if (this.intentionallyClosed) return;
+      if (routeSessionClose(ev.code)) {
         this.haltedForAuth = true;
-        window.dispatchEvent(
-          new Event(
-            ev.code === WS_CLOSE_SESSION_ENDED ? AUTH_EVENTS.reauth : AUTH_EVENTS.accessLost,
-          ),
-        );
         return;
       }
       this.scheduleReconnect();

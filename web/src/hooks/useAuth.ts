@@ -17,6 +17,7 @@ import {
   getClockOffsetMs,
   getOidcSession,
   providerAlias,
+  markReauthPending,
   setOidcSession,
   subscribeOidcSession,
   type AuthMode,
@@ -127,6 +128,11 @@ export function AuthProvider({ children }: AuthProviderProps) {
   phaseRef.current = phase;
   reauthRequiredRef.current = reauthRequired;
   providersRef.current = providers;
+
+  // Sockets and streams read this to stop timed retries while re-auth is due.
+  useEffect(() => {
+    markReauthPending(reauthRequired);
+  }, [reauthRequired]);
 
   const channelRef = useRef<BroadcastChannel | null>(null);
   const post = useCallback((message: AuthChannelMessage) => {
@@ -246,15 +252,27 @@ export function AuthProvider({ children }: AuthProviderProps) {
     const onReauth = () => {
       if (phaseRef.current === 'oidc') setReauthRequired(true);
     };
+    // A socket's session ended (4401). After an early re-auth the browser
+    // already holds a newer session: resuming reconnects the socket onto it.
+    // Only when there is none does the page ask for a new sign-in.
+    const onSessionEnded = () => {
+      if (phaseRef.current !== 'oidc') return;
+      void refreshOidcSession().then((outcome) => {
+        if (phaseRef.current !== 'oidc') return;
+        if (outcome !== 'resumed' && outcome !== 'reloading') setReauthRequired(true);
+      });
+    };
     const onAccessLost = () => {
       if (phaseRef.current === 'oidc') void recheck();
     };
     window.addEventListener(AUTH_EVENTS.unauthorized, onUnauthorized);
     window.addEventListener(AUTH_EVENTS.reauth, onReauth);
+    window.addEventListener(AUTH_EVENTS.sessionEnded, onSessionEnded);
     window.addEventListener(AUTH_EVENTS.accessLost, onAccessLost);
     return () => {
       window.removeEventListener(AUTH_EVENTS.unauthorized, onUnauthorized);
       window.removeEventListener(AUTH_EVENTS.reauth, onReauth);
+      window.removeEventListener(AUTH_EVENTS.sessionEnded, onSessionEnded);
       window.removeEventListener(AUTH_EVENTS.accessLost, onAccessLost);
     };
   }, [dropToSignedOut, recheck]);
