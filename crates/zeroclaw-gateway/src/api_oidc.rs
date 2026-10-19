@@ -19,6 +19,17 @@
 //!   manual copy fallback. No cookies, no session: clients keep
 //!   authenticating per request with the route-layer headers.
 //!
+//! Opt-in dashboard sign-in (`[gateway.dashboard_sign_in]`) reuses the same
+//! flow store, limits and callback, and ends in a session instead of a
+//! token page (see `dashboard_session`):
+//!
+//! - `GET  /api/auth/methods` lists the providers the dashboard offers.
+//! - `GET  /auth/sign-in/{alias}` starts a dashboard sign-in bound to the
+//!   starting browser by a short-lived cookie; `/oidc/callback` finishes
+//!   it with a session cookie, the token staying in the gateway.
+//! - `GET  /api/auth/session` says who the browser is signed in as.
+//! - `POST /auth/sign-out` ends the session.
+//!
 //! Because nothing here is authenticated, every route is bounded *before*
 //! it can cause outbound work, by four independent limits held in
 //! `OidcEnrollmentState`: an attempt limiter refuses clients that are
@@ -50,9 +61,13 @@ use axum::{
     routing::{get, post},
 };
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use tokio::sync::{Semaphore, SemaphorePermit};
 use zeroclaw_runtime::security::auth_provider::{DevicePollOutcome, Enrollment, PkceFlow};
 
+use crate::dashboard_session::{
+    self, CookieScope, DashboardAuth, DashboardCaller, SessionRejection, SignInRefusal,
+};
 use crate::{AppState, SlidingWindowRateLimiter};
 
 const FLOW_TTL: Duration = Duration::from_secs(600);
@@ -113,6 +128,26 @@ struct PendingPkce {
     /// The client this flow was started for, under the same key the
     /// limiters bill, so one caller's share can be counted.
     client: String,
+    /// What the callback does with the token: hand it over (enrollment) or
+    /// keep it behind a dashboard session. Stored here, never read from the
+    /// callback's query, so a callback cannot choose its own mode.
+    mode: FlowMode,
+}
+
+enum FlowMode {
+    /// `GET /oidc/login/{alias}`: the one-time token page.
+    Enrollment,
+    /// `GET /auth/sign-in/{alias}`: a dashboard session.
+    Dashboard {
+        /// SHA-256 of the binding cookie set on the browser that started
+        /// the flow. The callback must present the cookie.
+        binding_hash: [u8; 32],
+        /// Where to land afterwards, below the gateway's path prefix.
+        return_to: String,
+        /// Re-authentication in a popup: answer with a page that tells the
+        /// opener's other tabs and closes, instead of a redirect.
+        popup: bool,
+    },
 }
 
 /// In-flight PKCE flows keyed by `state`, following the pairing-store
@@ -237,6 +272,10 @@ pub(crate) fn routes_with(enrollment_state: Arc<OidcEnrollmentState>) -> Router<
         .route("/api/oidc/{alias}/device/poll", post(handle_device_poll))
         .route("/oidc/login/{alias}", get(handle_pkce_login))
         .route("/oidc/callback", get(handle_pkce_callback))
+        .route("/auth/sign-in/{alias}", get(handle_dashboard_sign_in))
+        .route("/api/auth/methods", get(handle_auth_methods))
+        .route("/api/auth/session", get(handle_auth_session))
+        .route("/auth/sign-out", post(handle_sign_out))
         .layer(axum::middleware::from_fn(no_store))
         .layer(Extension(enrollment_state))
 }
@@ -511,17 +550,15 @@ async fn handle_device_poll(
     }
 }
 
-/// The callback URI this deployment's browser flow lands on, derived
-/// from the request the user's browser just made. A spoofed Host cannot
-/// redeem anything: the IdP only accepts registered redirect URIs, and
-/// the exchange later uses the exact URI stored at flow start.
-fn callback_uri(state: &AppState, headers: &HeaderMap) -> Result<String, Box<Response>> {
+/// The scheme the browser used to reach this gateway: a forwarded proto
+/// only where the deployment trusts its proxy, else the listener's own.
+fn request_scheme(state: &AppState, headers: &HeaderMap) -> String {
     let forwarded_proto = state
         .trust_forwarded_headers
         .then(|| headers.get("x-forwarded-proto"))
         .flatten()
         .and_then(|v| v.to_str().ok());
-    let scheme = match forwarded_proto {
+    match forwarded_proto {
         Some(proto) => proto.to_string(),
         None => {
             // A `[gateway.tls]` block that is present but not enabled is
@@ -542,7 +579,22 @@ fn callback_uri(state: &AppState, headers: &HeaderMap) -> Result<String, Box<Res
                 "http".into()
             }
         }
-    };
+    }
+}
+
+/// Whether the browser reached this gateway over HTTPS, by the same rule
+/// the callback URI uses. Decides `Secure` cookies and the dashboard's
+/// own origin.
+pub(crate) fn request_is_https(state: &AppState, headers: &HeaderMap) -> bool {
+    request_scheme(state, headers).eq_ignore_ascii_case("https")
+}
+
+/// The callback URI this deployment's browser flow lands on, derived
+/// from the request the user's browser just made. A spoofed Host cannot
+/// redeem anything: the IdP only accepts registered redirect URIs, and
+/// the exchange later uses the exact URI stored at flow start.
+fn callback_uri(state: &AppState, headers: &HeaderMap) -> Result<String, Box<Response>> {
+    let scheme = request_scheme(state, headers);
     let host = headers
         .get(axum::http::header::HOST)
         .and_then(|v| v.to_str().ok())
@@ -603,10 +655,296 @@ async fn handle_pkce_login(
         flow,
         created: Instant::now(),
         client: key,
+        mode: FlowMode::Enrollment,
     }) {
         return too_many_requests(full, CAPACITY_RETRY_AFTER_SECS);
     }
     Redirect::temporary(&authorize_url).into_response()
+}
+
+/// Longest `return` path a dashboard sign-in accepts.
+const MAX_RETURN_PATH_BYTES: usize = 512;
+
+#[derive(Deserialize)]
+struct SignInQuery {
+    #[serde(default, rename = "return")]
+    return_to: Option<String>,
+    #[serde(default)]
+    popup: Option<String>,
+}
+
+/// Where a sign-in may land: a path on this dashboard, never another site.
+/// Anything else lands on the dashboard's root.
+fn safe_return_path(raw: Option<&str>) -> String {
+    match raw {
+        Some(path)
+            if path.starts_with('/')
+                && !path.starts_with("//")
+                && path.len() <= MAX_RETURN_PATH_BYTES
+                && path.bytes().all(|b| (0x21..=0x7e).contains(&b) && b != b'\\') =>
+        {
+            path.to_string()
+        }
+        _ => "/".to_string(),
+    }
+}
+
+/// Whether the request reached this gateway on the machine it runs on: a
+/// loopback peer that also named a loopback host.
+fn is_loopback_request(peer: SocketAddr, headers: &HeaderMap) -> bool {
+    if !peer.ip().is_loopback() {
+        return false;
+    }
+    let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let host = host.trim();
+    let name = match host.strip_prefix('[') {
+        Some(bracketed) => bracketed.split(']').next().unwrap_or_default(),
+        None => host.rsplit_once(':').map_or(host, |(name, _)| name),
+    };
+    name.eq_ignore_ascii_case("localhost")
+        || name
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Fixed page for a dashboard sign-in that cannot start here.
+fn sign_in_unavailable_page(status: StatusCode, explanation: &'static str) -> Response {
+    (
+        status,
+        Html(format!(
+            "<!doctype html><meta charset=\"utf-8\"><title>Sign-in unavailable</title>\
+             <body style=\"font-family:system-ui;margin:3rem\"><h1>Sign-in unavailable</h1>\
+             <p>{explanation}</p>"
+        )),
+    )
+        .into_response()
+}
+
+/// `GET /auth/sign-in/{alias}`: start a dashboard sign-in. The same
+/// Authorization Code + PKCE flow, store, limits and redirect URI as
+/// `GET /oidc/login/{alias}`, with two differences: the flow is bound to
+/// this browser by a short-lived cookie, and the callback ends in a
+/// dashboard session instead of a token page.
+async fn handle_dashboard_sign_in(
+    State(state): State<AppState>,
+    Extension(relay): Extension<Arc<OidcEnrollmentState>>,
+    Extension(dashboard): Extension<Arc<DashboardAuth>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(alias): Path<String>,
+    Query(query): Query<SignInQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let key = client_key(&state, peer, &headers);
+    if let Err(denied) = auth_gate(&relay, &key, false) {
+        return *denied;
+    }
+    if let Err(denied) = budget_gate(&relay, &key) {
+        return *denied;
+    }
+    let offered = {
+        let config = state.config.read();
+        config.gateway.dashboard_sign_in.offers(&alias) && config.oidc.contains_key(&alias)
+    };
+    if !offered {
+        return sign_in_unavailable_page(
+            StatusCode::NOT_FOUND,
+            "This dashboard does not offer that sign-in. Go back and choose another, or pair \
+             this browser.",
+        );
+    }
+    let https = request_is_https(&state, &headers);
+    if !https && !is_loopback_request(peer, &headers) {
+        return sign_in_unavailable_page(
+            StatusCode::BAD_REQUEST,
+            "Dashboard sign-in needs HTTPS. Pair this browser instead, or ask the operator \
+             to enable TLS on the gateway.",
+        );
+    }
+    if !dashboard.sessions.has_room() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"alias": alias})),
+            "dashboard sign-in refused: session store is full"
+        );
+        return sessions_full_page();
+    }
+    let enrollment = match enrollment_for(&state, &alias) {
+        Ok(enrollment) => enrollment,
+        Err(response) => return *response,
+    };
+    let redirect_uri = match callback_uri(&state, &headers) {
+        Ok(uri) => uri,
+        Err(response) => return *response,
+    };
+    if !relay.flows.has_capacity(&key) {
+        return too_many_requests(FLOW_STORE_FULL, CAPACITY_RETRY_AFTER_SECS);
+    }
+    relay.attempts.record_attempt(&key);
+    let flow = {
+        let Some(_permit) = outbound_permit(&relay) else {
+            return relay_busy();
+        };
+        match enrollment.pkce_start(&redirect_uri).await {
+            Ok(flow) => flow,
+            Err(e) => return error_json(StatusCode::BAD_GATEWAY, &format!("{e}")),
+        }
+    };
+    let binding = dashboard_session::random_token();
+    let authorize_url = flow.authorize_url.clone();
+    if let Err(full) = relay.flows.insert(PendingPkce {
+        alias,
+        flow,
+        created: Instant::now(),
+        client: key,
+        mode: FlowMode::Dashboard {
+            binding_hash: dashboard_session::session_key(&binding),
+            return_to: safe_return_path(query.return_to.as_deref()),
+            popup: query.popup.as_deref() == Some("1"),
+        },
+    }) {
+        return too_many_requests(full, CAPACITY_RETRY_AFTER_SECS);
+    }
+    let scope = CookieScope {
+        https,
+        path_prefix: &state.path_prefix,
+    };
+    let mut response = Redirect::temporary(&authorize_url).into_response();
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        scope.binding_cookie(&binding, FLOW_TTL.as_secs()),
+    );
+    response
+}
+
+/// `GET /api/auth/methods`: how this dashboard can be signed in to. Public,
+/// because the sign-in screen needs it before any credential exists; it
+/// names only providers the operator chose to offer.
+async fn handle_auth_methods(
+    State(state): State<AppState>,
+    Extension(relay): Extension<Arc<OidcEnrollmentState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    let key = client_key(&state, peer, &headers);
+    if let Err(denied) = auth_gate(&relay, &key, false) {
+        return *denied;
+    }
+    if let Err(denied) = budget_gate(&relay, &key) {
+        return *denied;
+    }
+    let oidc: Vec<serde_json::Value> = {
+        let config = state.config.read();
+        config
+            .gateway
+            .dashboard_sign_in
+            .oidc
+            .iter()
+            .filter(|alias| config.oidc.contains_key(*alias))
+            .map(|alias| serde_json::json!({"alias": alias, "provider": format!("oidc.{alias}")}))
+            .collect()
+    };
+    Json(serde_json::json!({
+        "pairing_required": state.pairing.require_pairing(),
+        "oidc": oidc,
+    }))
+    .into_response()
+}
+
+/// The pairing prompt, unchanged from the gateway's existing denial.
+fn pair_first() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({
+            "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
+        })),
+    )
+        .into_response()
+}
+
+/// `GET /api/auth/session`: who this browser is signed in as. For a
+/// session this carries the CSRF token the dashboard sends on requests that
+/// change state; `no-store` keeps it out of caches.
+async fn handle_auth_session(
+    State(state): State<AppState>,
+    caller: Option<Extension<DashboardCaller>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(token) = crate::api::extract_bearer_token(&headers).filter(|t| !t.is_empty()) {
+        return if state.pairing.is_authenticated(token) {
+            Json(serde_json::json!({"kind": "pairing"})).into_response()
+        } else {
+            pair_first()
+        };
+    }
+    match caller {
+        Some(Extension(DashboardCaller::Session(session))) => {
+            let admin = session.is_admin();
+            Json(serde_json::json!({
+                "kind": "oidc",
+                "provider": format!("oidc.{}", session.alias),
+                "principal_id": session.principal().id.as_str(),
+                "display_name": session.display_name,
+                "admin": admin,
+                "expires_at": session.expires_at,
+                "csrf_token": session.csrf,
+                "features": {
+                    // Chat for other accounts needs the core session path.
+                    "chat": admin,
+                    "operator_pages": admin,
+                },
+            }))
+            .into_response()
+        }
+        Some(Extension(DashboardCaller::Rejected(rejection))) => {
+            dashboard_session::rejection_response(rejection)
+        }
+        None => pair_first(),
+    }
+}
+
+/// `POST /auth/sign-out`: end this browser's dashboard session. The session
+/// layer has already required the CSRF token and the dashboard's origin.
+/// Signing out of ZeroClaw does not sign the user out of the identity
+/// provider.
+async fn handle_sign_out(
+    State(state): State<AppState>,
+    dashboard: Option<Extension<Arc<DashboardAuth>>>,
+    caller: Option<Extension<DashboardCaller>>,
+    headers: HeaderMap,
+) -> Response {
+    let (Some(Extension(dashboard)), Some(Extension(caller))) = (dashboard, caller) else {
+        return dashboard_session::rejection_response(SessionRejection::Invalid);
+    };
+    let session = match caller {
+        DashboardCaller::Session(session) => session,
+        DashboardCaller::Rejected(rejection) => {
+            return dashboard_session::rejection_response(rejection);
+        }
+    };
+    dashboard.end(&session);
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Disconnect)
+            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+            .with_attrs(::serde_json::json!({
+                "alias": session.alias,
+                "principal_id": session.principal().id.as_str(),
+            })),
+        "dashboard sign-out"
+    );
+    let scope = CookieScope {
+        https: request_is_https(&state, &headers),
+        path_prefix: &state.path_prefix,
+    };
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    for value in scope.clear_session_cookies() {
+        response.headers_mut().append(header::SET_COOKIE, value);
+    }
+    response
 }
 
 /// No `Debug`: `code` is an authorization code, redeemable for an access
@@ -704,6 +1042,7 @@ fn success_page(provider: &str, access_token: &str, expires_in: Option<u64>) -> 
 async fn handle_pkce_callback(
     State(state): State<AppState>,
     Extension(relay): Extension<Arc<OidcEnrollmentState>>,
+    dashboard_ext: Option<Extension<Arc<DashboardAuth>>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Query(query): Query<CallbackQuery>,
@@ -755,6 +1094,41 @@ async fn handle_pkce_callback(
     let Some(code) = query.code else {
         return unproductive_callback(&relay, &key, StatusCode::BAD_REQUEST);
     };
+    // A dashboard sign-in must finish in the browser that started it.
+    // Without this check a sign-in someone else started, as themselves,
+    // could be completed here, leaving this browser signed in to their
+    // account. Checked before any outbound work.
+    let binding_hash = match &pending.mode {
+        FlowMode::Enrollment => None,
+        FlowMode::Dashboard { binding_hash, .. } => Some(*binding_hash),
+    };
+    let dashboard = match binding_hash {
+        None => None,
+        Some(binding_hash) => {
+            let bound = dashboard_session::cookie_value(&headers, dashboard_session::BINDING_COOKIE)
+                .is_some_and(|value| dashboard_session::session_key(&value) == binding_hash);
+            if !bound {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"alias": pending.alias})),
+                    "dashboard sign-in callback did not come from the browser that started it"
+                );
+                return unproductive_callback(&relay, &key, StatusCode::BAD_REQUEST);
+            }
+            let Some(Extension(dashboard)) = dashboard_ext else {
+                return unproductive_callback(&relay, &key, StatusCode::BAD_REQUEST);
+            };
+            // Refused before the code exchange, so the refusal costs the
+            // identity provider nothing and the unused code can be retried.
+            if !dashboard.sessions.has_room() {
+                relay.flows.restore(pending);
+                return sessions_full_page();
+            }
+            Some(dashboard)
+        }
+    };
     let enrollment = match enrollment_for(&state, &pending.alias) {
         Ok(enrollment) => enrollment,
         // The alias was removed while the flow was in flight: fail closed.
@@ -770,26 +1144,189 @@ async fn handle_pkce_callback(
         relay.flows.restore(pending);
         return relay_busy_page();
     };
-    match enrollment.pkce_exchange(&pending.flow, &code).await {
-        Ok(token) => success_page(
-            &format!("oidc.{}", pending.alias),
-            &token.access_token,
-            token.expires_in,
-        ),
+    let PendingPkce {
+        alias, flow, mode, ..
+    } = pending;
+    let exchanged = match mode {
+        FlowMode::Enrollment => enrollment.pkce_exchange(&flow, &code).await,
+        FlowMode::Dashboard { .. } => {
+            enrollment
+                .pkce_exchange_requiring_id_token(&flow, &code)
+                .await
+        }
+    };
+    let token = match exchanged {
+        Ok(token) => token,
         Err(e) => {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
-                        "alias": pending.alias,
+                        "alias": alias,
                         "error": format!("{e}"),
                     })),
                 "oidc browser sign-in code exchange failed"
             );
-            unproductive_callback(&relay, &key, StatusCode::BAD_GATEWAY)
+            return unproductive_callback(&relay, &key, StatusCode::BAD_GATEWAY);
+        }
+    };
+    match (mode, dashboard) {
+        (
+            FlowMode::Dashboard {
+                return_to, popup, ..
+            },
+            Some(dashboard),
+        ) => {
+            let landing = DashboardLanding {
+                alias,
+                return_to,
+                popup,
+            };
+            finish_dashboard_sign_in(&state, &dashboard, &headers, landing, token.access_token).await
+        }
+        _ => success_page(
+            &format!("oidc.{alias}"),
+            &token.access_token,
+            token.expires_in,
+        ),
+    }
+}
+
+/// Where a completed dashboard sign-in lands.
+struct DashboardLanding {
+    alias: String,
+    return_to: String,
+    popup: bool,
+}
+
+/// Turn a dashboard sign-in the identity provider completed into a session:
+/// the core's provider verifies the access token, and only then is a cookie
+/// set. A refusal here is policy (no mapped profile, a service client, a
+/// full store), not a failed authentication, so it is not billed.
+async fn finish_dashboard_sign_in(
+    state: &AppState,
+    dashboard: &DashboardAuth,
+    headers: &HeaderMap,
+    landing: DashboardLanding,
+    access_token: String,
+) -> Response {
+    let DashboardLanding {
+        alias,
+        return_to,
+        popup,
+    } = landing;
+    let lifetime = {
+        let config = state.config.read();
+        config
+            .gateway
+            .dashboard_sign_in
+            .offers(&alias)
+            .then_some(config.gateway.dashboard_sign_in.session_lifetime_secs)
+    };
+    // Sign-in for this provider was turned off while the flow was pending.
+    let Some(lifetime) = lifetime else {
+        return sign_in_refused_page();
+    };
+    match dashboard.sign_in(&alias, access_token, lifetime).await {
+        Ok((cookie, session)) => {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Connect)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                    .with_attrs(::serde_json::json!({
+                        "alias": alias,
+                        "principal_id": session.principal().id.as_str(),
+                        "admin": session.is_admin(),
+                    })),
+                "dashboard sign-in"
+            );
+            let scope = CookieScope {
+                https: request_is_https(state, headers),
+                path_prefix: &state.path_prefix,
+            };
+            let mut response = if popup {
+                signed_in_popup_page(session.principal().id.as_str())
+            } else {
+                Redirect::to(&format!("{}{return_to}", state.path_prefix)).into_response()
+            };
+            let response_headers = response.headers_mut();
+            response_headers.append(header::SET_COOKIE, scope.session_cookie(&cookie));
+            response_headers.append(header::SET_COOKIE, scope.clear_binding_cookie());
+            response
+        }
+        Err(refusal) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "alias": alias,
+                        "reason": format!("{refusal:?}"),
+                    })),
+                "dashboard sign-in refused"
+            );
+            match refusal {
+                SignInRefusal::Full => sessions_full_page(),
+                SignInRefusal::Denied | SignInRefusal::Service => sign_in_refused_page(),
+            }
         }
     }
+}
+
+/// Fixed page for a sign-in the identity provider completed but this
+/// ZeroClaw does not accept.
+fn sign_in_refused_page() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Html(
+            "<!doctype html><meta charset=\"utf-8\"><title>Sign-in not accepted</title>\
+             <body style=\"font-family:system-ui;margin:3rem\"><h1>Sign-in not accepted</h1>\
+             <p>Your identity provider signed you in, but this account can't use this \
+             ZeroClaw dashboard. Ask its operator to grant your account access, or pair \
+             this browser instead.</p>",
+        ),
+    )
+        .into_response()
+}
+
+/// Fixed page when the session store is at its cap. The retry it invites
+/// finds the flow still pending when the refusal came before the exchange.
+fn sessions_full_page() -> Response {
+    let mut response = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Html(
+            "<!doctype html><meta charset=\"utf-8\"><title>Sign-in busy</title>\
+             <body style=\"font-family:system-ui;margin:3rem\"><h1>Too many signed-in browsers</h1>\
+             <p>This ZeroClaw has reached its limit of dashboard sign-ins. Try again shortly, \
+             or ask its operator to sign out unused browsers.</p>",
+        ),
+    )
+        .into_response();
+    set_retry_after(&mut response, CAPACITY_RETRY_AFTER_SECS);
+    response
+}
+
+/// Re-authentication in a popup ends here: tell the dashboard's other tabs
+/// on a same-origin channel (which, unlike `window.opener`, survives the
+/// opener policy) and close. The page carries no token; `principal` is a
+/// digest the tabs compare to see whether the same account signed in again.
+fn signed_in_popup_page(principal_id: &str) -> Response {
+    let digest = hex::encode(&Sha256::digest(principal_id.as_bytes())[..8]);
+    Html(format!(
+        "<!doctype html><meta charset=\"utf-8\"><title>Signed in</title>\
+         <body style=\"font-family:system-ui;margin:3rem\"><h1>Signed in</h1>\
+         <p>You can close this window.</p>\
+         <script>(function () {{\
+           try {{\
+             var channel = new BroadcastChannel(\"zeroclaw-auth\");\
+             channel.postMessage({{ type: \"signed-in\", principal: \"{digest}\" }});\
+             channel.close();\
+           }} catch (e) {{}}\
+           window.close();\
+         }})();</script>"
+    ))
+    .into_response()
 }
 
 #[cfg(test)]
@@ -2399,5 +2936,43 @@ mod tests {
             ..pending
         });
         assert!(relay.flows.consume(&expired).is_none());
+    }
+
+    #[test]
+    fn a_dashboard_return_path_stays_on_this_dashboard() {
+        for (raw, landing) in [
+            (Some("/chat"), "/chat"),
+            (Some("/sessions/abc?tab=history"), "/sessions/abc?tab=history"),
+            (None, "/"),
+            (Some(""), "/"),
+            (Some("chat"), "/"),
+            (Some("//evil.example"), "/"),
+            (Some("https://evil.example"), "/"),
+            (Some("/\\evil.example"), "/"),
+            (Some("/a b"), "/"),
+            (Some("/a\r\nSet-Cookie: x=y"), "/"),
+            (Some("/\u{e9}"), "/"),
+        ] {
+            assert_eq!(safe_return_path(raw), landing, "{raw:?}");
+        }
+        let long = format!("/{}", "a".repeat(MAX_RETURN_PATH_BYTES));
+        assert_eq!(safe_return_path(Some(&long)), "/");
+    }
+
+    #[test]
+    fn plain_http_sign_in_is_for_the_machine_the_gateway_runs_on() {
+        let with_host = |host: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::HOST, HeaderValue::from_str(host).unwrap());
+            headers
+        };
+        for host in ["localhost:42617", "LOCALHOST", "127.0.0.1:42617", "[::1]:42617"] {
+            assert!(is_loopback_request(loopback(), &with_host(host)), "{host}");
+        }
+        assert!(!is_loopback_request(loopback(), &with_host("zc.example.com")));
+        assert!(!is_loopback_request(loopback(), &with_host("192.168.1.5:42617")));
+        // A loopback name from a remote peer is not the local machine.
+        assert!(!is_loopback_request(remote(), &with_host("localhost:42617")));
+        assert!(!is_loopback_request(loopback(), &HeaderMap::new()));
     }
 }

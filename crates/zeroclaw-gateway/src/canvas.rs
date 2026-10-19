@@ -181,12 +181,26 @@ pub async fn handle_ws_canvas(
             })
             .unwrap_or("");
 
-        if !state.pairing.is_authenticated(token) {
-            return (
-                StatusCode::UNAUTHORIZED,
-                "Unauthorized — provide Authorization header or Sec-WebSocket-Protocol bearer",
-            )
-                .into_response();
+        // A signed-in administrator session presents no token. The canvas
+        // feed is closed by the page that opened it; it is not watched for
+        // the session's end the way the chat socket is.
+        let session = if token.is_empty() {
+            crate::dashboard_session::operator_session(None)
+        } else {
+            crate::dashboard_session::OperatorSession::Absent
+        };
+        match session {
+            crate::dashboard_session::OperatorSession::Admitted(_) => {}
+            crate::dashboard_session::OperatorSession::Denied(denied) => return denied,
+            crate::dashboard_session::OperatorSession::Absent => {
+                if !state.pairing.is_authenticated(token) {
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        "Unauthorized — provide Authorization header or Sec-WebSocket-Protocol bearer",
+                    )
+                        .into_response();
+                }
+            }
         }
     }
 

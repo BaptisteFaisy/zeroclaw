@@ -10,6 +10,7 @@ use super::{
 };
 use crate::ws_approval::{PendingApprovals, WsApprovalChannel, new_pending_approvals};
 use axum::{
+    Extension,
     extract::{
         Query, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
@@ -139,16 +140,39 @@ fn extract_ws_token<'a>(headers: &'a HeaderMap, query_token: Option<&'a str>) ->
 /// GET /ws/chat — WebSocket upgrade for agent chat
 pub async fn handle_ws_chat(
     State(state): State<AppState>,
+    dashboard: Option<Extension<Arc<crate::dashboard_session::DashboardAuth>>>,
     Query(params): Query<WsQuery>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
+    // A signed-in dashboard session presents no token; the session layer
+    // classified it for this upgrade, the dashboard's own origin included.
+    // The in-process chat runs as the operator, so only an administrator
+    // session may open it, and the socket closes when that stops holding.
+    let mut session_watch = None;
+    if state.pairing.require_pairing()
+        && extract_ws_token(&headers, params.token.as_deref()).is_none()
+        && let Some(caller) = crate::dashboard_session::current_caller()
+    {
+        if let Err(denied) = caller.admit_operator() {
+            return denied.into_response();
+        }
+        if let (crate::dashboard_session::DashboardCaller::Session(session), Some(Extension(auth))) =
+            (caller, dashboard)
+        {
+            session_watch = Some(crate::dashboard_session::SessionWatch::new(auth, session, true));
+        }
+    }
+
     // Auth: check header, subprotocol, then query param (precedence order). On
     // success derive a STABLE transport-authenticated subject (the paired-token
     // hash) so a required-group approval policy can be satisfied over WS; an
     // operator grants approval rights to this paired device via a `ws:<token-hash>`
-    // group member. `None` when pairing is not required (no auth identity).
-    let auth_subject = if state.pairing.require_pairing() {
+    // group member. `None` when pairing is not required (no auth identity), and
+    // for a dashboard session, which grants no such membership.
+    let auth_subject = if session_watch.is_some() {
+        None
+    } else if state.pairing.require_pairing() {
         let token = extract_ws_token(&headers, params.token.as_deref()).unwrap_or("");
         match state.pairing.authenticate_and_hash(token) {
             Some(hash) => Some(hash),
@@ -200,6 +224,22 @@ pub async fn handle_ws_chat(
     let session_id = params.session_id;
     let session_name = params.name;
     let session_cwd = params.cwd.or(params.workspace_dir);
+    if let Some(watch) = &session_watch {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Connect).with_attrs(
+                ::serde_json::json!({
+                    "principal_id": watch.principal_id(),
+                    "agent": agent_alias,
+                })
+            ),
+            "dashboard chat opened by a signed-in administrator"
+        );
+    }
+    let caller = SocketCaller {
+        approval_subject: auth_subject,
+        session: session_watch,
+    };
     ws.on_upgrade(move |socket| {
         handle_socket(
             socket,
@@ -208,7 +248,7 @@ pub async fn handle_ws_chat(
             session_id,
             session_name,
             session_cwd,
-            auth_subject,
+            caller,
         )
     })
     .into_response()
@@ -247,8 +287,17 @@ where
     S: futures_util::Sink<Message> + Unpin,
     R: futures_util::Stream<Item = Result<Message, axum::Error>> + Unpin,
 {
+    close_with(sender, receiver, WS_CLOSE_GOING_AWAY, reason).await;
+}
+
+/// Close a chat socket with `code`, waiting briefly for the peer's close.
+async fn close_with<S, R>(sender: &mut S, receiver: &mut R, code: u16, reason: &'static str)
+where
+    S: futures_util::Sink<Message> + Unpin,
+    R: futures_util::Stream<Item = Result<Message, axum::Error>> + Unpin,
+{
     let close = Message::Close(Some(axum::extract::ws::CloseFrame {
-        code: WS_CLOSE_GOING_AWAY,
+        code,
         reason: axum::extract::ws::Utf8Bytes::from_static(reason),
     }));
     if sender.send(close).await.is_err() {
@@ -468,6 +517,17 @@ where
     true
 }
 
+/// Who opened a chat socket.
+struct SocketCaller {
+    // The transport-authenticated approval subject (paired-token hash), if the
+    // connection was authenticated. Threaded to SOP approval frames so a policied
+    // gate can be satisfied by an identified WS caller.
+    approval_subject: Option<String>,
+    /// The dashboard session that opened the socket, if one did. The socket
+    /// closes when the session stops admitting it.
+    session: Option<crate::dashboard_session::SessionWatch>,
+}
+
 async fn handle_socket(
     socket: WebSocket,
     state: AppState,
@@ -475,11 +535,12 @@ async fn handle_socket(
     session_id: Option<String>,
     session_name: Option<String>,
     session_cwd: Option<String>,
-    // The transport-authenticated approval subject (paired-token hash), if the
-    // connection was authenticated. Threaded to SOP approval frames so a policied
-    // gate can be satisfied by an identified WS caller.
-    auth_subject: Option<String>,
+    caller: SocketCaller,
 ) {
+    let SocketCaller {
+        approval_subject: auth_subject,
+        session: mut session_watch,
+    } = caller;
     let (mut sender, mut receiver) = socket.split();
     // An upgraded socket outlives the listener it arrived on, so a reload or
     // stop of this gateway instance has to end it here. Subscribed before any
@@ -589,6 +650,10 @@ async fn handle_socket(
             first = receiver.next() => first,
             _ = gateway_stop_signal(&mut gateway_stopping) => {
                 close_for_reconnect(&mut sender, &mut receiver, "gateway restarting").await;
+                return;
+            }
+            code = crate::dashboard_session::session_lost(&mut session_watch, &state) => {
+                close_with(&mut sender, &mut receiver, code, "dashboard session ended").await;
                 return;
             }
             _ = tick_websocket_ping(&mut ping_interval) => {
@@ -1068,6 +1133,14 @@ async fn handle_socket(
             // able to hold the close back.
             _ = gateway_stop_signal(&mut gateway_stopping) => {
                 close_for_reconnect(&mut sender, &mut receiver, "gateway restarting").await;
+                break;
+            }
+
+            // ── Dashboard session ended or lost its access ────────────
+            // Between turns, like the stop arm, and with a code the client
+            // must not answer by reconnecting.
+            code = crate::dashboard_session::session_lost(&mut session_watch, &state) => {
+                close_with(&mut sender, &mut receiver, code, "dashboard session ended").await;
                 break;
             }
 

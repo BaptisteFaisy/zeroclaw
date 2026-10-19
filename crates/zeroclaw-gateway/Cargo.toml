@@ -79,6 +79,8 @@ parking_lot = "0.12"
 toml = "1.0"
 toml_edit = "0.25"
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
+# Dashboard sign-in session and CSRF tokens.
+rand = "0.10"
 
 # Unix-only: self-signal SIGTERM to trigger the daemon's graceful shutdown for
 # supervised post-upgrade restart (version.rs).
@@ -87,7 +89,6 @@ libc = "0.2"
 
 [dev-dependencies]
 zeroclaw-config = { workspace = true, features = ["test-helpers"] }
-rand = "0.10"
 rcgen = "0.13"
 tempfile = "3.26"
 # Enables deterministic clock and shared-authority helpers for gateway fixtures;

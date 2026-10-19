@@ -33,6 +33,7 @@ pub mod api_webauthn;
 pub mod api_webhook;
 pub mod auth_rate_limit;
 pub mod canvas;
+pub mod dashboard_session;
 pub mod node_tool;
 pub mod nodes;
 pub mod openapi;
@@ -2175,6 +2176,8 @@ pub async fn run_gateway_with_plugin_webhooks(
         },
     };
 
+    let dashboard_layer_state = state.clone();
+
     // Build router with middleware
     let inner = Router::new()
         .merge(config_admin_router(&inbound_auth))
@@ -2511,6 +2514,21 @@ pub async fn run_gateway_with_plugin_webhooks(
     } else {
         inner
     };
+
+    // Dashboard sign-in sessions: classified once per request for every
+    // route, upgrades and the fallback included. A no-op unless
+    // `[gateway.dashboard_sign_in]` offers a provider.
+    let dashboard_auth = Arc::new(dashboard_session::DashboardAuth::new(
+        dashboard_session::DashboardSessions::process_shared(),
+        Arc::clone(&inbound_auth),
+    ));
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        dashboard_session::DashboardLayer {
+            state: dashboard_layer_state,
+            auth: dashboard_auth,
+        },
+        dashboard_session::layer,
+    ));
 
     let tls_enabled = config
         .gateway
