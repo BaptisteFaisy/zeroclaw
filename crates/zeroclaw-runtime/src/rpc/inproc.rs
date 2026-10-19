@@ -1019,17 +1019,18 @@ mod tests {
         .expect("the request is answered")
     }
 
-    /// Open `test-agent`'s session `sid` over the duplex.
+    /// Open a new `test-agent` session over the duplex and return its id. A
+    /// remote caller cannot choose the id of a session that does not exist
+    /// yet, so the daemon assigns it.
     async fn open_session(
         reader: &mut BufReader<tokio::io::ReadHalf<DuplexStream>>,
         writer: &mut tokio::io::WriteHalf<DuplexStream>,
-        sid: &str,
-    ) {
+    ) -> String {
         writer
             .write_all(
                 rpc_request(
                     Method::SessionNew,
-                    &serde_json::json!({ "agent_alias": "test-agent", "session_id": sid }),
+                    &serde_json::json!({ "agent_alias": "test-agent" }),
                     2,
                 )
                 .as_bytes(),
@@ -1038,6 +1039,10 @@ mod tests {
             .unwrap();
         let frame = response_to(reader, 2).await;
         assert!(frame["error"].is_null(), "session/new failed: {frame}");
+        frame["result"]["session_id"]
+            .as_str()
+            .expect("session/new returns the session id")
+            .to_string()
     }
 
     /// A file on this host, the kind of path a remote caller must not have
@@ -1053,10 +1058,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (cancel, _connector, mut reader, mut writer) =
             operator_duplex(agent_config(tmp.path()), tmp.path()).await;
-        open_session(&mut reader, &mut writer, "attach-by-path").await;
+        let session_id = open_session(&mut reader, &mut writer).await;
 
         let attach = serde_json::json!({
-            "session_id": "attach-by-path",
+            "session_id": session_id,
             "files": [{ "path": host_file(tmp.path()) }],
         });
         writer
@@ -1083,10 +1088,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (cancel, _connector, mut reader, mut writer) =
             operator_duplex(agent_config(tmp.path()), tmp.path()).await;
-        open_session(&mut reader, &mut writer, "prompt-by-path").await;
+        let session_id = open_session(&mut reader, &mut writer).await;
 
         let prompt = serde_json::json!({
-            "session_id": "prompt-by-path",
+            "session_id": session_id,
             "prompt": "summarize the attachment",
             "attachments": [{ "path": host_file(tmp.path()) }],
         });
