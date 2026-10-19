@@ -48703,54 +48703,67 @@ mod tests {
         }
 
         /// A chat backend that deletes the session (as an independent writer
-        /// such as the gateway's delete route would) right after answering an
-        /// existence check, and counts appends.
-        struct DeletedAfterCheckBackend {
+        /// such as the gateway's delete route would) right after handing out
+        /// its next transcript snapshot, and counts the writes made through it.
+        struct DeletedAfterReadBackend {
             inner: Arc<dyn zeroclaw_infra::session_backend::SessionBackend>,
-            delete_on_next_check: std::sync::atomic::AtomicBool,
+            delete_after_next_read: std::sync::atomic::AtomicBool,
             deleted: std::sync::atomic::AtomicBool,
-            appends: std::sync::atomic::AtomicUsize,
+            writes: std::sync::atomic::AtomicUsize,
         }
 
-        impl zeroclaw_infra::session_backend::SessionBackend for DeletedAfterCheckBackend {
+        impl DeletedAfterReadBackend {
+            fn after_read(&self, session_key: &str) {
+                if self
+                    .delete_after_next_read
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    assert!(self.inner.delete_session(session_key).unwrap());
+                    self.deleted
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+
+            fn wrote(&self) {
+                self.writes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        impl zeroclaw_infra::session_backend::SessionBackend for DeletedAfterReadBackend {
             fn load(&self, session_key: &str) -> Vec<zeroclaw_providers::ChatMessage> {
-                self.inner.load(session_key)
+                let snapshot = self.inner.load(session_key);
+                self.after_read(session_key);
+                snapshot
             }
             fn try_load(
                 &self,
                 session_key: &str,
             ) -> std::io::Result<Vec<zeroclaw_providers::ChatMessage>> {
-                self.inner.try_load(session_key)
+                let snapshot = self.inner.try_load(session_key);
+                self.after_read(session_key);
+                snapshot
             }
             fn append(
                 &self,
                 session_key: &str,
                 message: &zeroclaw_providers::ChatMessage,
             ) -> std::io::Result<()> {
-                self.appends
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.wrote();
                 self.inner.append(session_key, message)
             }
             fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
+                self.wrote();
                 self.inner.remove_last(session_key)
             }
             fn list_sessions(&self) -> Vec<String> {
                 self.inner.list_sessions()
             }
             fn session_exists(&self, session_key: &str) -> bool {
-                let exists = self.inner.session_exists(session_key);
-                if exists
-                    && self
-                        .delete_on_next_check
-                        .swap(false, std::sync::atomic::Ordering::SeqCst)
-                {
-                    self.inner.delete_session(session_key).unwrap();
-                    self.deleted
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                }
-                exists
+                self.inner.session_exists(session_key)
             }
             fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
+                self.wrote();
                 self.inner.delete_session(session_key)
             }
             fn set_session_agent_alias(
@@ -48758,6 +48771,7 @@ mod tests {
                 session_key: &str,
                 agent_alias: &str,
             ) -> std::io::Result<()> {
+                self.wrote();
                 self.inner.set_session_agent_alias(session_key, agent_alias)
             }
             fn rewrite_messages(
@@ -48765,6 +48779,7 @@ mod tests {
                 session_key: &str,
                 messages: &[zeroclaw_providers::ChatMessage],
             ) -> std::io::Result<()> {
+                self.wrote();
                 self.inner.rewrite_messages(session_key, messages)
             }
             fn replace_conversation_state_if_exists(
@@ -48773,6 +48788,7 @@ mod tests {
                 messages: &[zeroclaw_providers::ChatMessage],
                 breadcrumb_present: bool,
             ) -> std::io::Result<bool> {
+                self.wrote();
                 self.inner.replace_conversation_state_if_exists(
                     session_key,
                     messages,
@@ -48784,63 +48800,74 @@ mod tests {
         #[tokio::test]
         async fn a_session_deleted_while_retirement_checks_it_stays_deleted() {
             for kind in ["sqlite", "jsonl"] {
-                let tmp = tempfile::TempDir::new().unwrap();
-                let config = make_acp_test_config(&tmp);
-                let inner = zeroclaw_infra::make_session_backend(&config.data_dir, kind).unwrap();
-                let backend = Arc::new(DeletedAfterCheckBackend {
-                    inner: Arc::clone(&inner),
-                    delete_on_next_check: std::sync::atomic::AtomicBool::new(false),
-                    deleted: std::sync::atomic::AtomicBool::new(false),
-                    appends: std::sync::atomic::AtomicUsize::new(0),
-                });
-                let queue = Arc::new(SessionActorQueue::new(32, 30, 600));
-                let sessions = Arc::new(SessionStore::new(64, queue));
-                let ctx = RpcContext::for_persistence_tests(
-                    config,
-                    Arc::clone(&sessions),
-                    Some(
-                        backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>
-                    ),
-                    None,
-                );
-                let mut client = remote(&ctx, "tui_deleted");
-                let session = open(&client).await;
-                let key = format!("rpc_{session}");
-                // The store holds the first message; the reply's write failed.
-                inner
-                    .append(
-                        &key,
-                        &zeroclaw_api::model_provider::ChatMessage::user("hello"),
-                    )
-                    .unwrap();
-                sessions.seed_history(&session, &two_turns()).await;
-                disconnect(&ctx, &mut client).await;
-                backend
-                    .delete_on_next_check
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                // The store holds the first message (the reply's write failed),
+                // or both.
+                for stored in [1, 2] {
+                    let case = format!("{kind}, {stored} of 2 stored");
+                    let tmp = tempfile::TempDir::new().unwrap();
+                    let config = make_acp_test_config(&tmp);
+                    let inner =
+                        zeroclaw_infra::make_session_backend(&config.data_dir, kind).unwrap();
+                    let backend = Arc::new(DeletedAfterReadBackend {
+                        inner: Arc::clone(&inner),
+                        delete_after_next_read: std::sync::atomic::AtomicBool::new(false),
+                        deleted: std::sync::atomic::AtomicBool::new(false),
+                        writes: std::sync::atomic::AtomicUsize::new(0),
+                    });
+                    let queue = Arc::new(SessionActorQueue::new(32, 30, 600));
+                    let sessions = Arc::new(SessionStore::new(64, queue));
+                    let ctx = RpcContext::for_persistence_tests(
+                        config,
+                        Arc::clone(&sessions),
+                        Some(backend.clone()
+                            as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+                        None,
+                    );
+                    let mut client = remote(&ctx, "tui_deleted");
+                    let session = open(&client).await;
+                    let key = format!("rpc_{session}");
+                    for message in &two_turns()[..stored] {
+                        inner.append(&key, message).unwrap();
+                    }
+                    sessions.seed_history(&session, &two_turns()).await;
+                    disconnect(&ctx, &mut client).await;
+                    backend.writes.store(0, std::sync::atomic::Ordering::SeqCst);
+                    backend
+                        .delete_after_next_read
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
 
-                retire_orphaned_sessions(&ctx, Instant::now() + TIMEOUT).await;
+                    retire_orphaned_sessions(&ctx, Instant::now() + TIMEOUT).await;
 
-                assert_eq!(
-                    backend.appends.load(std::sync::atomic::Ordering::SeqCst),
-                    0,
-                    "{kind}: retirement wrote to the transcript"
-                );
-                if backend.deleted.load(std::sync::atomic::Ordering::SeqCst) {
+                    assert!(
+                        backend.deleted.load(std::sync::atomic::Ordering::SeqCst),
+                        "{case}: retirement never read the transcript"
+                    );
+                    assert_eq!(
+                        backend.writes.load(std::sync::atomic::Ordering::SeqCst),
+                        0,
+                        "{case}: retirement wrote to the store"
+                    );
                     assert!(
                         !inner.session_exists(&key),
-                        "{kind}: the deleted session came back"
+                        "{case}: the deleted session came back"
                     );
                     assert!(
-                        inner.load(&key).is_empty(),
-                        "{kind}: deleted messages came back"
+                        inner.get_session_metadata(&key).is_none(),
+                        "{case}: the deleted session's metadata came back"
                     );
+                    assert!(
+                        inner.try_load(&key).unwrap().is_empty(),
+                        "{case}: deleted messages came back"
+                    );
+                    // Only a history its store held when retirement read it is
+                    // retired; a deletion afterwards never brings it back.
+                    let live = if stored == 2 {
+                        vec![]
+                    } else {
+                        vec![session.clone()]
+                    };
+                    assert_eq!(sessions.list_ids().await, live, "{case}: live sessions");
                 }
-                assert_eq!(
-                    sessions.list_ids().await,
-                    vec![session],
-                    "{kind}: a history its store lacks must keep its session"
-                );
             }
         }
 
