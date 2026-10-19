@@ -2135,6 +2135,7 @@ async fn process_chat_message(
                             // the client arm so buffered input cannot win the race.
                             code = crate::dashboard_session::session_lost(&mut *session, state), if !client_gone => {
                                 detach_mid_turn(session_key, &turn_id, pending_approvals);
+                                *session = None;
                                 close_with(&mut *sender, &mut *receiver, code, "dashboard session ended").await;
                                 client_gone = true;
                             }
@@ -2144,6 +2145,7 @@ async fn process_chat_message(
                                     ClientFrame::Ping(payload) => {
                                         if sender.send(Message::Pong(payload)).await.is_err() {
                                             detach_mid_turn(session_key, &turn_id, pending_approvals);
+                                            *session = None;
                                             client_gone = true;
                                         }
                                         continue;
@@ -2151,6 +2153,7 @@ async fn process_chat_message(
                                     ClientFrame::Ignore => continue,
                                     ClientFrame::Gone => {
                                         detach_mid_turn(session_key, &turn_id, pending_approvals);
+                                        *session = None;
                                         client_gone = true;
                                         continue;
                                     }
@@ -2159,6 +2162,7 @@ async fn process_chat_message(
                                     crate::dashboard_session::session_admits_now(&mut *session, state).await
                                 {
                                     detach_mid_turn(session_key, &turn_id, pending_approvals);
+                                    *session = None;
                                     close_with(&mut *sender, &mut *receiver, code, "dashboard session ended").await;
                                     client_gone = true;
                                     continue;
@@ -2263,6 +2267,7 @@ async fn process_chat_message(
                                     });
                                     if sender.send(Message::Text(frame.to_string().into())).await.is_err() {
                                         detach_mid_turn(session_key, &turn_id, pending_approvals);
+                                        *session = None;
                                         client_gone = true;
                                     }
                                 }
@@ -2270,6 +2275,7 @@ async fn process_chat_message(
                             _ = tick_websocket_ping(ping_interval), if !client_gone => {
                                 if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
                                     detach_mid_turn(session_key, &turn_id, pending_approvals);
+                                    *session = None;
                                     client_gone = true;
                                 }
                             }
@@ -2353,6 +2359,7 @@ async fn process_chat_message(
                                 }
                                 if sender.send(Message::Text(ws_msg.to_string().into())).await.is_err() {
                                     detach_mid_turn(session_key, &turn_id, pending_approvals);
+                                    *session = None;
                                     client_gone = true;
                                 }
                             }
@@ -3513,17 +3520,20 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                 )
                 .expect("inbound auth builds"),
             );
-            let dashboard = Arc::new(crate::dashboard_session::DashboardAuth::new(
-                Arc::new(crate::dashboard_session::DashboardSessions::default()),
-                Arc::new(crate::principal_gate::GatewayInboundAuth::from_shared(
-                    Arc::clone(&rpc_auth),
-                )),
-            ));
             let state = AppState {
                 session_backend: Some(backend.clone()),
                 pairing,
                 ..crate::api::tests::test_state(config.clone())
             };
+            let dashboard = Arc::new(
+                crate::dashboard_session::DashboardAuth::new(
+                    Arc::new(crate::dashboard_session::DashboardSessions::default()),
+                    Arc::new(crate::principal_gate::GatewayInboundAuth::from_shared(
+                        Arc::clone(&rpc_auth),
+                    )),
+                )
+                .for_generation(&state),
+            );
             let gateway_app = Router::new()
                 .route("/ws/chat", get(handle_ws_chat))
                 .merge(crate::api_oidc::routes())

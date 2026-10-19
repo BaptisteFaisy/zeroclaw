@@ -2518,10 +2518,15 @@ pub async fn run_gateway_with_plugin_webhooks(
     // Dashboard sign-in sessions: classified once per request for every
     // route, upgrades and the fallback included. A no-op unless
     // `[gateway.dashboard_sign_in]` offers a provider.
-    let dashboard_auth = Arc::new(dashboard_session::DashboardAuth::new(
-        dashboard_session::DashboardSessions::process_shared(),
-        Arc::clone(&inbound_auth),
-    ));
+    // Bound to this generation before it serves anything, so its stop
+    // retires the sessions' sockets and refuses their later requests.
+    let dashboard_auth = Arc::new(
+        dashboard_session::DashboardAuth::new(
+            dashboard_session::DashboardSessions::process_shared(),
+            Arc::clone(&inbound_auth),
+        )
+        .for_generation(&dashboard_layer_state),
+    );
     let app = app.layer(axum::middleware::from_fn_with_state(
         dashboard_session::DashboardLayer {
             state: dashboard_layer_state,

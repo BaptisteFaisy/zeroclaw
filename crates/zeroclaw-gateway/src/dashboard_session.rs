@@ -190,6 +190,9 @@ pub struct DashboardSessions {
     /// Keys of sessions that ended by expiring, with when they expired.
     /// Holds no credential; only answers "expired" instead of "invalid".
     expired: parking_lot::Mutex<HashMap<[u8; 32], u64>>,
+    /// Whether a session may be held, so the sign-in-off path, which runs
+    /// on every request, takes no lock when nothing was ever signed in.
+    occupied: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for DashboardSessions {
@@ -319,19 +322,23 @@ impl DashboardSessions {
         };
         let view = Arc::new(SessionAuth::from_session(key, &session, None));
         sessions.insert(key, session);
+        self.occupied
+            .store(true, std::sync::atomic::Ordering::Release);
         Ok((cookie, view))
     }
 
     /// End every session: sign-in was turned off. A later re-offer of the
     /// same provider must not bring them back.
     fn end_all(&self) {
-        let mut sessions = self.sessions.lock();
-        if sessions.is_empty() {
+        if !self.occupied.load(std::sync::atomic::Ordering::Acquire) {
             return;
         }
+        let mut sessions = self.sessions.lock();
         for (_, session) in sessions.drain() {
             session.ended.cancel();
         }
+        self.occupied
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 
     fn remove_key(&self, key: &[u8; 32]) -> bool {
@@ -511,6 +518,12 @@ impl DashboardCaller {
 pub struct DashboardAuth {
     pub(crate) sessions: Arc<DashboardSessions>,
     pub(crate) inbound: Arc<GatewayInboundAuth>,
+    /// The stop signal of the generation this state was built for,
+    /// subscribed before that generation served anything. Every clone
+    /// therefore sees a stop that came after that, including one that came
+    /// before the clone was taken; the shared channel's current value alone
+    /// cannot say whether this generation was stopped.
+    stopping: Option<tokio::sync::watch::Receiver<bool>>,
     _sweeper: SweeperGuard,
 }
 
@@ -523,7 +536,10 @@ const IDLE_SWEEP: std::time::Duration = std::time::Duration::from_secs(60);
 struct SweeperGuard(Option<tokio::task::AbortHandle>);
 
 impl SweeperGuard {
-    fn start(sessions: &Arc<DashboardSessions>) -> Self {
+    fn start(
+        sessions: &Arc<DashboardSessions>,
+        config: zeroclaw_config::live::LiveConfigHandle,
+    ) -> Self {
         // Built outside a runtime (no requests can arrive either): the
         // sweeps on admission and sign-in are all there is.
         if tokio::runtime::Handle::try_current().is_err() {
@@ -539,6 +555,11 @@ impl SweeperGuard {
                 let Some(sessions) = sessions.upgrade() else {
                     break;
                 };
+                // Sign-in turned off with no request since still ends every
+                // session, so turning it back on cannot bring them back.
+                if !config.read().gateway.dashboard_sign_in.enabled() {
+                    sessions.end_all();
+                }
                 sessions.sweep_now(now_unix());
             }
         });
@@ -568,13 +589,36 @@ pub(crate) enum SignInRefusal {
 }
 
 impl DashboardAuth {
+    /// Sign-in state over `sessions`, verified by `inbound`. A served
+    /// gateway binds it to its generation with [`Self::for_generation`].
     pub fn new(sessions: Arc<DashboardSessions>, inbound: Arc<GatewayInboundAuth>) -> Self {
-        let sweeper = SweeperGuard::start(&sessions);
         Self {
             sessions,
             inbound,
-            _sweeper: sweeper,
+            stopping: None,
+            _sweeper: SweeperGuard(None),
         }
+    }
+
+    /// Bind this state to the gateway generation `state` belongs to, before
+    /// that generation serves anything: its stop retires every session watch
+    /// and refuses cookie requests from then on, a generation built with
+    /// sign-in off ends every session, and the generation's idle sweep runs
+    /// until this state is dropped.
+    pub fn for_generation(mut self, state: &AppState) -> Self {
+        self.stopping = Some(state.shutdown_tx.subscribe());
+        if !state.config.read().gateway.dashboard_sign_in.enabled() {
+            self.sessions.end_all();
+        }
+        self._sweeper = SweeperGuard::start(&self.sessions, state.config.clone());
+        self
+    }
+
+    /// Whether this state's generation was told to stop.
+    pub(crate) fn is_retired(&self) -> bool {
+        self.stopping
+            .as_ref()
+            .is_some_and(|stopping| stopping.has_changed().unwrap_or(false))
     }
 
     /// Verify the access token a dashboard sign-in was issued and store the
@@ -698,16 +742,24 @@ impl DashboardAuth {
                 None => return DashboardCaller::Rejected(SessionRejection::Expired),
             },
         };
-        let sessions = self.sessions.sessions.lock();
-        match sessions.get(&key) {
-            Some(session) => DashboardCaller::Session(Arc::new(SessionAuth::from_session(
-                key,
-                session,
-                Some(grants),
-            ))),
-            // Signed out while this request was being checked.
-            None => DashboardCaller::Rejected(SessionRejection::Invalid),
-        }
+        // Verifying again can take long enough for the session's hard
+        // expiry to pass meanwhile, with a token that is still valid.
+        let checked_at = now_unix();
+        let admitted = {
+            let sessions = self.sessions.sessions.lock();
+            match sessions.get(&key) {
+                Some(session) if session.expires_at() <= checked_at => None,
+                Some(session) => Some(DashboardCaller::Session(Arc::new(
+                    SessionAuth::from_session(key, session, Some(grants)),
+                ))),
+                // Signed out while this request was being checked.
+                None => Some(DashboardCaller::Rejected(SessionRejection::Invalid)),
+            }
+        };
+        admitted.unwrap_or_else(|| {
+            self.sessions.expire_key(&key);
+            DashboardCaller::Rejected(SessionRejection::Expired)
+        })
     }
 
     /// Verify the held token again against the current authority and keep
@@ -1025,13 +1077,19 @@ impl SessionWatch {
         let start = tokio::time::Instant::now() + SOCKET_RECHECK;
         let mut recheck = tokio::time::interval_at(start, SOCKET_RECHECK);
         recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The generation's own signal when the state is bound to one (every
+        // served gateway); otherwise this state's, from now.
+        let stopping = auth
+            .stopping
+            .clone()
+            .unwrap_or_else(|| state.shutdown_tx.subscribe());
         Self {
             auth,
             session,
             require_admin,
             recheck,
             pending: None,
-            stopping: state.shutdown_tx.subscribe(),
+            stopping,
             stopped: false,
         }
     }
@@ -1077,18 +1135,52 @@ impl SessionWatch {
     /// same checks as a request, against the current policy, rather than
     /// waiting for the periodic recheck.
     pub(crate) async fn admits_now(&mut self, state: &AppState) -> Result<(), u16> {
+        let verdict = self.check_now(state).await;
+        if verdict.is_err() {
+            // Nothing of a session that no longer admits the socket is kept.
+            self.pending = None;
+        }
+        verdict
+    }
+
+    async fn check_now(&mut self, state: &AppState) -> Result<(), u16> {
         if let Some(code) = self.known_lost() {
             return Err(code);
         }
         self.pending = None;
-        let outcome = self.auth.recheck(state, &self.session).await;
-        self.judge(outcome)
+        // A check that has to verify again can take a while. The session
+        // ending, its expiry and the generation's stop each cut it short
+        // rather than wait for it to admit the frame afterwards.
+        let remaining = self.session.expires_at.saturating_sub(now_unix());
+        let outcome = tokio::select! {
+            biased;
+            () = self.session.ended.cancelled() => return Err(WS_CLOSE_SESSION_ENDED),
+            () = tokio::time::sleep(std::time::Duration::from_secs(remaining)) => {
+                return Err(WS_CLOSE_SESSION_ENDED);
+            }
+            () = Self::generation_stopped(&mut self.stopping) => {
+                self.stopped = true;
+                return Err(WS_CLOSE_GOING_AWAY);
+            }
+            outcome = self.auth.recheck(state, &self.session) => outcome,
+        };
+        self.judge(outcome)?;
+        // Whatever ended while the check ran still ends the socket.
+        self.known_lost().map_or(Ok(()), Err)
     }
 
     /// Resolves with the close code once the session stops admitting the
     /// socket. Cancel-safe: dropping the future loses nothing, since a
     /// started recheck lives in `self.pending` and the next call resumes it.
     async fn lost(&mut self, state: &AppState) -> u16 {
+        let code = self.wait_lost(state).await;
+        // Over for good: drop a recheck still in flight, and the token copy
+        // it holds, instead of keeping them for as long as the watch lives.
+        self.pending = None;
+        code
+    }
+
+    async fn wait_lost(&mut self, state: &AppState) -> u16 {
         loop {
             if let Some(code) = self.known_lost() {
                 return code;
@@ -1224,6 +1316,11 @@ pub async fn layer(
     let Some(cookie) = scope.session_value(request.headers()) else {
         return next.run(request).await;
     };
+    // A stopped generation admits nobody: an open keep-alive or TLS
+    // connection can still reach its router after its listener closed.
+    if layer.auth.is_retired() {
+        return generation_stopped_response();
+    }
     let host = request
         .headers()
         .get(header::HOST)
@@ -1239,6 +1336,9 @@ pub async fn layer(
                 .auth
                 .admit(|alias| provider_for(&offered, alias), &cookie)
                 .await;
+            if layer.auth.is_retired() {
+                return generation_stopped_response();
+            }
             match caller {
                 DashboardCaller::Session(session) => {
                     match check_csrf(request.method(), request.headers(), &session) {
@@ -1259,6 +1359,23 @@ pub async fn layer(
     // tabs and later requests hear why ("expired") instead of the answer for
     // no credential at all. Sign-out clears it; a new sign-in replaces it.
     DASHBOARD_CALLER.scope(caller, next.run(request)).await
+}
+
+/// The answer for a cookie request that reached a stopped generation: the
+/// client tries again, and the next generation's authority decides.
+fn generation_stopped_response() -> Response {
+    let mut response = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "error": "The gateway is restarting. Try again.",
+            "reason": "gateway_restarting",
+        })),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    response
 }
 
 /// A rejected session's answer as a full response, for routes that answer
@@ -1633,7 +1750,7 @@ mod tests {
             sop_engine,
             ..base
         };
-        let auth = Arc::new(DashboardAuth::new(sessions, Arc::clone(&inbound)));
+        let auth = Arc::new(DashboardAuth::new(sessions, Arc::clone(&inbound)).for_generation(&state));
         let router = Router::new()
             .merge(crate::config_admin_router(&inbound))
             .merge(crate::api_oidc::routes())
