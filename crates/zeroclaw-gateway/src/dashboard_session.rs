@@ -3467,6 +3467,92 @@ mod tests {
         );
     }
 
+    /// Introspection requests to `server` that carried alice's access token.
+    async fn token_requests(server: &MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|request| request.url.path() == "/introspect")
+            .filter(|request| String::from_utf8_lossy(&request.body).contains("at-alice"))
+            .count()
+    }
+
+    /// A re-verification that a publish straddles never sends the held
+    /// token to the provider the alias names afterwards. Repointed at
+    /// another issuer, or at another client of the same issuer, the session
+    /// ends, and the token reaches no provider it wasn't issued for.
+    #[tokio::test]
+    async fn a_reverification_never_sends_the_token_to_a_repointed_provider() {
+        for repoint in ["issuer", "client"] {
+            let first = idp(&["admins"], "gw").await;
+            let second = idp(&["admins"], "gw").await;
+            let mut config = sign_in_config(&first.uri());
+            test_support::revalidate_after(&mut config, 2);
+            let pairing = Arc::new(PairingGuard::new(
+                true,
+                &config.gateway.paired_tokens,
+                PairingCodePolicy::default(),
+            ));
+            let rpc =
+                Arc::new(RpcInboundAuth::from_config(&config, Arc::clone(&pairing)).unwrap());
+            let inbound = Arc::new(GatewayInboundAuth::from_shared(Arc::clone(&rpc)));
+            let fixture = fixture_with(
+                config.clone(),
+                pairing,
+                inbound,
+                Arc::new(DashboardSessions::default()),
+            );
+            let signed_in = sign_in(&fixture, &first).await;
+            tokio::time::sleep(test_support::UNTIL_DUE).await;
+            test_support::slow_introspection(&first, &["admins"], "gw", Duration::from_millis(600))
+                .await;
+            let mut repointed = config;
+            let corp = repointed.oidc.get_mut("corp").unwrap();
+            if repoint == "issuer" {
+                corp.issuer = second.uri();
+            } else {
+                corp.client_id = "gw2".into();
+                corp.interactive_clients = vec!["gw2".into()];
+            }
+            let sent_before = token_requests(&first).await;
+            let publisher = Arc::clone(&rpc);
+            let (response, ()) = tokio::join!(
+                send(
+                    &fixture.router,
+                    request(
+                        "GET",
+                        "/api/operator-probe",
+                        loopback(),
+                        &[("cookie", &signed_in.cookie_header())],
+                    ),
+                ),
+                async move {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    publisher
+                        .publish_accepted(&repointed, publisher.accepted_revision() + 1)
+                        .unwrap();
+                }
+            );
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{repoint}: a session survived its provider being repointed"
+            );
+            assert_eq!(
+                token_requests(&second).await,
+                0,
+                "{repoint}: the token was sent to the provider the alias names now"
+            );
+            assert_eq!(
+                token_requests(&first).await - sent_before,
+                1,
+                "{repoint}: the token was sent again, under the repointed client"
+            );
+        }
+    }
+
     /// A generation whose stop channel has closed is over: nothing can serve
     /// it or tell it anything more. So it reads as retired, and so does a
     /// socket's watch on it, even when the stop it was sent went unseen.
