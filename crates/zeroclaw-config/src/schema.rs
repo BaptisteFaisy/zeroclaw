@@ -8295,8 +8295,9 @@ pub struct WssConfig {
     /// last connection ends (default: 1800). Past that, the daemon closes each
     /// of them that has been idle as long, has no turn running and has no
     /// approval pending, which frees its place among the daemon's live
-    /// sessions. The transcript is kept: a chat session's history is written
-    /// first, and one whose history can't be written stays open. A client
+    /// sessions. The transcript is kept: a chat session's history must be in
+    /// its store, or be added to it, and one whose history differs from its
+    /// store or can't be stored stays open. A client
     /// that reconnects with its identity in time keeps its sessions; one that
     /// returns later can't reach the closed sessions over WSS. Sessions of local clients (the
     /// RPC socket) are not affected. `0` keeps orphaned sessions open until

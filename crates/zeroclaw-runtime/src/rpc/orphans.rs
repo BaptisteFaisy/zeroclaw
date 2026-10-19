@@ -7,9 +7,10 @@
 //! restart. Once the owning identity has had no live connection for
 //! `wss.orphaned_session_timeout_secs`, each of its sessions that has been idle
 //! as long, has no turn running and has no approval pending is closed, as
-//! `session/close` would close it. A chat session's current history is written
-//! to its store first, and a session whose history cannot be written stays
-//! live; only the live session goes.
+//! `session/close` would close it. A chat session's history must already be in
+//! its store, or be added to it without rewriting what is stored, and a
+//! session whose history can't be reconciled with its store stays live; only
+//! the live session goes.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -113,11 +114,14 @@ async fn retire(
     if cancel.is_cancelled() {
         return false;
     }
-    // Decided and removed in one step: a resume, a recorded activity or a
-    // reconnect after the checks above leaves the session alone.
+    // Decided and removed in one step: a resume, a recorded activity, a
+    // reconnect or a cancellation after the checks above leaves the session
+    // alone.
     let Some(agent) = ctx
         .sessions
-        .remove_if_unchanged(&current, || is_due(ctx, &current, timeout, now))
+        .remove_if_unchanged(&current, || {
+            !cancel.is_cancelled() && is_due(ctx, &current, timeout, now)
+        })
         .await
     else {
         return false;
@@ -147,16 +151,24 @@ async fn retire(
     true
 }
 
-/// Whether the live history of `session` is held by its durable store, writing
-/// a chat session's history now if it is not.
+/// Whether the live history of `session` is held by its durable store, adding
+/// a chat session's missing messages to it if needed.
 ///
 /// An ACP session's turns each commit through its checkpoint, and a turn whose
 /// checkpoint fails removes its live session, so a live ACP session's history
-/// is already in the ACP store. A chat session's post-turn write can fail
-/// without that, and a daemon can run without a chat store, so its current
-/// history is written here with the same guarded replacement a turn uses: a
-/// deleted row is never recreated, and history it would leave nowhere keeps
-/// the session live.
+/// is already in the ACP store.
+///
+/// A chat session's post-turn write can fail, a daemon can run without a chat
+/// store, and other writers (the gateway's message route) can append to the
+/// stored transcript without the live session. So the stored transcript is
+/// compared with the live one by role and content, and nothing stored is ever
+/// rewritten:
+/// - the store already holds everything live (alone, or followed by messages
+///   another writer stored later): nothing to write;
+/// - the store holds an earlier part of it: the missing messages are appended,
+///   unless the row is gone (a deleted session is never recreated);
+/// - the two differ: the session stays live, as it does when the store can't be
+///   read or written.
 async fn transcript_is_stored(ctx: &RpcContext, session: &OwnedSession) -> bool {
     if matches!(
         ctx.sessions.chat_mode(&session.id).await,
@@ -170,32 +182,64 @@ async fn transcript_is_stored(ctx: &RpcContext, session: &OwnedSession) -> bool 
     let Ok(agent) = tokio::time::timeout(AGENT_WAIT, agent.lock()).await else {
         return false;
     };
-    let durable = zeroclaw_providers::durable_chat_messages(agent.history());
+    let live = zeroclaw_providers::durable_chat_messages(agent.history());
+    drop(agent);
     let Some(backend) = ctx.session_backend.as_ref() else {
-        return durable.is_empty();
+        return live.is_empty();
     };
-    match backend.replace_conversation_state_if_exists(
-        &format!("rpc_{}", session.id),
-        &durable,
-        agent.history_has_trim_breadcrumb(),
-    ) {
-        Ok(true) => true,
-        Ok(false) => durable.is_empty(),
-        Err(error) => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Write)
-                    .with_category(::zeroclaw_log::EventCategory::Agent)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "session_id": session.id,
-                        "error": error.to_string(),
-                    })),
-                "Could not store an orphaned session's history; keeping it live"
-            );
-            false
+    let key = format!("rpc_{}", session.id);
+    let stored = match backend.try_load(&key) {
+        Ok(stored) => stored,
+        Err(error) => return keep_live(session, "could not read its stored history", &error),
+    };
+    let common = stored
+        .iter()
+        .zip(&live)
+        .take_while(|(stored, live)| stored.role == live.role && stored.content == live.content)
+        .count();
+    if common == live.len() {
+        return true;
+    }
+    if common < stored.len() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_category(::zeroclaw_log::EventCategory::Agent)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "session_id": session.id,
+                    "stored_messages": stored.len(),
+                    "live_messages": live.len(),
+                })),
+            "An orphaned session's history differs from its store; keeping it live"
+        );
+        return false;
+    }
+    if !backend.session_exists(&key) {
+        return false;
+    }
+    for message in &live[common..] {
+        if let Err(error) = backend.append(&key, message) {
+            return keep_live(session, "could not store its history", &error);
         }
     }
+    true
+}
+
+fn keep_live(session: &OwnedSession, what: &str, error: &std::io::Error) -> bool {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Write)
+            .with_category(::zeroclaw_log::EventCategory::Agent)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({
+                "session_id": session.id,
+                "problem": what,
+                "error": error.to_string(),
+            })),
+        "Keeping an orphaned session live: its history is not safely stored"
+    );
+    false
 }
 
 /// How long to wait between checks: the timeout itself when it is short,
