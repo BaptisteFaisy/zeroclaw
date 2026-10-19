@@ -25,9 +25,11 @@ const WS_PROTOCOL: &str = "zeroclaw.v1";
 /// WS /ws/sops/runs, real-time SOP run summaries.
 pub async fn handle_ws_sop_runs(
     State(state): State<AppState>,
+    dashboard: Option<axum::Extension<std::sync::Arc<crate::dashboard_session::DashboardAuth>>>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
+    let mut session_watch = None;
     if state.pairing.require_pairing() {
         let token = headers
             .get(header::AUTHORIZATION)
@@ -46,16 +48,17 @@ pub async fn handle_ws_sop_runs(
             })
             .unwrap_or("");
 
-        // A signed-in administrator session presents no token. The run feed
-        // is closed by the page that opened it; it is not watched for the
-        // session's end the way the chat socket is.
+        // A signed-in administrator session presents no token; the feed
+        // ends when the session stops admitting it.
         let session = if token.is_empty() {
-            crate::dashboard_session::operator_session(None)
+            crate::dashboard_session::operator_session(
+                dashboard.as_ref().map(|axum::Extension(auth)| auth),
+            )
         } else {
             crate::dashboard_session::OperatorSession::Absent
         };
         match session {
-            crate::dashboard_session::OperatorSession::Admitted(_) => {}
+            crate::dashboard_session::OperatorSession::Admitted(watch) => session_watch = watch,
             crate::dashboard_session::OperatorSession::Denied(denied) => return denied,
             crate::dashboard_session::OperatorSession::Absent => {
                 if !state.pairing.is_authenticated(token) {
@@ -79,11 +82,15 @@ pub async fn handle_ws_sop_runs(
         ws
     };
 
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+    ws.on_upgrade(move |socket| handle_socket(socket, state, session_watch))
         .into_response()
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState) {
+async fn handle_socket(
+    socket: WebSocket,
+    state: AppState,
+    mut session_watch: Option<crate::dashboard_session::SessionWatch>,
+) {
     let (mut sender, mut receiver) = socket.split();
 
     // The SOP subsystem may be disabled; tell the client and close.
@@ -160,11 +167,18 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
     });
 
-    while let Some(m) = receiver.next().await {
-        match m {
-            Ok(Message::Close(_)) | Err(_) => break,
-            _ => {}
+    let read_loop = async {
+        while let Some(m) = receiver.next().await {
+            match m {
+                Ok(Message::Close(_)) | Err(_) => break,
+                _ => {}
+            }
         }
+    };
+    // A dashboard session that ends, or loses its access, ends the feed.
+    tokio::select! {
+        () = read_loop => {}
+        _ = crate::dashboard_session::session_lost(&mut session_watch, &state) => {}
     }
 
     send_task.abort();

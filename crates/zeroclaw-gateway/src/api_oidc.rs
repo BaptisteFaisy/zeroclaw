@@ -66,7 +66,8 @@ use tokio::sync::{Semaphore, SemaphorePermit};
 use zeroclaw_runtime::security::auth_provider::{DevicePollOutcome, Enrollment, PkceFlow};
 
 use crate::dashboard_session::{
-    self, CookieScope, DashboardAuth, DashboardCaller, SessionRejection, SignInRefusal,
+    self, CookieScope, DashboardAuth, DashboardCaller, ProviderPin, SessionRejection,
+    SignInRefusal,
 };
 use crate::{AppState, SlidingWindowRateLimiter};
 
@@ -795,6 +796,7 @@ async fn handle_dashboard_sign_in(
     };
     let binding = dashboard_session::random_token();
     let authorize_url = flow.authorize_url.clone();
+    let flow_state = flow.state.clone();
     if let Err(full) = relay.flows.insert(PendingPkce {
         alias,
         flow,
@@ -815,7 +817,7 @@ async fn handle_dashboard_sign_in(
     let mut response = Redirect::temporary(&authorize_url).into_response();
     response.headers_mut().append(
         header::SET_COOKIE,
-        scope.binding_cookie(&binding, FLOW_TTL.as_secs()),
+        scope.binding_cookie(&flow_state, &binding, FLOW_TTL.as_secs()),
     );
     response
 }
@@ -1105,7 +1107,12 @@ async fn handle_pkce_callback(
     let dashboard = match binding_hash {
         None => None,
         Some(binding_hash) => {
-            let bound = dashboard_session::cookie_value(&headers, dashboard_session::BINDING_COOKIE)
+            let scope = CookieScope {
+                https: request_is_https(&state, &headers),
+                path_prefix: &state.path_prefix,
+            };
+            let bound = scope
+                .binding_value(&headers, &pending.flow.state)
                 .is_some_and(|value| dashboard_session::session_key(&value) == binding_hash);
             if !bound {
                 ::zeroclaw_log::record!(
@@ -1120,13 +1127,28 @@ async fn handle_pkce_callback(
             let Some(Extension(dashboard)) = dashboard_ext else {
                 return unproductive_callback(&relay, &key, StatusCode::BAD_REQUEST);
             };
+            // The provider as configured now, and whether it is still
+            // offered: a sign-in whose provider was taken off the screen
+            // while it was pending is refused before its code is spent.
+            let offered = {
+                let config = state.config.read();
+                let sign_in = &config.gateway.dashboard_sign_in;
+                sign_in
+                    .offers(&pending.alias)
+                    .then(|| config.oidc.get(&pending.alias))
+                    .flatten()
+                    .map(|entry| (ProviderPin::of(entry), sign_in.session_lifetime_secs))
+            };
+            let Some((provider, lifetime_secs)) = offered else {
+                return sign_in_refused_page();
+            };
             // Refused before the code exchange, so the refusal costs the
             // identity provider nothing and the unused code can be retried.
             if !dashboard.sessions.has_room() {
                 relay.flows.restore(pending);
                 return sessions_full_page();
             }
-            Some(dashboard)
+            Some((dashboard, provider, lifetime_secs))
         }
     };
     let enrollment = match enrollment_for(&state, &pending.alias) {
@@ -1172,30 +1194,45 @@ async fn handle_pkce_callback(
         }
     };
     match (mode, dashboard) {
-        (
-            FlowMode::Dashboard {
-                return_to, popup, ..
-            },
-            Some(dashboard),
-        ) => {
-            let landing = DashboardLanding {
-                alias,
-                return_to,
-                popup,
-            };
-            finish_dashboard_sign_in(&state, &dashboard, &headers, landing, token.access_token).await
-        }
-        _ => success_page(
+        (FlowMode::Enrollment, _) => success_page(
             &format!("oidc.{alias}"),
             &token.access_token,
             token.expires_in,
         ),
+        (
+            FlowMode::Dashboard {
+                return_to, popup, ..
+            },
+            Some((dashboard, provider, lifetime_secs)),
+        ) => {
+            let landing = DashboardLanding {
+                alias,
+                provider,
+                lifetime_secs,
+                flow_state: flow.state.clone(),
+                client: key,
+                return_to,
+                popup,
+            };
+            finish_dashboard_sign_in(&state, &dashboard, &headers, landing, token.access_token)
+                .await
+        }
+        // A dashboard flow always has its session state by now (it returned
+        // above otherwise); never fall through to the token page.
+        (FlowMode::Dashboard { .. }, None) => failure_page(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 
-/// Where a completed dashboard sign-in lands.
+/// A completed dashboard sign-in: what it was for and where it lands.
 struct DashboardLanding {
     alias: String,
+    /// The issuer and client the alias named when the callback arrived.
+    provider: ProviderPin,
+    lifetime_secs: u64,
+    /// The flow's `state`, which names its binding cookie.
+    flow_state: String,
+    /// The client key the limiters bill, for the audit event.
+    client: String,
     return_to: String,
     popup: bool,
 }
@@ -1213,22 +1250,17 @@ async fn finish_dashboard_sign_in(
 ) -> Response {
     let DashboardLanding {
         alias,
+        provider,
+        lifetime_secs,
+        flow_state,
+        client,
         return_to,
         popup,
     } = landing;
-    let lifetime = {
-        let config = state.config.read();
-        config
-            .gateway
-            .dashboard_sign_in
-            .offers(&alias)
-            .then_some(config.gateway.dashboard_sign_in.session_lifetime_secs)
-    };
-    // Sign-in for this provider was turned off while the flow was pending.
-    let Some(lifetime) = lifetime else {
-        return sign_in_refused_page();
-    };
-    match dashboard.sign_in(&alias, access_token, lifetime).await {
+    match dashboard
+        .sign_in(&alias, provider, access_token, lifetime_secs)
+        .await
+    {
         Ok((cookie, session)) => {
             ::zeroclaw_log::record!(
                 INFO,
@@ -1238,6 +1270,7 @@ async fn finish_dashboard_sign_in(
                         "alias": alias,
                         "principal_id": session.principal().id.as_str(),
                         "admin": session.is_admin(),
+                        "client": client,
                     })),
                 "dashboard sign-in"
             );
@@ -1252,7 +1285,7 @@ async fn finish_dashboard_sign_in(
             };
             let response_headers = response.headers_mut();
             response_headers.append(header::SET_COOKIE, scope.session_cookie(&cookie));
-            response_headers.append(header::SET_COOKIE, scope.clear_binding_cookie());
+            response_headers.append(header::SET_COOKIE, scope.clear_binding_cookie(&flow_state));
             response
         }
         Err(refusal) => {
@@ -1263,6 +1296,7 @@ async fn finish_dashboard_sign_in(
                     .with_attrs(::serde_json::json!({
                         "alias": alias,
                         "reason": format!("{refusal:?}"),
+                        "client": client,
                     })),
                 "dashboard sign-in refused"
             );

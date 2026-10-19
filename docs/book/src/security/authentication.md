@@ -598,6 +598,18 @@ Things to know before turning it on:
   they paired; revoke those on the pairing page.
 - Conversations and memory created before sign-in belong to the shared
   operator. Accounts without `admin` never see them.
+- Over plain HTTP on the gateway's own machine, browsers do not keep
+  cookies apart by port, so any other local web server the browser visits
+  is sent the session cookie. Use HTTPS, or sign in only from a browser
+  you don't use for other local development servers.
+- Taking a provider off `gateway.dashboard_sign_in.oidc`, or emptying it,
+  ends the sessions it issued; offering it again does not bring them
+  back. If the `[oidc.<alias>]` entry is pointed at another issuer or
+  client, its sessions end as well, without their tokens being sent to
+  the new provider.
+- With introspection, an identity provider that cannot be reached when a
+  session is due for revalidation ends that session (it fails closed);
+  users sign in again once the provider is back.
 
 ## Credential lifecycle
 

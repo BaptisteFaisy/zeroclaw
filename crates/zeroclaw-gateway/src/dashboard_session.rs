@@ -11,7 +11,7 @@
 //! leaves the decision to the route: public routes ignore the
 //! classification, so an expired cookie never keeps the dashboard shell or
 //! the sign-in screen from loading, while every authenticated route reads it
-//! through [`current_caller`] or the request's [`DashboardCaller`] extension.
+//! through `current_caller` or the request's [`DashboardCaller`] extension.
 //!
 //! With sign-in off, which is the default, the layer is a no-op that never
 //! reads a cookie: a forged one is no credential at all.
@@ -53,9 +53,12 @@ pub(crate) const HOST_SESSION_COOKIE: &str = "__Host-zc_session";
 /// or over plain HTTP on a loopback host.
 pub(crate) const SESSION_COOKIE: &str = "zc_session";
 
-/// Short-lived cookie binding a dashboard sign-in to the browser that
-/// started it, so a callback someone else started cannot finish here.
-pub(crate) const BINDING_COOKIE: &str = "zc_signin";
+/// Name stem of the short-lived cookie that binds a dashboard sign-in to
+/// the browser that started it, so a callback someone else started cannot
+/// finish here. Each flow gets its own cookie, named after its `state`, so
+/// two sign-ins in one browser (two tabs, a re-auth popup) never overwrite
+/// each other's binding.
+const BINDING_COOKIE_STEM: &str = "zc_signin_";
 
 /// Header a cookie-authenticated request that changes state must carry,
 /// holding the session's CSRF token.
@@ -91,9 +94,29 @@ pub(crate) fn session_key(cookie_value: &str) -> [u8; 32] {
     Sha256::digest(cookie_value.as_bytes()).into()
 }
 
+/// The provider a session was signed in with, as configured then. A
+/// session whose alias now names another issuer or client is ended rather
+/// than verified again: its token must never be sent to a provider that
+/// did not issue it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProviderPin {
+    pub(crate) issuer: String,
+    pub(crate) client_id: String,
+}
+
+impl ProviderPin {
+    pub(crate) fn of(config: &zeroclaw_config::schema::OidcConfig) -> Self {
+        Self {
+            issuer: config.issuer.clone(),
+            client_id: config.effective_client_id().to_string(),
+        }
+    }
+}
+
 /// One signed-in browser.
 struct Session {
     alias: String,
+    provider: ProviderPin,
     /// The access token the sign-in was issued. Memory only; never logged
     /// and never sent anywhere but the inbound authority that verifies it.
     bearer: String,
@@ -141,6 +164,7 @@ pub(crate) struct StoreFull;
 /// A verified sign-in on its way into the store.
 struct NewSession {
     alias: String,
+    provider: ProviderPin,
     bearer: String,
     auth: ConnectionAuth,
     authority: Weak<RpcInboundAuth>,
@@ -148,10 +172,21 @@ struct NewSession {
     lifetime_secs: u64,
 }
 
+/// How long the store remembers that a session expired, so a browser
+/// that comes back with its cookie is told to sign in again rather than
+/// that its session never existed.
+const EXPIRED_MEMORY_SECS: u64 = 60 * 60;
+
+/// Expired sessions remembered at once; the oldest is forgotten first.
+const MAX_EXPIRED_REMEMBERED: usize = 1024;
+
 /// Every live dashboard session in this process.
 #[derive(Default)]
 pub struct DashboardSessions {
     sessions: parking_lot::Mutex<HashMap<[u8; 32], Session>>,
+    /// Keys of sessions that ended by expiring, with when they expired.
+    /// Holds no credential; only answers "expired" instead of "invalid".
+    expired: parking_lot::Mutex<HashMap<[u8; 32], u64>>,
 }
 
 impl std::fmt::Debug for DashboardSessions {
@@ -169,14 +204,46 @@ impl DashboardSessions {
         Arc::clone(SHARED.get_or_init(|| Arc::new(Self::default())))
     }
 
-    fn sweep(sessions: &mut HashMap<[u8; 32], Session>, now: u64) {
-        sessions.retain(|_, session| {
+    fn sweep(&self, sessions: &mut HashMap<[u8; 32], Session>, now: u64) {
+        let mut ended = Vec::new();
+        sessions.retain(|key, session| {
             let live = session.expires_at() > now;
             if !live {
                 session.ended.cancel();
+                ended.push(*key);
             }
             live
         });
+        for key in ended {
+            self.remember_expired(key, now);
+        }
+    }
+
+    fn remember_expired(&self, key: [u8; 32], now: u64) {
+        let mut expired = self.expired.lock();
+        expired.retain(|_, at| now.saturating_sub(*at) < EXPIRED_MEMORY_SECS);
+        if expired.len() >= MAX_EXPIRED_REMEMBERED
+            && let Some(oldest) = expired.iter().min_by_key(|(_, at)| **at).map(|(k, _)| *k)
+        {
+            expired.remove(&oldest);
+        }
+        expired.insert(key, now);
+    }
+
+    /// Whether `key` named a session that expired recently.
+    fn expired_recently(&self, key: &[u8; 32], now: u64) -> bool {
+        self.expired
+            .lock()
+            .get(key)
+            .is_some_and(|at| now.saturating_sub(*at) < EXPIRED_MEMORY_SECS)
+    }
+
+    /// End a session because it expired or lost its authority, remembering
+    /// that it did.
+    fn expire_key(&self, key: &[u8; 32]) {
+        if self.remove_key(key) {
+            self.remember_expired(*key, now_unix());
+        }
     }
 
     /// Whether a new sign-in could land now. Checked before the code
@@ -184,7 +251,7 @@ impl DashboardSessions {
     /// [`Self::insert`] checks again.
     pub(crate) fn has_room(&self) -> bool {
         let mut sessions = self.sessions.lock();
-        Self::sweep(&mut sessions, now_unix());
+        self.sweep(&mut sessions, now_unix());
         sessions.len() < MAX_SESSIONS
     }
 
@@ -195,6 +262,7 @@ impl DashboardSessions {
     fn insert(&self, new: NewSession, now: u64) -> Result<(String, Arc<SessionAuth>), StoreFull> {
         let NewSession {
             alias,
+            provider,
             bearer,
             auth,
             authority,
@@ -202,7 +270,7 @@ impl DashboardSessions {
             lifetime_secs,
         } = new;
         let mut sessions = self.sessions.lock();
-        Self::sweep(&mut sessions, now);
+        self.sweep(&mut sessions, now);
         let principal = auth.principal.id.clone();
         let mut own: Vec<([u8; 32], u64)> = sessions
             .iter()
@@ -225,6 +293,7 @@ impl DashboardSessions {
         let key = session_key(&cookie);
         let session = Session {
             alias,
+            provider,
             bearer,
             auth,
             authority,
@@ -239,9 +308,16 @@ impl DashboardSessions {
         Ok((cookie, view))
     }
 
-    /// End the session a cookie names. Returns whether one existed.
-    pub(crate) fn remove(&self, cookie_value: &str) -> bool {
-        self.remove_key(&session_key(cookie_value))
+    /// End every session: sign-in was turned off. A later re-offer of the
+    /// same provider must not bring them back.
+    fn end_all(&self) {
+        let mut sessions = self.sessions.lock();
+        if sessions.is_empty() {
+            return;
+        }
+        for (_, session) in sessions.drain() {
+            session.ended.cancel();
+        }
     }
 
     fn remove_key(&self, key: &[u8; 32]) -> bool {
@@ -448,78 +524,91 @@ impl DashboardAuth {
     /// Verify the access token a dashboard sign-in was issued and store the
     /// session. The token is verified by the configured provider exactly as
     /// RPC verifies a bearer; the resolved principal must be a human.
+    /// `provider` is the alias's issuer and client as configured now, which
+    /// the session is pinned to.
     pub(crate) async fn sign_in(
         &self,
         alias: &str,
+        provider: ProviderPin,
         access_token: String,
         lifetime_secs: u64,
     ) -> Result<(String, Arc<SessionAuth>), SignInRefusal> {
-        let provider = format!("oidc.{alias}");
+        let selection = format!("oidc.{alias}");
         let auth = self
             .inbound
-            .authenticate_scoped(&access_token, &provider)
+            .authenticate_scoped(&access_token, &selection)
             .await
             .map_err(|_| SignInRefusal::Denied)?;
         if auth.principal.actor == ActorKind::Service {
             return Err(SignInRefusal::Service);
         }
         let display_name = display_name(&auth);
+        let new = NewSession {
+            alias: alias.to_string(),
+            provider,
+            bearer: access_token,
+            auth,
+            authority: self.inbound.authority_ref(),
+            display_name,
+            lifetime_secs,
+        };
         self.sessions
-            .insert(
-                NewSession {
-                    alias: alias.to_string(),
-                    bearer: access_token,
-                    auth,
-                    authority: self.inbound.authority_ref(),
-                    display_name,
-                    lifetime_secs,
-                },
-                now_unix(),
-            )
+            .insert(new, now_unix())
             .map_err(|StoreFull| SignInRefusal::Full)
+    }
+
+    /// Check again, from a long-lived socket, the session a request admitted
+    /// earlier: the same checks as for a request.
+    pub(crate) async fn recheck(&self, state: &AppState, session: &SessionAuth) -> DashboardCaller {
+        let offered = offered_providers(state);
+        self.admit_key(|alias| provider_for(&offered, alias), session.key)
+            .await
     }
 
     /// The session a cookie names, checked as RPC checks a bound connection
     /// before each operation. A session that fails is ended.
-    /// Check again, from a long-lived socket, the session a request admitted
-    /// earlier; the same checks as for a request.
-    pub(crate) async fn recheck(&self, state: &AppState, session: &SessionAuth) -> DashboardCaller {
-        let offered = offered_aliases(state);
-        self.admit_key(|alias| offered.iter().any(|o| o == alias), session.key)
-            .await
+    async fn admit(
+        &self,
+        offered: impl Fn(&str) -> Option<ProviderPin>,
+        cookie: &str,
+    ) -> DashboardCaller {
+        self.admit_key(offered, session_key(cookie)).await
     }
 
-    async fn admit(&self, config_alias_offered: impl Fn(&str) -> bool, cookie: &str) -> DashboardCaller {
-        self.admit_key(config_alias_offered, session_key(cookie))
-            .await
-    }
-
+    /// `offered` answers, for an alias, the provider it names now if the
+    /// dashboard still offers it.
     async fn admit_key(
         &self,
-        config_alias_offered: impl Fn(&str) -> bool,
+        offered: impl Fn(&str) -> Option<ProviderPin>,
         key: [u8; 32],
     ) -> DashboardCaller {
         let now = now_unix();
         let snapshot = {
-            let sessions = self.sessions.sessions.lock();
+            let mut sessions = self.sessions.sessions.lock();
+            // Expired sessions go now rather than at the next sign-in, so
+            // their tokens leave memory with them.
+            self.sessions.sweep(&mut sessions, now);
             sessions.get(&key).map(|session| {
                 (
                     session.alias.clone(),
+                    session.provider.clone(),
                     session.bearer.clone(),
                     session.auth.clone(),
                     session.authority.clone(),
-                    session.expires_at(),
                 )
             })
         };
-        let Some((alias, bearer, auth, authority, expires_at)) = snapshot else {
-            return DashboardCaller::Rejected(SessionRejection::Invalid);
+        let Some((alias, pinned, bearer, auth, authority)) = snapshot else {
+            return DashboardCaller::Rejected(if self.sessions.expired_recently(&key, now) {
+                SessionRejection::Expired
+            } else {
+                SessionRejection::Invalid
+            });
         };
-        if expires_at <= now {
-            self.sessions.remove_key(&key);
-            return DashboardCaller::Rejected(SessionRejection::Expired);
-        }
-        if !config_alias_offered(&alias) {
+        // Taken off the sign-in screen, removed, or repointed at another
+        // issuer or client: the session ends before its token could be sent
+        // to a provider that did not issue it.
+        if offered(&alias).as_ref() != Some(&pinned) {
             self.sessions.remove_key(&key);
             return DashboardCaller::Rejected(SessionRejection::Invalid);
         }
@@ -544,7 +633,7 @@ impl DashboardAuth {
                 Some(fresh) => match self.inbound.current_grants(&fresh) {
                     Ok(grants) => grants,
                     Err(_) => {
-                        self.sessions.remove_key(&key);
+                        self.sessions.expire_key(&key);
                         return DashboardCaller::Rejected(SessionRejection::Expired);
                     }
                 },
@@ -582,7 +671,7 @@ impl DashboardAuth {
                 fresh
             }
             _ => {
-                self.sessions.remove_key(key);
+                self.sessions.expire_key(key);
                 return None;
             }
         };
@@ -624,11 +713,6 @@ pub(crate) fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-/// The session cookie the request carries, if any.
-pub(crate) fn session_cookie(headers: &HeaderMap) -> Option<String> {
-    cookie_value(headers, HOST_SESSION_COOKIE).or_else(|| cookie_value(headers, SESSION_COOKIE))
-}
-
 /// The scheme, host and path a dashboard cookie is scoped to.
 pub(crate) struct CookieScope<'a> {
     pub https: bool,
@@ -636,8 +720,15 @@ pub(crate) struct CookieScope<'a> {
 }
 
 impl CookieScope<'_> {
+    /// Whether this deployment can use the `__Host-` prefix: HTTPS at the
+    /// root path. Then only `__Host-` names are read, so a cookie a sibling
+    /// host planted under the plain name is never consulted.
+    fn host_prefixed(&self) -> bool {
+        self.https && self.path_prefix.is_empty()
+    }
+
     fn session_name(&self) -> &'static str {
-        if self.https && self.path_prefix.is_empty() {
+        if self.host_prefixed() {
             HOST_SESSION_COOKIE
         } else {
             SESSION_COOKIE
@@ -646,6 +737,11 @@ impl CookieScope<'_> {
 
     fn secure(&self) -> &'static str {
         if self.https { "; Secure" } else { "" }
+    }
+
+    /// The session cookie the request carries, under this scope's one name.
+    pub(crate) fn session_value(&self, headers: &HeaderMap) -> Option<String> {
+        cookie_value(headers, self.session_name())
     }
 
     /// `Set-Cookie` for a new session. No `Max-Age`: the browser keeps it
@@ -679,23 +775,43 @@ impl CookieScope<'_> {
             .collect()
     }
 
-    /// `Set-Cookie` for the sign-in binding. `Lax`, because the callback is
+    /// The binding cookie's name and path for the flow with `state`. Under
+    /// `__Host-` it must be `Path=/`; otherwise it is scoped to the
+    /// callback.
+    fn binding_name_and_path(&self, state: &str) -> (String, String) {
+        let tag = hex::encode(&Sha256::digest(state.as_bytes())[..4]);
+        if self.host_prefixed() {
+            (format!("__Host-{BINDING_COOKIE_STEM}{tag}"), "/".to_string())
+        } else {
+            (
+                format!("{BINDING_COOKIE_STEM}{tag}"),
+                format!("{}/oidc/callback", self.path_prefix),
+            )
+        }
+    }
+
+    /// The binding cookie the callback for `state` carries, if any.
+    pub(crate) fn binding_value(&self, headers: &HeaderMap, state: &str) -> Option<String> {
+        cookie_value(headers, &self.binding_name_and_path(state).0)
+    }
+
+    /// `Set-Cookie` for a sign-in's binding. `Lax`, because the callback is
     /// a cross-site top-level navigation from the identity provider and a
-    /// `Strict` cookie would not be sent with it; scoped to the callback
-    /// path and the flow's lifetime.
-    pub(crate) fn binding_cookie(&self, value: &str, max_age_secs: u64) -> HeaderValue {
+    /// `Strict` cookie would not be sent with it; it lives as long as the
+    /// flow.
+    pub(crate) fn binding_cookie(&self, state: &str, value: &str, max_age_secs: u64) -> HeaderValue {
+        let (name, path) = self.binding_name_and_path(state);
         let header = format!(
-            "{BINDING_COOKIE}={value}; Path={}/oidc/callback; HttpOnly; SameSite=Lax; Max-Age={max_age_secs}{}",
-            self.path_prefix,
+            "{name}={value}; Path={path}; HttpOnly; SameSite=Lax; Max-Age={max_age_secs}{}",
             self.secure()
         );
         HeaderValue::from_str(&header).unwrap_or_else(|_| HeaderValue::from_static(""))
     }
 
-    pub(crate) fn clear_binding_cookie(&self) -> HeaderValue {
+    pub(crate) fn clear_binding_cookie(&self, state: &str) -> HeaderValue {
+        let (name, path) = self.binding_name_and_path(state);
         let header = format!(
-            "{BINDING_COOKIE}=; Path={}/oidc/callback; HttpOnly; SameSite=Lax; Max-Age=0{}",
-            self.path_prefix,
+            "{name}=; Path={path}; HttpOnly; SameSite=Lax; Max-Age=0{}",
             self.secure()
         );
         HeaderValue::from_str(&header).unwrap_or_else(|_| HeaderValue::from_static(""))
@@ -732,7 +848,11 @@ fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
 /// requests that change state and on upgrades. `Sec-Fetch-Site`, where
 /// sent, must say the request came from this origin (or, for a plain
 /// navigation, from the user).
-fn check_origin(method: &Method, headers: &HeaderMap, own_origin: &str) -> Result<(), SessionRejection> {
+fn check_origin(
+    method: &Method,
+    headers: &HeaderMap,
+    own_origin: &str,
+) -> Result<(), SessionRejection> {
     let strict = is_unsafe(method) || is_websocket_upgrade(headers);
     match headers.get(header::ORIGIN).map(|v| v.to_str()) {
         Some(Ok(origin)) if origin.eq_ignore_ascii_case(own_origin) => {}
@@ -740,17 +860,18 @@ fn check_origin(method: &Method, headers: &HeaderMap, own_origin: &str) -> Resul
         None if strict => return Err(SessionRejection::Origin),
         None => {}
     }
-    match headers
-        .get("sec-fetch-site")
-        .and_then(|v| v.to_str().ok())
-    {
+    match headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
         None | Some("same-origin") => Ok(()),
         Some("none") if !strict => Ok(()),
         Some(_) => Err(SessionRejection::Origin),
     }
 }
 
-fn check_csrf(method: &Method, headers: &HeaderMap, session: &SessionAuth) -> Result<(), SessionRejection> {
+fn check_csrf(
+    method: &Method,
+    headers: &HeaderMap,
+    session: &SessionAuth,
+) -> Result<(), SessionRejection> {
     if !is_unsafe(method) {
         return Ok(());
     }
@@ -762,17 +883,27 @@ fn check_csrf(method: &Method, headers: &HeaderMap, session: &SessionAuth) -> Re
     }
 }
 
-/// The providers the dashboard offers now that are still configured.
-fn offered_aliases(state: &AppState) -> Vec<String> {
+/// The providers the dashboard offers now that are still configured, with
+/// the issuer and client each alias names now.
+fn offered_providers(state: &AppState) -> Vec<(String, ProviderPin)> {
     let config = state.config.read();
     config
         .gateway
         .dashboard_sign_in
         .oidc
         .iter()
-        .filter(|alias| config.oidc.contains_key(*alias))
-        .cloned()
+        .filter_map(|alias| {
+            let entry = config.oidc.get(alias)?;
+            Some((alias.clone(), ProviderPin::of(entry)))
+        })
         .collect()
+}
+
+fn provider_for(offered: &[(String, ProviderPin)], alias: &str) -> Option<ProviderPin> {
+    offered
+        .iter()
+        .find(|(offered, _)| offered == alias)
+        .map(|(_, pin)| pin.clone())
 }
 
 /// How often a long-lived socket checks its session again, so a policy
@@ -787,16 +918,27 @@ pub(crate) const WS_CLOSE_SESSION_ENDED: u16 = 4401;
 /// admits this socket (the account lost the access the socket needs).
 pub(crate) const WS_CLOSE_ACCESS_LOST: u16 = 4403;
 
+type Recheck = std::pin::Pin<Box<dyn std::future::Future<Output = DashboardCaller> + Send>>;
+
 /// A long-lived socket's view of the dashboard session that opened it.
 pub(crate) struct SessionWatch {
     auth: Arc<DashboardAuth>,
     session: Arc<SessionAuth>,
     require_admin: bool,
     recheck: tokio::time::Interval,
+    /// A recheck in progress. Kept here, not in a `lost` future, because
+    /// a socket's loop drops that future whenever another branch fires: a
+    /// busy socket would otherwise abandon every recheck that needs a round
+    /// trip to the identity provider.
+    pending: Option<Recheck>,
 }
 
 impl SessionWatch {
-    pub(crate) fn new(auth: Arc<DashboardAuth>, session: Arc<SessionAuth>, require_admin: bool) -> Self {
+    pub(crate) fn new(
+        auth: Arc<DashboardAuth>,
+        session: Arc<SessionAuth>,
+        require_admin: bool,
+    ) -> Self {
         let start = tokio::time::Instant::now() + SOCKET_RECHECK;
         let mut recheck = tokio::time::interval_at(start, SOCKET_RECHECK);
         recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -805,6 +947,7 @@ impl SessionWatch {
             session,
             require_admin,
             recheck,
+            pending: None,
         }
     }
 
@@ -813,27 +956,39 @@ impl SessionWatch {
     }
 
     /// Resolves with the close code once the session stops admitting the
-    /// socket. Cancel-safe: every await is a timer, a cancellation token, or
-    /// a recheck whose effects are complete before it returns.
+    /// socket. Cancel-safe: dropping the future loses nothing, since a
+    /// started recheck lives in `self.pending` and the next call resumes it.
     async fn lost(&mut self, state: &AppState) -> u16 {
         loop {
             let remaining = self.session.expires_at.saturating_sub(now_unix());
-            tokio::select! {
-                () = self.session.ended.cancelled() => return WS_CLOSE_SESSION_ENDED,
-                () = tokio::time::sleep(std::time::Duration::from_secs(remaining)) => {
-                    return WS_CLOSE_SESSION_ENDED;
-                }
-                _ = self.recheck.tick() => {
-                    match self.auth.recheck(state, &self.session).await {
-                        DashboardCaller::Session(session)
-                            if !self.require_admin || session.is_admin() =>
-                        {
-                            self.session = session;
-                        }
-                        DashboardCaller::Session(_) => return WS_CLOSE_ACCESS_LOST,
-                        DashboardCaller::Rejected(_) => return WS_CLOSE_SESSION_ENDED,
+            let expiry = tokio::time::sleep(std::time::Duration::from_secs(remaining));
+            let outcome = match self.pending.as_mut() {
+                Some(pending) => tokio::select! {
+                    () = self.session.ended.cancelled() => return WS_CLOSE_SESSION_ENDED,
+                    () = expiry => return WS_CLOSE_SESSION_ENDED,
+                    outcome = pending => outcome,
+                },
+                None => {
+                    tokio::select! {
+                        () = self.session.ended.cancelled() => return WS_CLOSE_SESSION_ENDED,
+                        () = expiry => return WS_CLOSE_SESSION_ENDED,
+                        _ = self.recheck.tick() => {}
                     }
+                    let auth = Arc::clone(&self.auth);
+                    let session = Arc::clone(&self.session);
+                    let state = state.clone();
+                    self.pending =
+                        Some(Box::pin(async move { auth.recheck(&state, &session).await }));
+                    continue;
                 }
+            };
+            self.pending = None;
+            match outcome {
+                DashboardCaller::Session(session) if !self.require_admin || session.is_admin() => {
+                    self.session = session;
+                }
+                DashboardCaller::Session(_) => return WS_CLOSE_ACCESS_LOST,
+                DashboardCaller::Rejected(_) => return WS_CLOSE_SESSION_ENDED,
             }
         }
     }
@@ -885,16 +1040,30 @@ pub struct DashboardLayer {
 /// Classify every request that carries a session cookie; see the module
 /// docs. Installed on the whole router, so it covers every route,
 /// WebSocket upgrades and the fallback included.
-pub async fn layer(State(layer): State<DashboardLayer>, mut request: Request, next: Next) -> Response {
+pub async fn layer(
+    State(layer): State<DashboardLayer>,
+    mut request: Request,
+    next: Next,
+) -> Response {
     request.extensions_mut().insert(Arc::clone(&layer.auth));
     let enabled = layer.state.config.read().gateway.dashboard_sign_in.enabled();
-    if !enabled || request.headers().contains_key(header::AUTHORIZATION) {
+    if !enabled {
+        // Turning sign-in off ends every session, so re-offering a provider
+        // later cannot bring them back. No cookie is read.
+        layer.auth.sessions.end_all();
         return next.run(request).await;
     }
-    let Some(cookie) = session_cookie(request.headers()) else {
+    if request.headers().contains_key(header::AUTHORIZATION) {
+        return next.run(request).await;
+    }
+    let https = crate::api_oidc::request_is_https(&layer.state, request.headers());
+    let scope = CookieScope {
+        https,
+        path_prefix: &layer.state.path_prefix,
+    };
+    let Some(cookie) = scope.session_value(request.headers()) else {
         return next.run(request).await;
     };
-    let https = crate::api_oidc::request_is_https(&layer.state, request.headers());
     let host = request
         .headers()
         .get(header::HOST)
@@ -905,10 +1074,10 @@ pub async fn layer(State(layer): State<DashboardLayer>, mut request: Request, ne
     let caller = match check_origin(request.method(), request.headers(), &own_origin) {
         Err(rejection) => DashboardCaller::Rejected(rejection),
         Ok(()) => {
-            let offered = offered_aliases(&layer.state);
+            let offered = offered_providers(&layer.state);
             let caller = layer
                 .auth
-                .admit(|alias| offered.iter().any(|offered| offered == alias), &cookie)
+                .admit(|alias| provider_for(&offered, alias), &cookie)
                 .await;
             match caller {
                 DashboardCaller::Session(session) => {
@@ -926,15 +1095,10 @@ pub async fn layer(State(layer): State<DashboardLayer>, mut request: Request, ne
         request.extensions_mut().insert(Arc::clone(session));
     }
     request.extensions_mut().insert(caller.clone());
+    let clear_values = clears.then(|| scope.clear_session_cookies());
     let mut response = DASHBOARD_CALLER.scope(caller, next.run(request)).await;
-    if clears {
-        let scope = CookieScope {
-            https,
-            path_prefix: &layer.state.path_prefix,
-        };
-        for value in scope.clear_session_cookies() {
-            response.headers_mut().append(header::SET_COOKIE, value);
-        }
+    for value in clear_values.into_iter().flatten() {
+        response.headers_mut().append(header::SET_COOKIE, value);
     }
     response
 }
@@ -1177,6 +1341,7 @@ mod tests {
     /// A started sign-in: the binding cookie and the flow's `state` and
     /// `nonce`, read back from the redirect to the identity provider.
     struct Started {
+        binding_name: String,
         binding: String,
         state: String,
         nonce: String,
@@ -1192,17 +1357,29 @@ mod tests {
             .to_str()
             .unwrap()
             .to_string();
-        let binding = cookie_from(&response, BINDING_COOKIE).expect("binding cookie set");
         let binding_cookie = set_cookies(&response)
             .into_iter()
-            .find(|c| c.starts_with(BINDING_COOKIE))
-            .unwrap();
+            .find(|c| c.starts_with(BINDING_COOKIE_STEM))
+            .expect("binding cookie set");
         assert!(binding_cookie.contains("HttpOnly"), "{binding_cookie}");
         assert!(binding_cookie.contains("SameSite=Lax"), "{binding_cookie}");
         assert!(binding_cookie.contains("Path=/oidc/callback"), "{binding_cookie}");
+        let (binding_name, rest) = binding_cookie.split_once('=').unwrap();
+        let binding = rest.split(';').next().unwrap().to_string();
+        let state = query_param(&location, "state");
+        let scope = CookieScope {
+            https: false,
+            path_prefix: "",
+        };
+        assert_eq!(
+            binding_name,
+            scope.binding_name_and_path(&state).0,
+            "the binding cookie is named after its flow"
+        );
         Started {
+            binding_name: binding_name.to_string(),
             binding,
-            state: query_param(&location, "state"),
+            state,
             nonce: query_param(&location, "nonce"),
         }
     }
@@ -1231,14 +1408,27 @@ mod tests {
     }
 
     fn callback(started: &Started, binding: Option<&str>) -> HttpRequest<Body> {
-        let cookie = binding.map(|b| format!("{BINDING_COOKIE}={b}"));
+        callback_with(started, binding, "c1", &[])
+    }
+
+    fn callback_with(
+        started: &Started,
+        binding: Option<&str>,
+        code: &str,
+        other_cookies: &[String],
+    ) -> HttpRequest<Body> {
+        let mut cookies: Vec<String> = other_cookies.to_vec();
+        if let Some(binding) = binding {
+            cookies.push(format!("{}={binding}", started.binding_name));
+        }
+        let cookie = cookies.join("; ");
         let mut headers = vec![];
-        if let Some(cookie) = cookie.as_deref() {
-            headers.push(("cookie", cookie));
+        if !cookie.is_empty() {
+            headers.push(("cookie", cookie.as_str()));
         }
         request(
             "GET",
-            &format!("/oidc/callback?state={}&code=c1", started.state),
+            &format!("/oidc/callback?state={}&code={code}", started.state),
             loopback(),
             &headers,
         )
@@ -1273,8 +1463,15 @@ mod tests {
         assert!(
             set_cookies(&response)
                 .iter()
-                .any(|c| c.starts_with(BINDING_COOKIE) && c.contains("Max-Age=0")),
+                .any(|c| c.starts_with(&started.binding_name) && c.contains("Max-Age=0")),
             "the binding cookie is cleared"
+        );
+        assert!(
+            !response
+                .headers()
+                .keys()
+                .any(|name| name.as_str().starts_with("access-control-")),
+            "no CORS grant ever rides on a cookie response"
         );
         let cookie = cookie_from(&response, SESSION_COOKIE).unwrap();
         let cookie_header = format!("{SESSION_COOKIE}={cookie}");
@@ -1643,9 +1840,17 @@ mod tests {
             .expect("the mock provider vouches for the token")
     }
 
-    fn new_session(auth: ConnectionAuth, inbound: &GatewayInboundAuth, lifetime: u64) -> NewSession {
+    fn new_session(
+        auth: ConnectionAuth,
+        inbound: &GatewayInboundAuth,
+        lifetime: u64,
+    ) -> NewSession {
         NewSession {
             alias: "corp".into(),
+            provider: ProviderPin {
+                issuer: "unused-by-store-tests".into(),
+                client_id: "gw".into(),
+            },
             bearer: "at-alice".into(),
             auth,
             authority: inbound.authority_ref(),
@@ -1760,12 +1965,41 @@ mod tests {
         assert_eq!(fixture.auth.sessions.len(), 0);
     }
 
+    /// Another browser's sign-in sweeps expired sessions out of the store.
+    /// A browser that comes back afterwards with its cookie must still be
+    /// told its sign-in expired (so it offers to sign in again), not that
+    /// the session never existed.
+    #[tokio::test]
+    async fn a_swept_session_still_answers_expired() {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let auth = verified_auth(&fixture).await;
+        let (cookie, _) = fixture
+            .auth
+            .sessions
+            .insert(new_session(auth, &fixture.auth.inbound, 0), unix_now())
+            .unwrap();
+        assert!(fixture.auth.sessions.has_room(), "the sweep runs here");
+        assert_eq!(fixture.auth.sessions.len(), 0);
+        let caller = fixture.auth.admit(|_| None, &cookie).await;
+        assert!(matches!(
+            caller,
+            DashboardCaller::Rejected(SessionRejection::Expired)
+        ));
+        // A cookie that never named a session is still invalid.
+        let caller = fixture.auth.admit(|_| None, "never-issued").await;
+        assert!(matches!(
+            caller,
+            DashboardCaller::Rejected(SessionRejection::Invalid)
+        ));
+    }
+
     #[tokio::test]
     async fn a_provider_no_longer_offered_ends_its_sessions() {
         let server = idp(&["admins"], "gw").await;
         let fixture = fixture(sign_in_config(&server.uri()));
         let signed_in = sign_in(&fixture, &server).await;
-        let caller = fixture.auth.admit(|_| false, &signed_in.cookie).await;
+        let caller = fixture.auth.admit(|_| None, &signed_in.cookie).await;
         assert!(matches!(
             caller,
             DashboardCaller::Rejected(SessionRejection::Invalid)
@@ -1852,7 +2086,7 @@ mod tests {
         let signed_in = sign_in(&fixture, &server).await;
         let DashboardCaller::Session(session) = fixture
             .auth
-            .admit(|alias| alias == "corp", &signed_in.cookie)
+            .admit(|alias| Some(pin_for(&fixture, alias)), &signed_in.cookie)
             .await
         else {
             panic!("signed in");
@@ -1893,17 +2127,235 @@ mod tests {
 
     #[test]
     fn cookies_carry_the_attributes_their_scope_needs() {
-        let https_root = CookieScope { https: true, path_prefix: "" };
+        let https_root = CookieScope {
+            https: true,
+            path_prefix: "",
+        };
         let value = https_root.session_cookie("v").to_str().unwrap().to_string();
-        assert_eq!(value, "__Host-zc_session=v; Path=/; HttpOnly; SameSite=Strict; Secure");
-        let prefixed = CookieScope { https: true, path_prefix: "/zc" };
-        let value = prefixed.session_cookie("v").to_str().unwrap().to_string();
-        assert_eq!(value, "zc_session=v; Path=/zc/; HttpOnly; SameSite=Strict; Secure");
-        let binding = prefixed.binding_cookie("b", 600).to_str().unwrap().to_string();
         assert_eq!(
-            binding,
-            "zc_signin=b; Path=/zc/oidc/callback; HttpOnly; SameSite=Lax; Max-Age=600; Secure"
+            value,
+            "__Host-zc_session=v; Path=/; HttpOnly; SameSite=Strict; Secure"
+        );
+        let prefixed = CookieScope {
+            https: true,
+            path_prefix: "/zc",
+        };
+        let value = prefixed.session_cookie("v").to_str().unwrap().to_string();
+        assert_eq!(
+            value,
+            "zc_session=v; Path=/zc/; HttpOnly; SameSite=Strict; Secure"
         );
         assert_eq!(https_root.clear_session_cookies().len(), 2);
+
+        // The binding cookie: `__Host-` at an HTTPS root (so `Path=/`),
+        // scoped to the callback otherwise; named after its flow either way.
+        let (name, _) = prefixed.binding_name_and_path("state-a");
+        let binding = prefixed.binding_cookie("state-a", "b", 600);
+        assert_eq!(
+            binding.to_str().unwrap(),
+            format!("{name}=b; Path=/zc/oidc/callback; HttpOnly; SameSite=Lax; Max-Age=600; Secure")
+        );
+        assert!(name.starts_with("zc_signin_"), "{name}");
+        let (root_name, root_path) = https_root.binding_name_and_path("state-a");
+        assert!(root_name.starts_with("__Host-zc_signin_"), "{root_name}");
+        assert_eq!(root_path, "/");
+        assert_ne!(
+            prefixed.binding_name_and_path("state-b").0,
+            name,
+            "two flows never share a binding cookie"
+        );
+    }
+
+    /// At an HTTPS root only the `__Host-` name is read, so a plain-named
+    /// cookie planted from a sibling host is never consulted.
+    #[test]
+    fn a_plain_named_cookie_is_ignored_where_host_prefixed_applies() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static("zc_session=planted"),
+        );
+        let https_root = CookieScope {
+            https: true,
+            path_prefix: "",
+        };
+        assert_eq!(https_root.session_value(&headers), None);
+        let plain_http = CookieScope {
+            https: false,
+            path_prefix: "",
+        };
+        assert_eq!(plain_http.session_value(&headers).as_deref(), Some("planted"));
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static("zc_session=planted; __Host-zc_session=real"),
+        );
+        assert_eq!(https_root.session_value(&headers).as_deref(), Some("real"));
+    }
+
+    #[tokio::test]
+    async fn two_sign_ins_started_in_one_browser_both_finish() {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let first = start(&fixture, "/auth/sign-in/corp?return=/a").await;
+        let second = start(&fixture, "/auth/sign-in/corp?return=/b").await;
+        assert_ne!(first.binding_name, second.binding_name);
+        for (started, code) in [(&first, "code-a"), (&second, "code-b")] {
+            Mock::given(http_method("POST"))
+                .and(http_path("/token"))
+                .and(wiremock::matchers::body_string_contains(format!("code={code}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "at-alice",
+                    "token_type": "Bearer",
+                    "expires_in": 600,
+                    "id_token": id_token(serde_json::json!({
+                        "iss": server.uri(),
+                        "aud": "gw",
+                        "sub": "alice",
+                        "exp": unix_now() + 600,
+                        "nonce": started.nonce,
+                    })),
+                })))
+                .mount(&server)
+                .await;
+        }
+        // The browser holds both binding cookies and sends both.
+        let both = [
+            format!("{}={}", first.binding_name, first.binding),
+            format!("{}={}", second.binding_name, second.binding),
+        ];
+        let response = send(&fixture.router, callback_with(&second, None, "code-b", &both)).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers()[header::LOCATION], "/b");
+        let response = send(&fixture.router, callback_with(&first, None, "code-a", &both)).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers()[header::LOCATION], "/a");
+    }
+
+    #[tokio::test]
+    async fn a_session_whose_alias_now_names_another_provider_ends_unverified() {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let signed_in = sign_in(&fixture, &server).await;
+        let introspections = || async {
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.url.path() == "/introspect")
+                .count()
+        };
+        let before = introspections().await;
+        let repointed = ProviderPin {
+            issuer: "https://other-idp.example.com".into(),
+            client_id: "gw".into(),
+        };
+        let caller = fixture
+            .auth
+            .admit(|_| Some(repointed.clone()), &signed_in.cookie)
+            .await;
+        assert!(matches!(
+            caller,
+            DashboardCaller::Rejected(SessionRejection::Invalid)
+        ));
+        assert_eq!(fixture.auth.sessions.len(), 0);
+        assert_eq!(
+            introspections().await,
+            before,
+            "the held token was never sent anywhere"
+        );
+    }
+
+    #[tokio::test]
+    async fn turning_sign_in_off_ends_every_session() {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let signed_in = sign_in(&fixture, &server).await;
+        assert_eq!(fixture.auth.sessions.len(), 1);
+
+        let mut off = sign_in_config(&server.uri());
+        off.gateway.dashboard_sign_in.oidc.clear();
+        let off_fixture = fixture_with(
+            off,
+            Arc::clone(&fixture.state.pairing),
+            Arc::clone(&fixture.auth.inbound),
+            Arc::clone(&fixture.auth.sessions),
+        );
+        let (status, body) = probe(&off_fixture, &[("cookie", &signed_in.cookie_header())]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(body.get("reason").is_none(), "with sign-in off the cookie is no credential");
+        assert_eq!(fixture.auth.sessions.len(), 0, "and the sessions are gone");
+
+        // Offering the provider again does not bring the old session back.
+        let (status, body) = probe(&fixture, &[("cookie", &signed_in.cookie_header())]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["reason"], "session_invalid");
+    }
+
+    /// A busy socket keeps cancelling the future `session_lost` returns; a
+    /// recheck that needs a round trip must still complete across those
+    /// cancellations instead of starting over every time.
+    #[tokio::test]
+    async fn a_recheck_survives_the_socket_loop_dropping_its_future() {
+        let server = idp(&["admins"], "gw").await;
+        let config = sign_in_config(&server.uri());
+        let fixture = fixture(config.clone());
+        let signed_in = sign_in(&fixture, &server).await;
+        let DashboardCaller::Session(session) = fixture
+            .auth
+            .admit(|alias| Some(pin_for(&fixture, alias)), &signed_in.cookie)
+            .await
+        else {
+            panic!("signed in");
+        };
+        // A reload: the next recheck must verify the token again against a
+        // new authority, and the provider now answers slowly, refusing it.
+        server.reset().await;
+        let issuer = server.uri();
+        Mock::given(http_method("GET"))
+            .and(http_path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": issuer,
+                "introspection_endpoint": format!("{issuer}/introspect"),
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(http_method("POST"))
+            .and(http_path("/introspect"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(300))
+                    .set_body_json(serde_json::json!({"active": false})),
+            )
+            .mount(&server)
+            .await;
+        let reloaded = Arc::new(DashboardAuth::new(
+            Arc::clone(&fixture.auth.sessions),
+            Arc::new(
+                GatewayInboundAuth::from_config(&config, Arc::clone(&fixture.state.pairing))
+                    .unwrap(),
+            ),
+        ));
+        let mut watch = SessionWatch::new(reloaded, session, true);
+        watch.recheck = tokio::time::interval(std::time::Duration::from_millis(1));
+        let mut watch = Some(watch);
+        // Each 20 ms slice is one turn of a busy socket's loop.
+        let mut closed = None;
+        for _ in 0..100 {
+            if let Ok(code) = tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                session_lost(&mut watch, &fixture.state),
+            )
+            .await
+            {
+                closed = Some(code);
+                break;
+            }
+        }
+        assert_eq!(closed, Some(WS_CLOSE_SESSION_ENDED));
+    }
+
+    fn pin_for(fixture: &Fixture, alias: &str) -> ProviderPin {
+        ProviderPin::of(&fixture.state.config.read().oidc[alias])
     }
 }

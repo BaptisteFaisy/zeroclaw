@@ -157,10 +157,12 @@ pub async fn handle_canvas_clear(
 /// WS /ws/canvas/:id — real-time canvas updates.
 pub async fn handle_ws_canvas(
     State(state): State<AppState>,
+    dashboard: Option<axum::Extension<std::sync::Arc<crate::dashboard_session::DashboardAuth>>>,
     Path(id): Path<String>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
+    let mut session_watch = None;
     // Auth check (same pattern as ws::handle_ws_chat)
     if state.pairing.require_pairing() {
         let token = headers
@@ -181,16 +183,17 @@ pub async fn handle_ws_canvas(
             })
             .unwrap_or("");
 
-        // A signed-in administrator session presents no token. The canvas
-        // feed is closed by the page that opened it; it is not watched for
-        // the session's end the way the chat socket is.
+        // A signed-in administrator session presents no token; the feed
+        // ends when the session stops admitting it.
         let session = if token.is_empty() {
-            crate::dashboard_session::operator_session(None)
+            crate::dashboard_session::operator_session(
+                dashboard.as_ref().map(|axum::Extension(auth)| auth),
+            )
         } else {
             crate::dashboard_session::OperatorSession::Absent
         };
         match session {
-            crate::dashboard_session::OperatorSession::Admitted(_) => {}
+            crate::dashboard_session::OperatorSession::Admitted(watch) => session_watch = watch,
             crate::dashboard_session::OperatorSession::Denied(denied) => return denied,
             crate::dashboard_session::OperatorSession::Absent => {
                 if !state.pairing.is_authenticated(token) {
@@ -217,11 +220,16 @@ pub async fn handle_ws_canvas(
         ws
     };
 
-    ws.on_upgrade(move |socket| handle_canvas_socket(socket, state, id))
+    ws.on_upgrade(move |socket| handle_canvas_socket(socket, state, id, session_watch))
         .into_response()
 }
 
-async fn handle_canvas_socket(socket: WebSocket, state: AppState, canvas_id: String) {
+async fn handle_canvas_socket(
+    socket: WebSocket,
+    state: AppState,
+    canvas_id: String,
+    mut session_watch: Option<crate::dashboard_session::SessionWatch>,
+) {
     let (mut sender, mut receiver) = socket.split();
 
     // Subscribe to canvas updates
@@ -288,11 +296,18 @@ async fn handle_canvas_socket(socket: WebSocket, state: AppState, canvas_id: Str
     });
 
     // Read loop: we mostly ignore incoming messages but handle close/ping
-    while let Some(msg) = receiver.next().await {
-        match msg {
-            Ok(Message::Close(_)) | Err(_) => break,
-            _ => {} // Ignore all other messages (pings are handled by axum)
+    let read_loop = async {
+        while let Some(msg) = receiver.next().await {
+            match msg {
+                Ok(Message::Close(_)) | Err(_) => break,
+                _ => {} // Ignore all other messages (pings are handled by axum)
+            }
         }
+    };
+    // A dashboard session that ends, or loses its access, ends the feed.
+    tokio::select! {
+        () = read_loop => {}
+        _ = crate::dashboard_session::session_lost(&mut session_watch, &state) => {}
     }
 
     // Abort the send task when the connection is closed
