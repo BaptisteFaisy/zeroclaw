@@ -1034,7 +1034,10 @@ impl ServeTasks {
             return true;
         }
         self.abort_all();
-        if tokio::time::timeout(RETIRE_JOIN, self.idle()).await.is_err() {
+        if tokio::time::timeout(RETIRE_JOIN, self.idle())
+            .await
+            .is_err()
+        {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -1149,7 +1152,10 @@ fn accept_error_action(error: &std::io::Error, tls: bool) -> AcceptErrorAction {
 
 /// Wait `delay` before accepting again. Whether the gateway was told to stop
 /// meanwhile.
-async fn accept_backoff(delay: Duration, stopping: &mut tokio::sync::watch::Receiver<bool>) -> bool {
+async fn accept_backoff(
+    delay: Duration,
+    stopping: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool {
     tokio::select! {
         () = tokio::time::sleep(delay) => false,
         () = gateway_stop_requested(stopping) => true,
@@ -7511,7 +7517,9 @@ path = "{trigger_path}"
         let request = axum::http::Request::get(format!("http://{addr}/api/events"))
             .body(())
             .unwrap();
-        let (response, _) = client.send_request(request, true).expect("send the request");
+        let (response, _) = client
+            .send_request(request, true)
+            .expect("send the request");
         let response = tokio::time::timeout(std::time::Duration::from_secs(5), response)
             .await
             .expect("response deadline")
