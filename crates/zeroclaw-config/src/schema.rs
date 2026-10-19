@@ -30625,7 +30625,10 @@ zeroclaw-operators = "operator"
     fn dashboard_sign_in_is_off_by_default() {
         let config = Config::default();
         assert!(!config.gateway.dashboard_sign_in.enabled());
-        assert_eq!(config.gateway.dashboard_sign_in.session_lifetime_secs, 28_800);
+        assert_eq!(
+            config.gateway.dashboard_sign_in.session_lifetime_secs,
+            28_800
+        );
 
         let parsed: Config = toml::from_str("[gateway]\n").unwrap();
         assert!(!parsed.gateway.dashboard_sign_in.enabled());

@@ -430,7 +430,9 @@ impl SessionRejection {
         match self {
             Self::Expired => "Your dashboard sign-in has expired. Sign in again.",
             Self::Invalid => "This dashboard sign-in is no longer valid. Sign in again.",
-            Self::Csrf => "Signed-in requests that change state must send the X-ZeroClaw-CSRF header",
+            Self::Csrf => {
+                "Signed-in requests that change state must send the X-ZeroClaw-CSRF header"
+            }
             Self::Origin => "Signed-in requests must come from the dashboard's own origin",
         }
     }
@@ -561,7 +563,8 @@ impl DashboardAuth {
     /// earlier: the same checks as for a request.
     pub(crate) async fn recheck(&self, state: &AppState, session: &SessionAuth) -> DashboardCaller {
         let offered = offered_providers(state);
-        self.admit_key(|alias| provider_for(&offered, alias), session.key).await
+        self.admit_key(|alias| provider_for(&offered, alias), session.key)
+            .await
     }
 
     /// The session a cookie names, checked as RPC checks a bound connection
@@ -780,7 +783,10 @@ impl CookieScope<'_> {
     fn binding_name_and_path(&self, state: &str) -> (String, String) {
         let tag = hex::encode(&Sha256::digest(state.as_bytes())[..4]);
         if self.host_prefixed() {
-            (format!("__Host-{BINDING_COOKIE_STEM}{tag}"), "/".to_string())
+            (
+                format!("__Host-{BINDING_COOKIE_STEM}{tag}"),
+                "/".to_string(),
+            )
         } else {
             (
                 format!("{BINDING_COOKIE_STEM}{tag}"),
@@ -981,8 +987,9 @@ impl SessionWatch {
                     let auth = Arc::clone(&self.auth);
                     let session = Arc::clone(&self.session);
                     let state = state.clone();
-                    self.pending =
-                        Some(Box::pin(async move { auth.recheck(&state, &session).await }));
+                    self.pending = Some(Box::pin(
+                        async move { auth.recheck(&state, &session).await },
+                    ));
                     continue;
                 }
             };
@@ -1027,9 +1034,9 @@ pub(crate) fn operator_session(dashboard: Option<&Arc<DashboardAuth>>) -> Operat
         return OperatorSession::Denied(denied.into_response());
     }
     match (caller, dashboard) {
-        (DashboardCaller::Session(session), Some(auth)) => OperatorSession::Admitted(Some(
-            SessionWatch::new(Arc::clone(auth), session, true),
-        )),
+        (DashboardCaller::Session(session), Some(auth)) => {
+            OperatorSession::Admitted(Some(SessionWatch::new(Arc::clone(auth), session, true)))
+        }
         _ => OperatorSession::Admitted(None),
     }
 }
@@ -1050,7 +1057,13 @@ pub async fn layer(
     next: Next,
 ) -> Response {
     request.extensions_mut().insert(Arc::clone(&layer.auth));
-    let enabled = layer.state.config.read().gateway.dashboard_sign_in.enabled();
+    let enabled = layer
+        .state
+        .config
+        .read()
+        .gateway
+        .dashboard_sign_in
+        .enabled();
     if !enabled {
         // Turning sign-in off ends every session, so re-offering a provider
         // later cannot bring them back. No cookie is read.
@@ -1079,7 +1092,10 @@ pub async fn layer(
         Err(rejection) => DashboardCaller::Rejected(rejection),
         Ok(()) => {
             let offered = offered_providers(&layer.state);
-            let caller = layer.auth.admit(|alias| provider_for(&offered, alias), &cookie).await;
+            let caller = layer
+                .auth
+                .admit(|alias| provider_for(&offered, alias), &cookie)
+                .await;
             match caller {
                 DashboardCaller::Session(session) => {
                     match check_csrf(request.method(), request.headers(), &session) {
@@ -1246,7 +1262,12 @@ mod tests {
             GatewayInboundAuth::from_config(&config, Arc::clone(&pairing))
                 .expect("inbound auth builds"),
         );
-        fixture_with(config, pairing, inbound, Arc::new(DashboardSessions::default()))
+        fixture_with(
+            config,
+            pairing,
+            inbound,
+            Arc::new(DashboardSessions::default()),
+        )
     }
 
     fn fixture_with(
@@ -1364,7 +1385,10 @@ mod tests {
             .expect("binding cookie set");
         assert!(binding_cookie.contains("HttpOnly"), "{binding_cookie}");
         assert!(binding_cookie.contains("SameSite=Lax"), "{binding_cookie}");
-        assert!(binding_cookie.contains("Path=/oidc/callback"), "{binding_cookie}");
+        assert!(
+            binding_cookie.contains("Path=/oidc/callback"),
+            "{binding_cookie}"
+        );
         let (binding_name, rest) = binding_cookie.split_once('=').unwrap();
         let binding = rest.split(';').next().unwrap().to_string();
         let state = query_param(&location, "state");
@@ -1458,7 +1482,10 @@ mod tests {
             .find(|c| c.starts_with(SESSION_COOKIE))
             .expect("session cookie set");
         assert!(session_cookie.contains("HttpOnly"), "{session_cookie}");
-        assert!(session_cookie.contains("SameSite=Strict"), "{session_cookie}");
+        assert!(
+            session_cookie.contains("SameSite=Strict"),
+            "{session_cookie}"
+        );
         assert!(session_cookie.contains("Path=/;"), "{session_cookie}");
         assert!(!session_cookie.contains("Secure"), "plain HTTP on loopback");
         assert!(
@@ -1482,7 +1509,10 @@ mod tests {
                 "GET",
                 "/api/auth/session",
                 loopback(),
-                &[("cookie", &cookie_header), ("sec-fetch-site", "same-origin")],
+                &[
+                    ("cookie", &cookie_header),
+                    ("sec-fetch-site", "same-origin"),
+                ],
             ),
         )
         .await;
@@ -1516,7 +1546,10 @@ mod tests {
 
         let (status, body) = probe(&fixture, &[("cookie", "zc_session=forged")]).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert!(body.get("reason").is_none(), "the pairing denial, unchanged: {body}");
+        assert!(
+            body.get("reason").is_none(),
+            "the pairing denial, unchanged: {body}"
+        );
 
         let response = send(
             &fixture.router,
@@ -1563,7 +1596,11 @@ mod tests {
 
         let cookie = signed_in.cookie_header();
         let (status, _) = probe(&fixture, &[("cookie", &cookie)]).await;
-        assert_eq!(status, StatusCode::OK, "an administrator is operator-equivalent");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an administrator is operator-equivalent"
+        );
 
         // Sign-out changes state: the CSRF token and the own origin are required.
         let response = send(
@@ -1754,8 +1791,7 @@ mod tests {
             server.reset().await;
             mount_discovery_and_introspection(&server, &["admins"], "gw").await;
             mount_token(&server, &started.nonce, true).await;
-            let response =
-                send(&fixture.router, callback(&started, Some(&started.binding))).await;
+            let response = send(&fixture.router, callback(&started, Some(&started.binding))).await;
             assert_eq!(response.status(), StatusCode::SEE_OTHER, "{target}");
             assert_eq!(response.headers()[header::LOCATION], "/", "{target}");
         }
@@ -1803,19 +1839,35 @@ mod tests {
         // browser sends the cookie; its Origin gives it away.
         let other = "http://localhost:3000";
         let (status, body) = probe(&fixture, &[("cookie", &cookie), ("origin", other)]).await;
-        assert_eq!((status, body["reason"].clone()), (StatusCode::FORBIDDEN, "origin".into()));
+        assert_eq!(
+            (status, body["reason"].clone()),
+            (StatusCode::FORBIDDEN, "origin".into())
+        );
 
-        let (status, body) =
-            probe(&fixture, &[("cookie", &cookie), ("sec-fetch-site", "same-site")]).await;
-        assert_eq!((status, body["reason"].clone()), (StatusCode::FORBIDDEN, "origin".into()));
+        let (status, body) = probe(
+            &fixture,
+            &[("cookie", &cookie), ("sec-fetch-site", "same-site")],
+        )
+        .await;
+        assert_eq!(
+            (status, body["reason"].clone()),
+            (StatusCode::FORBIDDEN, "origin".into())
+        );
 
         // WebSocket upgrades must name the dashboard's origin.
         let (status, body) =
             probe(&fixture, &[("cookie", &cookie), ("upgrade", "websocket")]).await;
-        assert_eq!((status, body["reason"].clone()), (StatusCode::FORBIDDEN, "origin".into()));
+        assert_eq!(
+            (status, body["reason"].clone()),
+            (StatusCode::FORBIDDEN, "origin".into())
+        );
         let (status, _) = probe(
             &fixture,
-            &[("cookie", &cookie), ("upgrade", "websocket"), ("origin", OWN_ORIGIN)],
+            &[
+                ("cookie", &cookie),
+                ("upgrade", "websocket"),
+                ("origin", OWN_ORIGIN),
+            ],
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -1827,13 +1879,21 @@ mod tests {
                 "POST",
                 "/auth/sign-out",
                 loopback(),
-                &[("cookie", &cookie), ("origin", other), (CSRF_HEADER, &signed_in.csrf)],
+                &[
+                    ("cookie", &cookie),
+                    ("origin", other),
+                    (CSRF_HEADER, &signed_in.csrf),
+                ],
             ),
         )
         .await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert_eq!(json(response).await["reason"], "origin");
-        assert_eq!(fixture.auth.sessions.len(), 1, "a refused request ends nothing");
+        assert_eq!(
+            fixture.auth.sessions.len(),
+            1,
+            "a refused request ends nothing"
+        );
     }
 
     #[tokio::test]
@@ -1847,7 +1907,11 @@ mod tests {
             &[("cookie", &cookie), ("authorization", "Bearer zc_paired")],
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "the paired bearer decides, not the scoped cookie");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the paired bearer decides, not the scoped cookie"
+        );
         let (status, _) = probe(
             &fixture,
             &[("cookie", &cookie), ("authorization", "Bearer wrong")],
@@ -1903,10 +1967,10 @@ mod tests {
             cookies.push(cookie);
         }
         assert!(!fixture.auth.sessions.has_room());
-        let refused = fixture
-            .auth
-            .sessions
-            .insert(new_session(auth.clone(), &fixture.auth.inbound, 3600), unix_now());
+        let refused = fixture.auth.sessions.insert(
+            new_session(auth.clone(), &fixture.auth.inbound, 3600),
+            unix_now(),
+        );
         assert_eq!(refused.err(), Some(StoreFull));
 
         // The starter refuses before any round trip to the provider.
@@ -1919,16 +1983,14 @@ mod tests {
         assert!(response.headers().contains_key(header::RETRY_AFTER));
         assert_eq!(fixture.auth.sessions.len(), MAX_SESSIONS);
         assert!(
-            cookies
-                .iter()
-                .all(|cookie| {
-                    fixture
-                        .auth
-                        .sessions
-                        .sessions
-                        .lock()
-                        .contains_key(&session_key(cookie))
-                }),
+            cookies.iter().all(|cookie| {
+                fixture
+                    .auth
+                    .sessions
+                    .sessions
+                    .lock()
+                    .contains_key(&session_key(cookie))
+            }),
             "every existing session survives"
         );
     }
@@ -1943,7 +2005,10 @@ mod tests {
         let (bystander_cookie, _) = fixture
             .auth
             .sessions
-            .insert(new_session(bystander, &fixture.auth.inbound, 3600), unix_now())
+            .insert(
+                new_session(bystander, &fixture.auth.inbound, 3600),
+                unix_now(),
+            )
             .unwrap();
         let mut own = Vec::new();
         for i in 0..=MAX_SESSIONS_PER_PRINCIPAL {
@@ -1965,7 +2030,10 @@ mod tests {
                 .lock()
                 .contains_key(&session_key(cookie))
         };
-        assert!(!held(&own[0].0), "the oldest of this principal's sessions went");
+        assert!(
+            !held(&own[0].0),
+            "the oldest of this principal's sessions went"
+        );
         assert!(own[0].1.ended.is_cancelled(), "and its sockets were told");
         assert!(own[1..].iter().all(|(cookie, _)| held(cookie)));
         assert!(held(&bystander_cookie), "nobody else's session is touched");
@@ -1984,7 +2052,12 @@ mod tests {
         let cookie_header = format!("{SESSION_COOKIE}={cookie}");
         let response = send(
             &fixture.router,
-            request("GET", "/api/operator-probe", loopback(), &[("cookie", &cookie_header)]),
+            request(
+                "GET",
+                "/api/operator-probe",
+                loopback(),
+                &[("cookie", &cookie_header)],
+            ),
         )
         .await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -2064,7 +2137,12 @@ mod tests {
 
         // The operator drops the group mapping; the next request sees it.
         let mut revoked = config;
-        revoked.oidc.get_mut("corp").unwrap().profile_map.remove("admins");
+        revoked
+            .oidc
+            .get_mut("corp")
+            .unwrap()
+            .profile_map
+            .remove("admins");
         rpc.publish_accepted(&revoked, rpc.accepted_revision() + 1)
             .unwrap();
         let (status, body) = probe(&fixture, &[("cookie", &signed_in.cookie_header())]).await;
@@ -2083,9 +2161,8 @@ mod tests {
                 &config.gateway.paired_tokens,
                 PairingCodePolicy::default(),
             ));
-            let inbound = Arc::new(
-                GatewayInboundAuth::from_config(config, Arc::clone(&pairing)).unwrap(),
-            );
+            let inbound =
+                Arc::new(GatewayInboundAuth::from_config(config, Arc::clone(&pairing)).unwrap());
             fixture_with(config.clone(), pairing, inbound, Arc::clone(&sessions))
         };
         let first = generation(&config);
@@ -2094,7 +2171,10 @@ mod tests {
         // A reload: a new gateway generation with a new authority, the same store.
         let second = generation(&config);
         let introspections = |requests: &[wiremock::Request]| {
-            requests.iter().filter(|r| r.url.path() == "/introspect").count()
+            requests
+                .iter()
+                .filter(|r| r.url.path() == "/introspect")
+                .count()
         };
         let before = introspections(&server.received_requests().await.unwrap());
         let (status, _) = probe(&second, &[("cookie", &signed_in.cookie_header())]).await;
@@ -2153,10 +2233,22 @@ mod tests {
 
     #[test]
     fn origins_compare_as_browsers_send_them() {
-        assert_eq!(origin_of(false, "LocalHost:42617"), "http://localhost:42617");
-        assert_eq!(origin_of(true, "zc.example.com:443"), "https://zc.example.com");
-        assert_eq!(origin_of(false, "zc.example.com:80"), "http://zc.example.com");
-        assert_eq!(origin_of(true, "zc.example.com:8443"), "https://zc.example.com:8443");
+        assert_eq!(
+            origin_of(false, "LocalHost:42617"),
+            "http://localhost:42617"
+        );
+        assert_eq!(
+            origin_of(true, "zc.example.com:443"),
+            "https://zc.example.com"
+        );
+        assert_eq!(
+            origin_of(false, "zc.example.com:80"),
+            "http://zc.example.com"
+        );
+        assert_eq!(
+            origin_of(true, "zc.example.com:8443"),
+            "https://zc.example.com:8443"
+        );
     }
 
     #[test]
@@ -2187,7 +2279,9 @@ mod tests {
         let binding = prefixed.binding_cookie("state-a", "b", 600);
         assert_eq!(
             binding.to_str().unwrap(),
-            format!("{name}=b; Path=/zc/oidc/callback; HttpOnly; SameSite=Lax; Max-Age=600; Secure")
+            format!(
+                "{name}=b; Path=/zc/oidc/callback; HttpOnly; SameSite=Lax; Max-Age=600; Secure"
+            )
         );
         assert!(name.starts_with("zc_signin_"), "{name}");
         let (root_name, root_path) = https_root.binding_name_and_path("state-a");
@@ -2218,7 +2312,10 @@ mod tests {
             https: false,
             path_prefix: "",
         };
-        assert_eq!(plain_http.session_value(&headers).as_deref(), Some("planted"));
+        assert_eq!(
+            plain_http.session_value(&headers).as_deref(),
+            Some("planted")
+        );
         headers.insert(
             header::COOKIE,
             HeaderValue::from_static("zc_session=planted; __Host-zc_session=real"),
@@ -2236,7 +2333,9 @@ mod tests {
         for (started, code) in [(&first, "code-a"), (&second, "code-b")] {
             Mock::given(http_method("POST"))
                 .and(http_path("/token"))
-                .and(wiremock::matchers::body_string_contains(format!("code={code}")))
+                .and(wiremock::matchers::body_string_contains(format!(
+                    "code={code}"
+                )))
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "access_token": "at-alice",
                     "token_type": "Bearer",
@@ -2257,10 +2356,18 @@ mod tests {
             format!("{}={}", first.binding_name, first.binding),
             format!("{}={}", second.binding_name, second.binding),
         ];
-        let response = send(&fixture.router, callback_with(&second, None, "code-b", &both)).await;
+        let response = send(
+            &fixture.router,
+            callback_with(&second, None, "code-b", &both),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         assert_eq!(response.headers()[header::LOCATION], "/b");
-        let response = send(&fixture.router, callback_with(&first, None, "code-a", &both)).await;
+        let response = send(
+            &fixture.router,
+            callback_with(&first, None, "code-a", &both),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         assert_eq!(response.headers()[header::LOCATION], "/a");
     }
@@ -2317,7 +2424,10 @@ mod tests {
         );
         let (status, body) = probe(&off_fixture, &[("cookie", &signed_in.cookie_header())]).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert!(body.get("reason").is_none(), "with sign-in off the cookie is no credential");
+        assert!(
+            body.get("reason").is_none(),
+            "with sign-in off the cookie is no credential"
+        );
         assert_eq!(fixture.auth.sessions.len(), 0, "and the sessions are gone");
 
         // Offering the provider again does not bring the old session back.

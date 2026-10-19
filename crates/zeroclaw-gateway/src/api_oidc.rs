@@ -66,8 +66,7 @@ use tokio::sync::{Semaphore, SemaphorePermit};
 use zeroclaw_runtime::security::auth_provider::{DevicePollOutcome, Enrollment, PkceFlow};
 
 use crate::dashboard_session::{
-    self, CookieScope, DashboardAuth, DashboardCaller, ProviderPin, SessionRejection,
-    SignInRefusal,
+    self, CookieScope, DashboardAuth, DashboardCaller, ProviderPin, SessionRejection, SignInRefusal,
 };
 use crate::{AppState, SlidingWindowRateLimiter};
 
@@ -682,7 +681,9 @@ fn safe_return_path(raw: Option<&str>) -> String {
             if path.starts_with('/')
                 && !path.starts_with("//")
                 && path.len() <= MAX_RETURN_PATH_BYTES
-                && path.bytes().all(|b| (0x21..=0x7e).contains(&b) && b != b'\\') =>
+                && path
+                    .bytes()
+                    .all(|b| (0x21..=0x7e).contains(&b) && b != b'\\') =>
         {
             path.to_string()
         }
@@ -1257,7 +1258,10 @@ async fn finish_dashboard_sign_in(
         return_to,
         popup,
     } = landing;
-    match dashboard.sign_in(&alias, provider, access_token, lifetime_secs).await {
+    match dashboard
+        .sign_in(&alias, provider, access_token, lifetime_secs)
+        .await
+    {
         Ok((cookie, session)) => {
             ::zeroclaw_log::record!(
                 INFO,
@@ -2973,7 +2977,10 @@ mod tests {
     fn a_dashboard_return_path_stays_on_this_dashboard() {
         for (raw, landing) in [
             (Some("/chat"), "/chat"),
-            (Some("/sessions/abc?tab=history"), "/sessions/abc?tab=history"),
+            (
+                Some("/sessions/abc?tab=history"),
+                "/sessions/abc?tab=history",
+            ),
             (None, "/"),
             (Some(""), "/"),
             (Some("chat"), "/"),
@@ -2997,13 +3004,27 @@ mod tests {
             headers.insert(header::HOST, HeaderValue::from_str(host).unwrap());
             headers
         };
-        for host in ["localhost:42617", "LOCALHOST", "127.0.0.1:42617", "[::1]:42617"] {
+        for host in [
+            "localhost:42617",
+            "LOCALHOST",
+            "127.0.0.1:42617",
+            "[::1]:42617",
+        ] {
             assert!(is_loopback_request(loopback(), &with_host(host)), "{host}");
         }
-        assert!(!is_loopback_request(loopback(), &with_host("zc.example.com")));
-        assert!(!is_loopback_request(loopback(), &with_host("192.168.1.5:42617")));
+        assert!(!is_loopback_request(
+            loopback(),
+            &with_host("zc.example.com")
+        ));
+        assert!(!is_loopback_request(
+            loopback(),
+            &with_host("192.168.1.5:42617")
+        ));
         // A loopback name from a remote peer is not the local machine.
-        assert!(!is_loopback_request(remote(), &with_host("localhost:42617")));
+        assert!(!is_loopback_request(
+            remote(),
+            &with_host("localhost:42617")
+        ));
         assert!(!is_loopback_request(loopback(), &HeaderMap::new()));
     }
 }

@@ -529,7 +529,9 @@ pub async fn config_route_auth(
     // already verified it and resolved the grants in force now, and put
     // its verdict on the request. An explicit credential always wins, so
     // this applies only when the request presents none.
-    if !request.headers().contains_key(axum::http::header::AUTHORIZATION)
+    if !request
+        .headers()
+        .contains_key(axum::http::header::AUTHORIZATION)
         && !request.headers().contains_key(AUTH_PROVIDER_HEADER)
         && let Some(caller) = request.extensions().get::<DashboardCaller>().cloned()
     {
