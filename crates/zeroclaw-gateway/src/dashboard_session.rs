@@ -2364,15 +2364,73 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        // The cookie stays: the browser's other tabs, and its next request,
+        // must hear "expired" too, not the answer for no credential at all.
         assert!(
-            set_cookies(&response)
+            !set_cookies(&response)
                 .iter()
-                .any(|c| c.starts_with(SESSION_COOKIE) && c.contains("Max-Age=0")),
-            "the browser is told to drop the cookie"
+                .any(|c| c.starts_with(SESSION_COOKIE)),
+            "an expired session's answer does not drop the cookie"
         );
         assert_eq!(json(response).await["reason"], "session_expired");
         assert!(view.ended.is_cancelled());
         assert_eq!(fixture.auth.sessions.len(), 0);
+        let (status, body) = probe(&fixture, &[("cookie", &cookie_header)]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["reason"], "session_expired", "the next request hears it too");
+    }
+
+    /// A session ended by a policy change answers "expired" in every tab of
+    /// the browser, not only to whichever request saw the change first.
+    #[tokio::test]
+    async fn a_revoked_session_answers_expired_to_every_later_request() {
+        let server = idp(&["admins"], "gw").await;
+        let config = sign_in_config(&server.uri());
+        let pairing = Arc::new(PairingGuard::new(
+            true,
+            &config.gateway.paired_tokens,
+            PairingCodePolicy::default(),
+        ));
+        let rpc = Arc::new(RpcInboundAuth::from_config(&config, Arc::clone(&pairing)).unwrap());
+        let inbound = Arc::new(GatewayInboundAuth::from_shared(Arc::clone(&rpc)));
+        let fixture = fixture_with(
+            config.clone(),
+            pairing,
+            inbound,
+            Arc::new(DashboardSessions::default()),
+        );
+        let signed_in = sign_in(&fixture, &server).await;
+        let mut revoked = config;
+        revoked
+            .oidc
+            .get_mut("corp")
+            .unwrap()
+            .profile_map
+            .remove("admins");
+        rpc.publish_accepted(&revoked, rpc.accepted_revision() + 1)
+            .unwrap();
+
+        let first = send(
+            &fixture.router,
+            request(
+                "GET",
+                "/api/operator-probe",
+                loopback(),
+                &[("cookie", &signed_in.cookie_header())],
+            ),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            !set_cookies(&first)
+                .iter()
+                .any(|c| c.starts_with(SESSION_COOKIE)),
+            "a revoked session's answer does not drop the cookie"
+        );
+        assert_eq!(json(first).await["reason"], "session_expired");
+        let (status, body) = probe(&fixture, &[("cookie", &signed_in.cookie_header())]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["reason"], "session_expired", "another tab hears it too");
     }
 
     /// Another browser's sign-in sweeps expired sessions out of the store.
