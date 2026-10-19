@@ -930,4 +930,209 @@ mod tests {
             .expect("waiter task did not panic");
         assert!(!connected);
     }
+
+    /// A config with one agent, so a session can be opened over the duplex.
+    /// Its provider is never reached: these tests are refused before a turn
+    /// would run.
+    fn agent_config(tmp: &std::path::Path) -> Config {
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::{AliasedAgentConfig, RiskProfileConfig};
+
+        let mut providers = zeroclaw_config::providers::Providers::default();
+        {
+            let provider = providers
+                .models
+                .ensure("openai", "test-provider")
+                .expect("`openai` slot must exist");
+            provider.api_key = Some("test-key".into());
+            provider.model = Some("test-model".into());
+            provider.uri = Some("http://127.0.0.1:1".into());
+        }
+        let mut agents = HashMap::new();
+        agents.insert(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "openai.test-provider".into(),
+                risk_profile: "test-profile".into(),
+                ..Default::default()
+            },
+        );
+        let mut risk_profiles = HashMap::new();
+        risk_profiles.insert("test-profile".to_string(), RiskProfileConfig::default());
+        Config {
+            providers,
+            agents,
+            risk_profiles,
+            ..base_config(tmp)
+        }
+    }
+
+    /// An initialized duplex for the shared operator (a paired token). Its
+    /// grants are the widest a caller holds, so a local-only check that
+    /// refuses it refuses every in-process caller.
+    async fn operator_duplex(
+        mut config: Config,
+        tmp: &std::path::Path,
+    ) -> (
+        CancellationToken,
+        InprocConnector,
+        BufReader<tokio::io::ReadHalf<DuplexStream>>,
+        tokio::io::WriteHalf<DuplexStream>,
+    ) {
+        config.gateway.require_pairing = true;
+        config.gateway.paired_tokens = vec!["zc_inproc_test_token".to_string()];
+        let ctx = with_tui_signing(ctx_for(config), tmp);
+        let cancel = CancellationToken::new();
+        let connector = InprocConnector::new(cancel.clone());
+        connector.bind(ctx);
+        let stream = connector.connect().await.expect("bound connector connects");
+        let (read_half, mut writer) = tokio::io::split(stream);
+        let mut reader = BufReader::new(read_half);
+        let params = InitializeParams {
+            auth_token: Some("zc_inproc_test_token".to_string()),
+            ..initialize_params()
+        };
+        writer
+            .write_all(rpc_request(Method::Initialize, &params, 1).as_bytes())
+            .await
+            .unwrap();
+        let frame = read_frame(&mut reader).await;
+        assert!(frame["error"].is_null(), "unexpected RPC error: {frame}");
+        (cancel, connector, reader, writer)
+    }
+
+    /// The response to request `id`, skipping notifications.
+    async fn response_to(
+        reader: &mut BufReader<tokio::io::ReadHalf<DuplexStream>>,
+        id: u64,
+    ) -> serde_json::Value {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let frame = read_frame(reader).await;
+                if frame["id"] == serde_json::json!(id) {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("the request is answered")
+    }
+
+    /// Open `test-agent`'s session `sid` over the duplex.
+    async fn open_session(
+        reader: &mut BufReader<tokio::io::ReadHalf<DuplexStream>>,
+        writer: &mut tokio::io::WriteHalf<DuplexStream>,
+        sid: &str,
+    ) {
+        writer
+            .write_all(
+                rpc_request(
+                    Method::SessionNew,
+                    &serde_json::json!({ "agent_alias": "test-agent", "session_id": sid }),
+                    2,
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let frame = response_to(reader, 2).await;
+        assert!(frame["error"].is_null(), "session/new failed: {frame}");
+    }
+
+    /// A file on this host, the kind of path a remote caller must not have
+    /// the daemon read for it.
+    fn host_file(tmp: &std::path::Path) -> String {
+        let path = tmp.join("host-only.txt");
+        std::fs::write(&path, "read by path from the daemon host").unwrap();
+        path.canonicalize().unwrap().to_string_lossy().into_owned()
+    }
+
+    #[tokio::test]
+    async fn duplex_file_attach_refuses_a_path_source_as_wss_does() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cancel, _connector, mut reader, mut writer) =
+            operator_duplex(agent_config(tmp.path()), tmp.path()).await;
+        open_session(&mut reader, &mut writer, "attach-by-path").await;
+
+        let attach = serde_json::json!({
+            "session_id": "attach-by-path",
+            "files": [{ "path": host_file(tmp.path()) }],
+        });
+        writer
+            .write_all(rpc_request(Method::FileAttach, &attach, 3).as_bytes())
+            .await
+            .unwrap();
+        let frame = response_to(&mut reader, 3).await;
+        assert_eq!(
+            frame["error"]["code"],
+            zeroclaw_api::jsonrpc::error_codes::INVALID_PARAMS,
+            "an in-process caller is remote: no path sources, even for the operator: {frame}"
+        );
+        assert!(
+            frame["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("Path mode is not available")),
+            "{frame}"
+        );
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn duplex_prompt_refuses_a_path_attachment_as_wss_does() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cancel, _connector, mut reader, mut writer) =
+            operator_duplex(agent_config(tmp.path()), tmp.path()).await;
+        open_session(&mut reader, &mut writer, "prompt-by-path").await;
+
+        let prompt = serde_json::json!({
+            "session_id": "prompt-by-path",
+            "prompt": "summarize the attachment",
+            "attachments": [{ "path": host_file(tmp.path()) }],
+        });
+        writer
+            .write_all(rpc_request(Method::SessionPrompt, &prompt, 3).as_bytes())
+            .await
+            .unwrap();
+        let frame = response_to(&mut reader, 3).await;
+        assert!(
+            frame["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("Path mode is not available")),
+            "an in-process caller is remote: a prompt may not attach by path: {frame}"
+        );
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn duplex_is_refused_sop_run_detail_as_wss_is() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cancel, _connector, mut reader, mut writer) =
+            operator_duplex(base_config(tmp.path()), tmp.path()).await;
+
+        writer
+            .write_all(
+                rpc_request(
+                    Method::SopsRunDetail,
+                    &serde_json::json!({ "run_id": "any-run" }),
+                    2,
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let frame = response_to(&mut reader, 2).await;
+        assert_eq!(
+            frame["error"]["code"],
+            zeroclaw_api::jsonrpc::error_codes::AUTH_REQUIRED,
+            "sops/run-detail is for local IPC only: {frame}"
+        );
+        assert!(
+            frame["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("is not served over remote")),
+            "{frame}"
+        );
+        cancel.cancel();
+    }
 }
