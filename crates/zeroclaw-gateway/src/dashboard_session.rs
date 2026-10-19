@@ -622,11 +622,12 @@ impl DashboardAuth {
         self
     }
 
-    /// Whether this state's generation was told to stop.
+    /// Whether this state's generation was told to stop. A closed channel
+    /// counts: once its sender is gone the generation is over.
     pub(crate) fn is_retired(&self) -> bool {
         self.stopping
             .as_ref()
-            .is_some_and(|stopping| stopping.has_changed().unwrap_or(false))
+            .is_some_and(|stopping| stopping.has_changed().unwrap_or(true))
     }
 
     /// Verify the access token a dashboard sign-in was issued and store the
@@ -1175,7 +1176,7 @@ impl SessionWatch {
         if self.session.ended.is_cancelled() || self.session.expires_at <= now_unix() {
             return Some(WS_CLOSE_SESSION_ENDED);
         }
-        if self.stopped || self.stopping.has_changed().unwrap_or(false) {
+        if self.stopped || self.stopping.has_changed().unwrap_or(true) {
             self.stopped = true;
             return Some(WS_CLOSE_GOING_AWAY);
         }
