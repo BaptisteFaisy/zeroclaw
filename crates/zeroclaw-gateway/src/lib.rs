@@ -7057,6 +7057,141 @@ path = "{trigger_path}"
         }
     }
 
+    /// A gateway told to stop closes the TLS connections it already
+    /// accepted instead of leaving them to serve its retired router: an
+    /// idle kept-alive connection closes at once, one with a streaming
+    /// response in flight within a bounded drain, so the client reconnects
+    /// and reaches the gateway that replaced it.
+    #[tokio::test]
+    async fn a_stopped_gateway_closes_its_open_tls_connections() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.gateway.require_pairing = false;
+        config.memory.backend = "none".into();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".into()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let cert_path = tmp.path().join("gateway.crt");
+        let key_path = tmp.path().join("gateway.key");
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, key.serialize_pem()).unwrap();
+        config.gateway.tls = Some(zeroclaw_config::schema::GatewayTlsConfig {
+            enabled: true,
+            cert_path: cert_path.display().to_string(),
+            key_path: key_path.display().to_string(),
+            ..Default::default()
+        });
+
+        let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(None);
+        let readiness = zeroclaw_runtime::daemon::GatewayReadinessReporter::new(move |addr| {
+            let _ = ready_tx.send(Some(addr));
+        });
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (reload_tx, _) = tokio::sync::watch::channel(false);
+        let controls = zeroclaw_runtime::daemon::GatewayReloadControls::standalone(
+            shutdown_tx.clone(),
+            reload_tx,
+        );
+        let server = zeroclaw_spawn::spawn!(async move {
+            run_gateway(
+                "127.0.0.1",
+                0,
+                config,
+                None,
+                Some(controls),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(readiness),
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            ready_rx.wait_for(Option::is_some).await.unwrap();
+        })
+        .await
+        .expect("the TLS gateway becomes ready");
+        let addr = ready_rx.borrow().unwrap();
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.der().clone()).unwrap();
+        let client = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
+        async fn connect(
+            connector: &tokio_rustls::TlsConnector,
+            addr: SocketAddr,
+        ) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+            let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+            connector.connect(name, tcp).await.expect("TLS handshake")
+        }
+        let mut buf = vec![0u8; 64 * 1024];
+
+        // An idle connection kept alive after one request.
+        let mut idle = connect(&connector, addr).await;
+        idle.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), idle.read(&mut buf))
+            .await
+            .expect("health response deadline")
+            .unwrap();
+        let head = String::from_utf8_lossy(&buf[..n]).to_string();
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+
+        // A connection with a streaming response in flight.
+        let mut streaming = connect(&connector, addr).await;
+        streaming
+            .write_all(b"GET /api/events HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), streaming.read(&mut buf))
+            .await
+            .expect("event stream response deadline")
+            .unwrap();
+        let head = String::from_utf8_lossy(&buf[..n]).to_string();
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+
+        shutdown_tx.send(true).unwrap();
+        for (name, stream) in [("idle", &mut idle), ("streaming", &mut streaming)] {
+            let closed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => continue,
+                    }
+                }
+            })
+            .await
+            .is_ok();
+            assert!(closed, "the stopped gateway kept its {name} TLS connection open");
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(10), server)
+            .await
+            .expect("the gateway stops")
+            .expect("the gateway task does not panic")
+            .expect("the gateway stops cleanly");
+    }
+
     #[tokio::test]
     async fn run_gateway_starts_with_mismatched_provider_api_key() {
         // `run_gateway` binds the process-global pricing config handle.

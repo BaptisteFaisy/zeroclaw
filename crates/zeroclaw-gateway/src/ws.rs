@@ -3609,6 +3609,28 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             (client, session_start)
         }
 
+        /// Answer the `index`-th provider request (1-based) with a text reply
+        /// of about `bytes`, in 64 KiB pieces, instead of the parked one.
+        fn script_long_reply(&self, index: usize, bytes: usize) {
+            let piece = "x".repeat(64 * 1024);
+            let mut tail = String::new();
+            for _ in 0..bytes.div_ceil(piece.len()) {
+                tail.push_str(&format!(
+                    "event: content_block_delta\n\
+data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{piece}\"}}}}\n\n"
+                ));
+            }
+            tail.push_str(
+                "event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n",
+            );
+            self.scripted_tails.lock().insert(index, tail);
+        }
+
         /// Answer the `index`-th provider request (1-based) with a call to
         /// `tool`, instead of the parked text reply.
         fn script_tool_call(&self, index: usize, tool: &str, input: serde_json::Value) {
@@ -4354,6 +4376,64 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         );
         fixture.release_next();
         fixture.wait_for_turn_to_settle(&session_key).await;
+        fixture.shutdown();
+    }
+
+    #[test]
+    fn a_stalled_viewer_does_not_hold_an_ended_sessions_watch() {
+        run_ws_regression(
+            "ws-signin-stalled-viewer",
+            a_stalled_viewer_does_not_hold_an_ended_sessions_watch_inner,
+        );
+    }
+
+    /// A viewer that stops reading stalls the socket's writes. Ending the
+    /// session must still release the socket's session watch, without the
+    /// viewer reading anything and while the turn is still running.
+    async fn a_stalled_viewer_does_not_hold_an_ended_sessions_watch_inner() {
+        let idp = crate::dashboard_session::test_support::idp(&["admins"], "gw").await;
+        let mut fixture = ParkedTurnFixture::spawn_signed_in(&idp.uri()).await;
+        // Far more than the socket buffers hold, so the gateway's writes stall.
+        fixture.script_long_reply(1, 48 * 1024 * 1024);
+        let (cookie, csrf) = fixture.sign_in(3600).await;
+        let dashboard = Arc::clone(&fixture.signed_in().dashboard);
+        let baseline = Arc::strong_count(&dashboard);
+        let session_id = "signin-stalled-viewer";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        let (mut client, _) = fixture.connect_signed_in(session_id, &cookie).await;
+        fixture.start_parked_turn(&mut client, "write a lot").await;
+        // From here on the viewer reads nothing.
+        fixture.release_next();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            Arc::strong_count(&dashboard) > baseline,
+            "the open socket holds its session watch"
+        );
+
+        let status = crate::dashboard_session::test_support::sign_out_over_http(
+            fixture.gateway_addr,
+            &cookie,
+            &csrf,
+        )
+        .await;
+        assert_eq!(status, 204, "sign-out succeeds");
+        let released = tokio::time::timeout(Duration::from_secs(5), async {
+            while Arc::strong_count(&dashboard) > baseline {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .is_ok();
+        assert!(
+            fixture.has_live_turn(&session_key),
+            "the turn is still running"
+        );
+        assert!(
+            released,
+            "a stalled write kept the ended session's watch ({} > {baseline})",
+            Arc::strong_count(&dashboard)
+        );
+        drop(client);
         fixture.shutdown();
     }
 

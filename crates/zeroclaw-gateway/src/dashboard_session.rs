@@ -3699,4 +3699,116 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(body["reason"], "session_invalid");
     }
+
+    // ── A retired generation and an ended session's recheck ───────────
+
+    /// A retired generation whose sign-in is off (a reload turned it off and
+    /// a kept-alive connection still holds it) never ends the sessions of
+    /// the generation that replaced it: not through a request, not through
+    /// its sweep.
+    #[tokio::test]
+    async fn a_retired_generation_never_ends_the_next_generations_sessions() {
+        let server = idp(&["admins"], "gw").await;
+        let config = sign_in_config(&server.uri());
+        let sessions = Arc::new(DashboardSessions::default());
+        let mut off_config = config.clone();
+        off_config.gateway.dashboard_sign_in.oidc.clear();
+        let old = fixture_with(
+            off_config.clone(),
+            pairing_for(&off_config),
+            inbound_for(&off_config),
+            Arc::clone(&sessions),
+        );
+        old.state.shutdown_tx.send_replace(true);
+        let new = fixture_with(
+            config.clone(),
+            pairing_for(&config),
+            inbound_for(&config),
+            Arc::clone(&sessions),
+        );
+        let (cookie, session) = new
+            .auth
+            .sign_in("corp", pin_for(&new, "corp"), "at-alice".into(), 3600)
+            .await
+            .expect("alice signs in to the new generation");
+
+        let _ = send(
+            &old.router,
+            request(
+                "GET",
+                "/api/operator-probe",
+                loopback(),
+                &[("cookie", &cookie_for(&cookie))],
+            ),
+        )
+        .await;
+        assert!(
+            !session.ended.is_cancelled(),
+            "a request through the retired generation ended the new generation's session"
+        );
+
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(61)).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::resume();
+        assert!(
+            !session.ended.is_cancelled(),
+            "the retired generation's sweep ended the new generation's session"
+        );
+        let (status, _) = probe(&new, &[("cookie", &cookie_for(&cookie))]).await;
+        assert_eq!(status, StatusCode::OK, "the session still admits its request");
+    }
+
+    /// An ended session's recheck, with the token copy it holds, goes at
+    /// once even when the socket never polls its watch again: a stalled
+    /// writer, or a response body the transport stopped polling.
+    #[tokio::test]
+    async fn an_ended_sessions_recheck_goes_without_being_polled() {
+        let server = idp(&["admins"], "gw").await;
+        let mut config = sign_in_config(&server.uri());
+        test_support::revalidate_after(&mut config, 2);
+        let fixture = fixture(config);
+        let (_, session) = fixture
+            .auth
+            .sign_in("corp", pin_for(&fixture, "corp"), "at-alice".into(), 3600)
+            .await
+            .expect("alice signs in");
+        let mut watch = SessionWatch::new(
+            Arc::clone(&fixture.auth),
+            Arc::clone(&session),
+            true,
+            &fixture.state,
+        );
+        watch.recheck = tokio::time::interval(Duration::from_millis(1));
+        tokio::time::sleep(test_support::UNTIL_DUE).await;
+        test_support::slow_introspection(&server, &["admins"], "gw", Duration::from_secs(30))
+            .await;
+        let held = Arc::strong_count(&session);
+        let mut watch = Some(watch);
+        let _ = tokio::time::timeout(
+            Duration::from_millis(200),
+            session_lost(&mut watch, &fixture.state),
+        )
+        .await;
+        assert!(
+            Arc::strong_count(&session) > held,
+            "a recheck is waiting on the provider"
+        );
+
+        assert!(fixture.auth.end(&session));
+        let released = tokio::time::timeout(Duration::from_secs(2), async {
+            while Arc::strong_count(&session) > held {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .is_ok();
+        assert!(
+            released,
+            "the ended session's recheck waits for the socket to poll it"
+        );
+        drop(watch);
+    }
 }
