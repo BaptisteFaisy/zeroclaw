@@ -1455,9 +1455,11 @@ fn generation_stopped_response() -> Response {
         })),
     )
         .into_response();
-    response
-        .headers_mut()
-        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    let headers = response.headers_mut();
+    headers.insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    // A client reusing this connection would only reach the stopped
+    // generation again; it has to open a new one to reach the next.
+    headers.insert(header::CONNECTION, HeaderValue::from_static("close"));
     response
 }
 
