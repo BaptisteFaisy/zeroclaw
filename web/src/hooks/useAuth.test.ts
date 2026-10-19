@@ -87,6 +87,8 @@ let requests: Recorded[] = [];
 let health = { require_pairing: true, paired: true };
 let providers: string[] = [];
 let sessionResponse: () => Response = () => new Response("", { status: 401 });
+// Paths whose next request meets a gateway generation that is stopping for a reload.
+let restartingOnce = new Set<string>();
 
 const json = (status: number, body: unknown) =>
   new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
@@ -95,6 +97,15 @@ globalThis.fetch = async (input, init) => {
   const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
   const method = (init?.method ?? "GET").toUpperCase();
   requests.push({ url, method, headers: new Headers(init?.headers) });
+  for (const path of restartingOnce) {
+    if (url.endsWith(path)) {
+      restartingOnce.delete(path);
+      return new Response('{"error":"restarting","reason":"gateway_restarting"}', {
+        status: 503,
+        headers: { "Retry-After": "0" },
+      });
+    }
+  }
   if (url.endsWith("/health")) return json(200, health);
   if (url.endsWith("/api/auth/methods")) {
     return json(200, {
@@ -172,6 +183,7 @@ beforeEach(() => {
   health = { require_pairing: true, paired: true };
   providers = [];
   sessionResponse = () => new Response("", { status: 401 });
+  restartingOnce = new Set();
   latest = null;
 });
 
@@ -433,3 +445,36 @@ test("plain expiry: the socket's 4401 with no newer session asks for re-auth", a
   chat.disconnect();
 });
 
+
+// ---------------------------------------------------------------------------
+// Gateway reloads
+// ---------------------------------------------------------------------------
+
+test("a page load that meets a gateway reload waits it out and signs in", async () => {
+  restartingOnce = new Set(["/health", "/api/auth/methods", "/api/auth/session"]);
+  await mountSignedIn();
+  assert.deepEqual(state().providers, [{ alias: "corp", provider: "oidc.corp" }]);
+  assert.equal(restartingOnce.size, 0);
+});
+
+test("a session check that meets a gateway reload resumes instead of prompting", async () => {
+  await mountSignedIn();
+  restartingOnce = new Set(["/api/auth/session"]);
+  await fire("sessionEnded");
+  assert.equal(restartingOnce.size, 0);
+  assert.equal(state().reauthRequired, false);
+  assert.equal(state().isAuthenticated, true);
+  assert.equal(state().signOutNotice, null);
+});
+
+test("sign-out that meets a gateway reload still signs out", async () => {
+  await mountSignedIn();
+  restartingOnce = new Set(["/auth/sign-out"]);
+  await act(async () => {
+    await state().signOut();
+  });
+  await act(settle);
+  assert.equal(requests.filter((r) => r.url.endsWith("/auth/sign-out")).length, 2);
+  assert.equal(state().isAuthenticated, false);
+  assert.deepEqual(state().signOutNotice, { kind: "signed-out", provider: "corp" });
+});

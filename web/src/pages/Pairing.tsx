@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { Smartphone, Trash2, X } from 'lucide-react';
 import { getAdminPairCode } from '@/lib/api';
 import { authHeaders } from '@/lib/auth';
+import { fetchThroughRestart } from '@/lib/authSession';
 import { Button, Card, ConfirmDialog, PageHeader } from '@/components/ui';
 import { t } from '@/lib/i18n';
 
@@ -27,7 +28,7 @@ export default function Pairing() {
 
   const fetchDevices = useCallback(async () => {
     try {
-      const res = await fetch('/api/devices', {
+      const res = await fetchThroughRestart('/api/devices', {
         headers: authHeaders('GET'),
       });
       if (res.ok) {
@@ -68,7 +69,7 @@ export default function Pairing() {
 
   const handleInitiatePairing = async () => {
     try {
-      const res = await fetch('/api/pairing/initiate', {
+      const res = await fetchThroughRestart('/api/pairing/initiate', {
         method: 'POST',
         headers: authHeaders('POST'),
       });
@@ -85,7 +86,7 @@ export default function Pairing() {
 
   const handleRevokeDevice = async (deviceId: string) => {
     try {
-      const res = await fetch(`/api/devices/${deviceId}`, {
+      const res = await fetchThroughRestart(`/api/devices/${deviceId}`, {
         method: 'DELETE',
         headers: authHeaders('DELETE'),
       });

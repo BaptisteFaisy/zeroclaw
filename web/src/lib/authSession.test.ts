@@ -366,3 +366,64 @@ test("the auth channel accepts only the two message types", () => {
   assert.equal(authSession.parseChannelMessage({ type: "token", token: "x" }), null);
   assert.equal(authSession.parseChannelMessage("signed-in"), null);
 });
+
+// ---------------------------------------------------------------------------
+// Gateway reloads
+// ---------------------------------------------------------------------------
+
+const restarting = () =>
+  new Response('{"error":"The gateway is restarting. Try again.","reason":"gateway_restarting"}', {
+    status: 503,
+    headers: { "Retry-After": "0" },
+  });
+
+function answers(...responses: (() => Response)[]) {
+  const calls: string[] = [];
+  const fetchImpl = async (url: string) => {
+    calls.push(url);
+    const next = responses.shift();
+    assert.ok(next, `unexpected request ${url}`);
+    return next();
+  };
+  return { calls, fetchImpl };
+}
+
+test("a reload's 503 gateway_restarting is waited out by the methods, session and sign-out requests", async () => {
+  const m = answers(restarting, () => new Response(JSON.stringify(methods(["corp"]))));
+  assert.deepEqual(await authSession.fetchAuthMethods(m.fetchImpl), methods(["corp"]));
+  assert.equal(m.calls.length, 2);
+
+  const s = session();
+  const p = answers(restarting, restarting, () => new Response(JSON.stringify(s)));
+  const probe = await authSession.fetchAuthSession(p.fetchImpl);
+  assert.equal(probe.kind, "oidc");
+  assert.equal(p.calls.length, 3);
+
+  const o = answers(restarting, () => new Response(null, { status: 204 }));
+  await authSession.postSignOut("csrf-1", o.fetchImpl);
+  assert.equal(o.calls.length, 2);
+});
+
+test("only gateway_restarting is tried again, and only a few times", async () => {
+  const other = answers(
+    () => new Response('{"error":"x","reason":"core_unavailable"}', { status: 503 }),
+  );
+  assert.deepEqual(await authSession.fetchAuthSession(other.fetchImpl), { kind: "error" });
+  assert.equal(other.calls.length, 1);
+
+  const endless = answers(...Array.from({ length: 10 }, () => restarting));
+  assert.deepEqual(await authSession.fetchAuthSession(endless.fetchImpl), { kind: "error" });
+  assert.equal(endless.calls.length, authSession.RESTART_ATTEMPTS);
+});
+
+test("Retry-After sets the wait before trying again, within bounds", () => {
+  const wait = (value?: string) =>
+    authSession.restartRetryDelayMs(
+      new Response(null, { status: 503, headers: value === undefined ? {} : { "Retry-After": value } }),
+    );
+  assert.equal(wait("1"), 1000);
+  assert.equal(wait("0"), 0);
+  assert.equal(wait(), 1000);
+  assert.equal(wait("soon"), 1000);
+  assert.equal(wait("120"), 5000);
+});

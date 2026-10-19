@@ -24,7 +24,7 @@ import {
   setToken,
   type AuthMode,
 } from "./auth";
-import { failureReason, refreshOidcSession } from "./authSession";
+import { failureReason, fetchThroughRestart, refreshOidcSession } from "./authSession";
 import { apiOrigin, basePath } from "./basePath";
 
 // ---------------------------------------------------------------------------
@@ -216,7 +216,7 @@ async function apiFetchOnce<T>(
     ) {
       headers.set("Content-Type", "application/json");
     }
-    const response = await fetch(url, { ...options, headers });
+    const response = await fetchThroughRestart(url, { ...options, headers });
     const text =
       response.status === 204 ? "" : await response.text().catch(() => "");
     return {
@@ -443,7 +443,7 @@ export async function getPublicHealth(): Promise<{
   require_pairing: boolean;
   paired: boolean;
 }> {
-  const response = await fetch(`${basePath}/health`);
+  const response = await fetchThroughRestart(`${basePath}/health`);
   if (!response.ok) {
     throw new Error(`Health check failed (${response.status})`);
   }
@@ -841,7 +841,7 @@ export async function putPersonalityFile(
   const url = `/api/personality/${encodeURIComponent(filename)}${agentQuery(agent)}`;
   const mode = getAuthMode();
   const headers = authHeaders("PUT", { "Content-Type": "application/json" });
-  const response = await fetch(`${apiOrigin}${basePath}${url}`, {
+  const response = await fetchThroughRestart(`${apiOrigin}${basePath}${url}`, {
     method: "PUT",
     headers,
     body: JSON.stringify({
