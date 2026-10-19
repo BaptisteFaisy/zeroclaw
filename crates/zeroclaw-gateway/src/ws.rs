@@ -4208,7 +4208,9 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         };
         let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
         let (mut client, _) = fixture.connect_signed_in(session_id, &cookie).await;
-        fixture.start_parked_turn(&mut client, "read the note").await;
+        fixture
+            .start_parked_turn(&mut client, "read the note")
+            .await;
         fixture.release_next();
         let prompt = next_frame_of(&mut client, "approval_request").await;
         let request_id = prompt["request_id"]
@@ -4249,7 +4251,11 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             Duration::from_secs(12),
         )
         .await;
-        assert_eq!(code, Some(expected), "{end:?}: the socket closes at the end");
+        assert_eq!(
+            code,
+            Some(expected),
+            "{end:?}: the socket closes at the end"
+        );
 
         let follow_up = fixture.next_provider_request().await.to_string();
         fixture.release_next();
@@ -4309,7 +4315,9 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         let session_id = "signin-release-watch";
         let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
         let (mut client, _) = fixture.connect_signed_in(session_id, &cookie).await;
-        fixture.start_parked_turn(&mut client, "hold this turn").await;
+        fixture
+            .start_parked_turn(&mut client, "hold this turn")
+            .await;
         assert!(
             Arc::strong_count(&dashboard) > baseline,
             "the open socket holds its session watch"

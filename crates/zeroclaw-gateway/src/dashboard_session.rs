@@ -1750,7 +1750,8 @@ mod tests {
             sop_engine,
             ..base
         };
-        let auth = Arc::new(DashboardAuth::new(sessions, Arc::clone(&inbound)).for_generation(&state));
+        let auth =
+            Arc::new(DashboardAuth::new(sessions, Arc::clone(&inbound)).for_generation(&state));
         let router = Router::new()
             .merge(crate::config_admin_router(&inbound))
             .merge(crate::api_oidc::routes())
@@ -3196,8 +3197,7 @@ mod tests {
             .expect("alice signs in");
         // Due for verification, which now takes past the hard expiry.
         tokio::time::sleep(test_support::UNTIL_DUE).await;
-        test_support::slow_introspection(&server, &["admins"], "gw", Duration::from_secs(4))
-            .await;
+        test_support::slow_introspection(&server, &["admins"], "gw", Duration::from_secs(4)).await;
         let (status, body) = probe(&fixture, &[("cookie", &cookie_for(&cookie))]).await;
         assert_eq!(
             status,
@@ -3222,8 +3222,7 @@ mod tests {
             .expect("alice signs in");
         let mut watch = SessionWatch::new(Arc::clone(&fixture.auth), session, true, &fixture.state);
         tokio::time::sleep(test_support::UNTIL_DUE).await;
-        test_support::slow_introspection(&server, &["admins"], "gw", Duration::from_secs(8))
-            .await;
+        test_support::slow_introspection(&server, &["admins"], "gw", Duration::from_secs(8)).await;
         let started = std::time::Instant::now();
         let verdict = watch.admits_now(&fixture.state).await;
         assert_eq!(
@@ -3252,8 +3251,7 @@ mod tests {
             .expect("alice signs in");
         let mut watch = SessionWatch::new(Arc::clone(&fixture.auth), session, true, &fixture.state);
         tokio::time::sleep(test_support::UNTIL_DUE).await;
-        test_support::slow_introspection(&server, &["admins"], "gw", Duration::from_secs(8))
-            .await;
+        test_support::slow_introspection(&server, &["admins"], "gw", Duration::from_secs(8)).await;
         let stop = fixture.state.shutdown_tx.clone();
         let started = std::time::Instant::now();
         let (verdict, ()) = tokio::join!(watch.admits_now(&fixture.state), async move {
@@ -3346,8 +3344,7 @@ mod tests {
         );
         tokio::time::sleep(test_support::UNTIL_DUE).await;
         watch.recheck = tokio::time::interval(Duration::from_millis(1));
-        test_support::slow_introspection(&server, &["admins"], "gw", Duration::from_secs(30))
-            .await;
+        test_support::slow_introspection(&server, &["admins"], "gw", Duration::from_secs(30)).await;
         let mut watch = Some(watch);
         let _ = tokio::time::timeout(
             Duration::from_millis(200),
@@ -3434,7 +3431,12 @@ mod tests {
             let lifetime = if case == "expiry" { 2 } else { 3600 };
             let (cookie, session) = fixture
                 .auth
-                .sign_in("corp", pin_for(&fixture, "corp"), "at-alice".into(), lifetime)
+                .sign_in(
+                    "corp",
+                    pin_for(&fixture, "corp"),
+                    "at-alice".into(),
+                    lifetime,
+                )
                 .await
                 .expect("alice signs in");
             let response = send(
@@ -3447,7 +3449,11 @@ mod tests {
                 ),
             )
             .await;
-            assert_eq!(response.status(), StatusCode::OK, "{case}: the stream opens");
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "{case}: the stream opens"
+            );
             let mut body = response.into_body();
             match case {
                 "sign-out" => assert!(fixture.auth.end(&session)),
@@ -3516,7 +3522,8 @@ mod tests {
                     fixture.state.shutdown_tx.send_replace(true);
                     WS_CLOSE_GOING_AWAY
                 };
-                let (code, _) = test_support::until_closed(&mut socket, Duration::from_secs(3)).await;
+                let (code, _) =
+                    test_support::until_closed(&mut socket, Duration::from_secs(3)).await;
                 assert_eq!(code, Some(expected), "notifier={notifier}, {case}");
                 served.abort();
             }
@@ -3547,7 +3554,10 @@ mod tests {
         for _ in 0..20 {
             tokio::task::yield_now().await;
         }
-        assert!(old_sweep.is_finished(), "a dropped generation's sweep keeps running");
+        assert!(
+            old_sweep.is_finished(),
+            "a dropped generation's sweep keeps running"
+        );
 
         let new = fixture_with(
             config.clone(),
@@ -3579,7 +3589,10 @@ mod tests {
         let cases: [(&str, Vec<(&str, &str)>); 2] = [
             (
                 "no Origin",
-                vec![("cookie", cookie.as_str()), (CSRF_HEADER, signed_in.csrf.as_str())],
+                vec![
+                    ("cookie", cookie.as_str()),
+                    (CSRF_HEADER, signed_in.csrf.as_str()),
+                ],
             ),
             (
                 "cross-site fetch",
@@ -3601,7 +3614,11 @@ mod tests {
             assert_eq!(json(response).await["reason"], "origin", "{case}");
         }
         let (status, _) = probe(&fixture, &[("cookie", &cookie)]).await;
-        assert_eq!(status, StatusCode::OK, "the refused sign-outs ended nothing");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the refused sign-outs ended nothing"
+        );
     }
 
     async fn set_sign_in(state: &AppState, on: bool) {
