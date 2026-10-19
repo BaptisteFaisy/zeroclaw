@@ -624,7 +624,9 @@ Things to know before turning it on:
   you don't use for other local development servers.
 - Taking a provider off `gateway.dashboard_sign_in.oidc`, or emptying it,
   ends the sessions it issued: at the next request, and within a minute
-  if none arrives. Offering it again does not bring them back. If the `[oidc.<alias>]` entry is pointed at another issuer or
+  if none arrives (at once when a reload applies the change). Offering it
+  again does not bring them back, except when it is offered again within
+  that minute with no request in between. If the `[oidc.<alias>]` entry is pointed at another issuer or
   client, its sessions end as well, without their tokens being sent to
   the new provider.
 - With introspection, an identity provider that cannot be reached when a

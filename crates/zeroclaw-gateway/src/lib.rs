@@ -943,6 +943,17 @@ fn config_admin_router(inbound_auth: &Arc<principal_gate::GatewayInboundAuth>) -
         ))
 }
 
+/// How long an accepted TLS connection of a stopping gateway may take to
+/// finish the responses in flight before it is dropped.
+const TLS_CONNECTION_DRAIN: Duration = Duration::from_secs(5);
+
+/// Resolves when the gateway is told to stop; never, if it no longer can be.
+async fn gateway_stop_requested(stopping: &mut tokio::sync::watch::Receiver<bool>) {
+    if stopping.changed().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
 #[allow(clippy::too_many_lines)]
 // One parameter per daemon-owned dependency; a bundling struct would only
@@ -2604,8 +2615,18 @@ pub async fn run_gateway_with_plugin_webhooks(
                     .await
                     .expect("infallible make_service");
 
+                    // The listener stops accepting at the stop, but an accepted
+                    // connection would go on serving this generation's router
+                    // and its retired authority. A clone of the loop's own
+                    // receiver, subscribed when the gateway started, sees a stop
+                    // that came before this connection was handed over too.
+                    let mut stopping = shutdown_signal.clone();
                     zeroclaw_spawn::spawn!(async move {
-                        let tls_stream = match tls_acceptor.accept(tcp_stream).await {
+                        let accepted = tokio::select! {
+                            accepted = tls_acceptor.accept(tcp_stream) => accepted,
+                            () = gateway_stop_requested(&mut stopping) => return,
+                        };
+                        let tls_stream = match accepted {
                             Ok(s) => s,
                             Err(e) => {
                                 ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": format!("{}", e), "remote_addr": remote_addr})), "TLS handshake failed from");
@@ -2619,12 +2640,25 @@ pub async fn run_gateway_with_plugin_webhooks(
                                 tower::Service::call(&mut svc, req).await
                             }
                         });
-                        if let Err(e) = hyper_util::server::conn::auto::Builder::new(
+                        let builder = hyper_util::server::conn::auto::Builder::new(
                             hyper_util::rt::TokioExecutor::new(),
-                        )
-                        .serve_connection(io, hyper_svc)
-                        .await
-                        {
+                        );
+                        let connection = builder.serve_connection(io, hyper_svc);
+                        tokio::pin!(connection);
+                        let served = tokio::select! {
+                            served = connection.as_mut() => served,
+                            () = gateway_stop_requested(&mut stopping) => {
+                                // Finish what is in flight, then close, so the
+                                // client reconnects to the next generation; a
+                                // response that never ends is cut off.
+                                connection.as_mut().graceful_shutdown();
+                                match tokio::time::timeout(TLS_CONNECTION_DRAIN, connection.as_mut()).await {
+                                    Ok(served) => served,
+                                    Err(_) => return,
+                                }
+                            }
+                        };
+                        if let Err(e) = served {
                             ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": format!("{}", e), "remote_addr": remote_addr})), "connection error from");
                         }
                     });

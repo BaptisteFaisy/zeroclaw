@@ -69,10 +69,21 @@ pub async fn handle_sse_events(
             }
         }
     }
-    let watch_state = state.clone();
-    let session_ended = async move {
-        session_lost(&mut session_watch, &watch_state).await;
-    };
+    // The session is watched from a task of its own, so a response body the
+    // transport stopped polling holds nothing of the session: the stream
+    // keeps only the cancellation that ends it, and the guard that stops the
+    // watching task when the stream is dropped.
+    let session_ended = tokio_util::sync::CancellationToken::new();
+    let watcher = session_watch.map(|watch| {
+        let ended = session_ended.clone();
+        let watch_state = state.clone();
+        crate::dashboard_session::TaskGuard(zeroclaw_spawn::spawn!(async move {
+            let mut watch = Some(watch);
+            session_lost(&mut watch, &watch_state).await;
+            drop(watch);
+            ended.cancel();
+        }))
+    });
 
     let rx = state.event_tx.subscribe();
     let stream = BroadcastStream::new(rx).filter_map(
@@ -89,7 +100,11 @@ pub async fn handle_sse_events(
     );
 
     // Ends with the dashboard session that opened it; never, otherwise.
-    let stream = futures_util::StreamExt::take_until(stream, session_ended);
+    let stream = futures_util::StreamExt::take_until(stream, session_ended.cancelled_owned());
+    let stream = futures_util::StreamExt::map(stream, move |event| {
+        let _watching = &watcher;
+        event
+    });
 
     Sse::new(stream)
         .keep_alive(KeepAlive::default())

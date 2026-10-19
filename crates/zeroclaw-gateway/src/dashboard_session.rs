@@ -539,6 +539,7 @@ impl SweeperGuard {
     fn start(
         sessions: &Arc<DashboardSessions>,
         config: zeroclaw_config::live::LiveConfigHandle,
+        mut stopping: tokio::sync::watch::Receiver<bool>,
     ) -> Self {
         // Built outside a runtime (no requests can arrive either): the
         // sweeps on admission and sign-in are all there is.
@@ -551,7 +552,13 @@ impl SweeperGuard {
             let mut ticks = tokio::time::interval_at(start, IDLE_SWEEP);
             ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                ticks.tick().await;
+                // A stopped generation sweeps no more: its configuration no
+                // longer governs the sessions in the shared store.
+                tokio::select! {
+                    biased;
+                    () = SessionWatch::generation_stopped(&mut stopping) => break,
+                    _ = ticks.tick() => {}
+                }
                 let Some(sessions) = sessions.upgrade() else {
                     break;
                 };
@@ -606,11 +613,13 @@ impl DashboardAuth {
     /// sign-in off ends every session, and the generation's idle sweep runs
     /// until this state is dropped.
     pub fn for_generation(mut self, state: &AppState) -> Self {
-        self.stopping = Some(state.shutdown_tx.subscribe());
+        let stopping = state.shutdown_tx.subscribe();
         if !state.config.read().gateway.dashboard_sign_in.enabled() {
             self.sessions.end_all();
         }
-        self._sweeper = SweeperGuard::start(&self.sessions, state.config.clone());
+        self._sweeper =
+            SweeperGuard::start(&self.sessions, state.config.clone(), stopping.clone());
+        self.stopping = Some(stopping);
         self
     }
 
@@ -1036,7 +1045,27 @@ pub(crate) const WS_CLOSE_SESSION_ENDED: u16 = 4401;
 /// admits this socket (the account lost the access the socket needs).
 pub(crate) const WS_CLOSE_ACCESS_LOST: u16 = 4403;
 
-type Recheck = std::pin::Pin<Box<dyn std::future::Future<Output = DashboardCaller> + Send>>;
+/// A socket's periodic recheck, run in a task of its own. The task ends,
+/// and drops the token copy it verifies with, as soon as the session ends,
+/// expires or loses its generation, whether or not the socket ever polls
+/// for the result: a stalled writer or a response body the transport
+/// stopped polling cannot keep it. Dropping this aborts the task.
+struct RecheckTask(tokio::task::JoinHandle<Option<DashboardCaller>>);
+
+impl Drop for RecheckTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// A task that is aborted when this is dropped.
+pub(crate) struct TaskGuard(pub(crate) tokio::task::JoinHandle<()>);
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 /// WebSocket close code for a socket whose gateway generation stopped (a
 /// reload or shutdown): the client may reconnect, and the next generation's
@@ -1060,7 +1089,7 @@ pub(crate) struct SessionWatch {
     /// a socket's loop drops that future whenever another branch fires: a
     /// busy socket would otherwise abandon every recheck that needs a round
     /// trip to the identity provider.
-    pending: Option<Recheck>,
+    pending: Option<RecheckTask>,
     /// The generation's stop signal (`AppState::shutdown_tx`), subscribed
     /// when the socket opened.
     stopping: tokio::sync::watch::Receiver<bool>,
@@ -1180,6 +1209,23 @@ impl SessionWatch {
         code
     }
 
+    fn spawn_recheck(&self, state: &AppState) -> RecheckTask {
+        let auth = Arc::clone(&self.auth);
+        let session = Arc::clone(&self.session);
+        let state = state.clone();
+        let mut stopping = self.stopping.clone();
+        RecheckTask(zeroclaw_spawn::spawn!(async move {
+            let remaining = session.expires_at.saturating_sub(now_unix());
+            tokio::select! {
+                biased;
+                () = session.ended.cancelled() => None,
+                () = tokio::time::sleep(std::time::Duration::from_secs(remaining)) => None,
+                () = SessionWatch::generation_stopped(&mut stopping) => None,
+                outcome = auth.recheck(&state, &session) => Some(outcome),
+            }
+        }))
+    }
+
     async fn wait_lost(&mut self, state: &AppState) -> u16 {
         loop {
             if let Some(code) = self.known_lost() {
@@ -1187,7 +1233,7 @@ impl SessionWatch {
             }
             let remaining = self.session.expires_at.saturating_sub(now_unix());
             let expiry = tokio::time::sleep(std::time::Duration::from_secs(remaining));
-            let outcome = match self.pending.as_mut() {
+            let joined = match self.pending.as_mut() {
                 Some(pending) => tokio::select! {
                     () = self.session.ended.cancelled() => return WS_CLOSE_SESSION_ENDED,
                     () = expiry => return WS_CLOSE_SESSION_ENDED,
@@ -1195,7 +1241,7 @@ impl SessionWatch {
                         self.stopped = true;
                         return WS_CLOSE_GOING_AWAY;
                     }
-                    outcome = pending => outcome,
+                    joined = &mut pending.0 => joined,
                 },
                 None => {
                     tokio::select! {
@@ -1207,16 +1253,19 @@ impl SessionWatch {
                         }
                         _ = self.recheck.tick() => {}
                     }
-                    let auth = Arc::clone(&self.auth);
-                    let session = Arc::clone(&self.session);
-                    let state = state.clone();
-                    self.pending = Some(Box::pin(
-                        async move { auth.recheck(&state, &session).await },
-                    ));
+                    self.pending = Some(self.spawn_recheck(state));
                     continue;
                 }
             };
             self.pending = None;
+            let outcome = match joined {
+                Ok(Some(outcome)) => outcome,
+                // The recheck saw the session end, expire or lose its
+                // generation first; a recheck that failed to run fails closed.
+                Ok(None) | Err(_) => {
+                    return self.known_lost().unwrap_or(WS_CLOSE_SESSION_ENDED);
+                }
+            };
             if let Err(code) = self.judge(outcome) {
                 return code;
             }
@@ -1301,8 +1350,12 @@ pub async fn layer(
         .enabled();
     if !enabled {
         // Turning sign-in off ends every session, so re-offering a provider
-        // later cannot bring them back. No cookie is read.
-        layer.auth.sessions.end_all();
+        // later cannot bring them back. No cookie is read. Only the active
+        // generation may: a stopped one's configuration is history, and the
+        // sessions in the shared store now belong to the one after it.
+        if !layer.auth.is_retired() {
+            layer.auth.sessions.end_all();
+        }
         return next.run(request).await;
     }
     if request.headers().contains_key(header::AUTHORIZATION) {

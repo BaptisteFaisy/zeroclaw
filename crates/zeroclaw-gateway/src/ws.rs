@@ -303,8 +303,11 @@ pub(crate) async fn close_with<S, R>(
         code,
         reason: axum::extract::ws::Utf8Bytes::from_static(reason),
     }));
-    if sender.send(close).await.is_err() {
-        return;
+    // A peer that stopped reading holds up neither the close frame nor
+    // what follows it.
+    match tokio::time::timeout(WS_CLOSE_HANDSHAKE_GRACE, sender.send(close)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) | Err(_) => return,
     }
     let _ = tokio::time::timeout(WS_CLOSE_HANDSHAKE_GRACE, async {
         while let Some(Ok(frame)) = receiver.next().await {
@@ -314,6 +317,36 @@ pub(crate) async fn close_with<S, R>(
         }
     })
     .await;
+}
+
+/// What became of a frame sent while the socket's dashboard session may end.
+enum Sent {
+    Delivered,
+    PeerGone,
+    /// The session ended first, with this close code; the frame was not sent.
+    SessionLost(u16),
+}
+
+/// Send `message` unless the session behind the socket ends first. A peer
+/// that stops reading stalls the send on the transport, and the session
+/// ending must not wait for it.
+async fn send_unless_lost(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    message: Message,
+    session: &mut Option<crate::dashboard_session::SessionWatch>,
+    state: &AppState,
+) -> Sent {
+    tokio::select! {
+        biased;
+        code = crate::dashboard_session::session_lost(session, state) => Sent::SessionLost(code),
+        sent = sender.send(message) => {
+            if sent.is_ok() {
+                Sent::Delivered
+            } else {
+                Sent::PeerGone
+            }
+        }
+    }
 }
 
 /// Answer a turn the agent lifecycle did not admit. Returns `true` when the
@@ -984,8 +1017,13 @@ async fn handle_socket(
 
             // ── Keepalive ─────────────────────────────────────────────
             _ = tick_websocket_ping(&mut ping_interval) => {
-                if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
-                    break;
+                match send_unless_lost(&mut sender, Message::Ping(Vec::new().into()), &mut session_watch, &state).await {
+                    Sent::Delivered => {}
+                    Sent::PeerGone => break,
+                    Sent::SessionLost(code) => {
+                        close_with(&mut sender, &mut receiver, code, "dashboard session ended").await;
+                        break;
+                    }
                 }
             }
 
@@ -1189,8 +1227,16 @@ async fn handle_socket(
                 if let Ok(event) = event
                     && event_matches_session(&event, &session_id)
                     && !is_observability_telemetry(&event)
+                    && let Sent::SessionLost(code) = send_unless_lost(
+                        &mut sender,
+                        Message::Text(event.to_string().into()),
+                        &mut session_watch,
+                        &state,
+                    )
+                    .await
                 {
-                    let _ = sender.send(Message::Text(event.to_string().into())).await;
+                    close_with(&mut sender, &mut receiver, code, "dashboard session ended").await;
+                    break;
                 }
             }
 
@@ -1216,7 +1262,17 @@ async fn handle_socket(
                         continue;
                     }
                 };
-                let _ = sender.send(Message::Text(frame.to_string().into())).await;
+                if let Sent::SessionLost(code) = send_unless_lost(
+                    &mut sender,
+                    Message::Text(frame.to_string().into()),
+                    &mut session_watch,
+                    &state,
+                )
+                .await
+                {
+                    close_with(&mut sender, &mut receiver, code, "dashboard session ended").await;
+                    break;
+                }
             }
 
         }
@@ -2117,6 +2173,29 @@ async fn process_chat_message(
     let forward_fut = async {
         let mut cancel_drained = false;
         let mut client_gone = false;
+        // Every write to the viewer races the session ending: a viewer that
+        // stops reading stalls the write, and the session's loss must not
+        // wait behind it. Either way the viewer is detached and its session
+        // watch released.
+        macro_rules! send_to_viewer {
+            ($message:expr) => {
+                match send_unless_lost(&mut *sender, $message, &mut *session, state).await {
+                    Sent::Delivered => {}
+                    Sent::PeerGone => {
+                        detach_mid_turn(session_key, &turn_id, pending_approvals);
+                        *session = None;
+                        client_gone = true;
+                    }
+                    Sent::SessionLost(code) => {
+                        detach_mid_turn(session_key, &turn_id, pending_approvals);
+                        *session = None;
+                        close_with(&mut *sender, &mut *receiver, code, "dashboard session ended")
+                            .await;
+                        client_gone = true;
+                    }
+                }
+            };
+        }
         loop {
             tokio::select! {
                             biased;
@@ -2143,11 +2222,7 @@ async fn process_chat_message(
                                 let text = match classify_client_frame(client_msg) {
                                     ClientFrame::Text(text) => text,
                                     ClientFrame::Ping(payload) => {
-                                        if sender.send(Message::Pong(payload)).await.is_err() {
-                                            detach_mid_turn(session_key, &turn_id, pending_approvals);
-                                            *session = None;
-                                            client_gone = true;
-                                        }
+                                        send_to_viewer!(Message::Pong(payload));
                                         continue;
                                     }
                                     ClientFrame::Ignore => continue,
@@ -2173,7 +2248,7 @@ async fn process_chat_message(
                                         "message": "Invalid JSON. Send {\"type\":\"message\",\"content\":\"your text\"}",
                                         "code": "INVALID_JSON"
                                     });
-                                    let _ = sender.send(Message::Text(err.to_string().into())).await;
+                                    send_to_viewer!(Message::Text(err.to_string().into()));
                                     continue;
                                 };
                                 match parsed["type"].as_str() {
@@ -2217,7 +2292,7 @@ async fn process_chat_message(
                                                 "message": "Message content cannot be empty",
                                                 "code": "EMPTY_CONTENT"
                                             });
-                                            let _ = sender.send(Message::Text(err.to_string().into())).await;
+                                            send_to_viewer!(Message::Text(err.to_string().into()));
                                             continue;
                                         }
                                         match steering_tx.try_send(gateway_steering_input(content)) {
@@ -2228,7 +2303,7 @@ async fn process_chat_message(
                                                     "message": "Steering queue is full for the running turn",
                                                     "code": "STEERING_QUEUE_FULL"
                                                 });
-                                                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                                                send_to_viewer!(Message::Text(err.to_string().into()));
                                             }
                                             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                                                 let err = serde_json::json!({
@@ -2236,7 +2311,7 @@ async fn process_chat_message(
                                                     "message": "Running turn is no longer accepting steering messages",
                                                     "code": "STEERING_CLOSED"
                                                 });
-                                                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                                                send_to_viewer!(Message::Text(err.to_string().into()));
                                             }
                                         }
                                     }
@@ -2265,19 +2340,11 @@ async fn process_chat_message(
                                         "arguments_summary": arguments_summary,
                                         "timeout_secs": timeout_secs,
                                     });
-                                    if sender.send(Message::Text(frame.to_string().into())).await.is_err() {
-                                        detach_mid_turn(session_key, &turn_id, pending_approvals);
-                                        *session = None;
-                                        client_gone = true;
-                                    }
+                                    send_to_viewer!(Message::Text(frame.to_string().into()));
                                 }
                             }
                             _ = tick_websocket_ping(ping_interval), if !client_gone => {
-                                if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
-                                    detach_mid_turn(session_key, &turn_id, pending_approvals);
-                                    *session = None;
-                                    client_gone = true;
-                                }
+                                send_to_viewer!(Message::Ping(Vec::new().into()));
                             }
                                 event_opt = event_rx.recv() => {
                                 let Some(event) = event_opt else { break };
@@ -2357,11 +2424,7 @@ async fn process_chat_message(
                                 if client_gone {
                                     continue;
                                 }
-                                if sender.send(Message::Text(ws_msg.to_string().into())).await.is_err() {
-                                    detach_mid_turn(session_key, &turn_id, pending_approvals);
-                                    *session = None;
-                                    client_gone = true;
-                                }
+                                send_to_viewer!(Message::Text(ws_msg.to_string().into()));
                             }
                         }
         }
