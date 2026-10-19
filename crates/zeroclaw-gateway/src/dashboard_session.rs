@@ -2953,15 +2953,10 @@ mod tests {
         let signed_in = sign_in(&fixture, &server).await;
         assert_eq!(fixture.auth.sessions.len(), 1);
 
-        let mut off = sign_in_config(&server.uri());
-        off.gateway.dashboard_sign_in.oidc.clear();
-        let off_fixture = fixture_with(
-            off,
-            Arc::clone(&fixture.state.pairing),
-            Arc::clone(&fixture.auth.inbound),
-            Arc::clone(&fixture.auth.sessions),
-        );
-        let (status, body) = probe(&off_fixture, &[("cookie", &signed_in.cookie_header())]).await;
+        // Turned off live, in the same generation: the next request ends
+        // every session, without waiting for a sweep or a reload.
+        set_sign_in(&fixture.state, false).await;
+        let (status, body) = probe(&fixture, &[("cookie", &signed_in.cookie_header())]).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert!(
             body.get("reason").is_none(),
@@ -2970,6 +2965,7 @@ mod tests {
         assert_eq!(fixture.auth.sessions.len(), 0, "and the sessions are gone");
 
         // Offering the provider again does not bring the old session back.
+        set_sign_in(&fixture.state, true).await;
         let (status, body) = probe(&fixture, &[("cookie", &signed_in.cookie_header())]).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(body["reason"], "session_invalid");
