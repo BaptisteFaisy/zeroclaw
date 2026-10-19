@@ -74,12 +74,18 @@ releases its sessions. Once the client has had no live connection for
 `wss.orphaned_session_timeout_secs` (default 1800), the daemon closes each of
 its sessions that:
 
-- has also been idle that long;
+- has also been idle that long (a turn counts as activity when it finishes);
 - has no turn running;
 - has no approval pending.
 
 Closing one works as `session/close` does: the session leaves the live map,
-and its transcript is kept. The daemon logs each one it closes.
+and its transcript is kept. A chat session's current history is written to
+its store first, and a session whose history can't be written stays live. The
+daemon logs each one it closes.
+
+After that, the transcript is in the store but out of a remote client's reach.
+Over WSS a client reaches only live sessions its own identity owns, so it
+can't list, read or resume a closed one. A local client can resume it.
 
 Sessions of local clients are not closed this way. Setting
 `wss.orphaned_session_timeout_secs` to `0` keeps every orphaned session live
