@@ -48490,7 +48490,8 @@ mod tests {
             );
         }
 
-        /// A chat backend whose transcript writes fail while `failing` is set.
+        /// A chat backend whose transcript writes (appends and rewrites) fail
+        /// while `failing` is set.
         #[derive(Default)]
         struct FlakyChatBackend {
             failing: std::sync::atomic::AtomicBool,
@@ -48513,6 +48514,9 @@ mod tests {
                 session_key: &str,
                 message: &zeroclaw_providers::ChatMessage,
             ) -> std::io::Result<()> {
+                if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(std::io::Error::other("simulated transcript write failure"));
+                }
                 self.rows
                     .lock()
                     .unwrap()
@@ -48669,39 +48673,296 @@ mod tests {
             assert_eq!(restored["message_count"], json!(2), "{restored}");
         }
 
+        /// Store `messages` as a turn's post-turn write does.
+        fn store_as_a_turn_would(
+            backend: &zeroclaw_infra::session_sqlite::SqliteSessionBackend,
+            key: &str,
+            messages: &[zeroclaw_api::model_provider::ChatMessage],
+        ) {
+            assert!(
+                backend
+                    .replace_conversation_state_if_exists(key, messages, false)
+                    .unwrap()
+            );
+        }
+
+        fn stored_contents(
+            backend: &zeroclaw_infra::session_sqlite::SqliteSessionBackend,
+            key: &str,
+        ) -> Vec<String> {
+            backend.load(key).into_iter().map(|m| m.content).collect()
+        }
+
         #[tokio::test]
-        async fn a_retired_acp_session_keeps_its_record_and_comes_back() {
+        async fn a_message_another_writer_stored_survives_retirement() {
             let tmp = tempfile::TempDir::new().unwrap();
-            let (ctx, _backend, acp) = persistence_enforcement_ctx(make_acp_test_config(&tmp));
-            let mut client = remote(&ctx, "tui_acp");
-            let session = client
-                .handle_session_new_for_test(
-                    &json!({ "agent_alias": "test-agent", "chat_mode": "acp" }),
-                )
-                .await
-                .expect("ACP session/new")["session_id"]
-                .as_str()
-                .unwrap()
-                .to_string();
+            let (ctx, backend, _acp) = persistence_enforcement_ctx(make_acp_test_config(&tmp));
+            let mut client = remote(&ctx, "tui_shared");
+            let session = open(&client).await;
+            let key = format!("rpc_{session}");
+            ctx.sessions.seed_history(&session, &two_turns()).await;
+            store_as_a_turn_would(&backend, &key, &two_turns());
             disconnect(&ctx, &mut client).await;
+            // What `POST /api/sessions/{id}/messages` does for an existing
+            // `rpc_` key: an append to the durable transcript only.
+            backend
+                .append(
+                    &key,
+                    &zeroclaw_api::model_provider::ChatMessage::assistant("posted later"),
+                )
+                .unwrap();
 
             assert_eq!(
                 retire_orphaned_sessions(&ctx, Instant::now() + TIMEOUT).await,
                 vec![session.clone()]
             );
-            assert!(
-                acp.load_session(&session).unwrap().is_some(),
-                "the ACP record is gone"
+            assert_eq!(
+                stored_contents(&backend, &key),
+                vec!["hello", "hi there", "posted later"],
+                "retirement erased a stored message"
             );
             let (operator, _rx) = local_operator(&ctx).await;
+            assert_eq!(resume(&operator, &session).await["message_count"], json!(3));
+        }
+
+        #[tokio::test]
+        async fn a_history_that_differs_from_its_store_keeps_the_session() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (ctx, backend, _acp) = persistence_enforcement_ctx(make_acp_test_config(&tmp));
+            let mut client = remote(&ctx, "tui_diverged");
+            let session = open(&client).await;
+            let key = format!("rpc_{session}");
+            let mut live = two_turns();
+            live.push(zeroclaw_api::model_provider::ChatMessage::user("only live"));
+            let mut stored = two_turns();
+            stored.push(zeroclaw_api::model_provider::ChatMessage::assistant(
+                "only stored",
+            ));
+            ctx.sessions.seed_history(&session, &live).await;
+            store_as_a_turn_would(&backend, &key, &stored);
+            disconnect(&ctx, &mut client).await;
+
+            assert!(
+                retire_orphaned_sessions(&ctx, Instant::now() + TIMEOUT)
+                    .await
+                    .is_empty()
+            );
+            assert_eq!(ctx.sessions.list_ids().await, vec![session]);
+            assert_eq!(
+                stored_contents(&backend, &key),
+                vec!["hello", "hi there", "only stored"]
+            );
+        }
+
+        #[tokio::test]
+        async fn retiring_stored_history_leaves_its_timestamps_alone() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (ctx, backend, _acp) = persistence_enforcement_ctx(make_acp_test_config(&tmp));
+            let mut client = remote(&ctx, "tui_saved");
+            let session = open(&client).await;
+            let key = format!("rpc_{session}");
+            ctx.sessions.seed_history(&session, &two_turns()).await;
+            store_as_a_turn_would(&backend, &key, &two_turns());
+            let times = |b: &zeroclaw_infra::session_sqlite::SqliteSessionBackend| {
+                b.load_with_timestamps(&key)
+                    .into_iter()
+                    .map(|m| m.created_at)
+                    .collect::<Vec<_>>()
+            };
+            let row = |b: &zeroclaw_infra::session_sqlite::SqliteSessionBackend| {
+                b.list_sessions_with_metadata()
+                    .into_iter()
+                    .find(|meta| meta.key == key)
+                    .map(|meta| (meta.created_at, meta.last_activity, meta.message_count))
+            };
+            let (times_before, row_before) = (times(&backend), row(&backend));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            disconnect(&ctx, &mut client).await;
+
+            assert_eq!(
+                retire_orphaned_sessions(&ctx, Instant::now() + TIMEOUT).await,
+                vec![session]
+            );
+            assert_eq!(
+                times(&backend),
+                times_before,
+                "message times were rewritten"
+            );
+            assert_eq!(row(&backend), row_before, "session metadata was rewritten");
+        }
+
+        #[tokio::test]
+        async fn a_cancel_while_retirement_holds_the_session_map_prevents_removal() {
+            let (_tmp, sessions, mut ctx) = context(Some(1));
+            let ends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut hooks = crate::hooks::HookRunner::new();
+            hooks.register(Box::new(EndCounter(Arc::clone(&ends))));
+            Arc::get_mut(&mut ctx).unwrap().hooks = Some(Arc::new(hooks));
+            let (entered, release) = sessions.set_test_retirement_removal_pause();
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let task = spawn_orphan_retirement(&ctx, cancel.clone());
+
+            let mut client = remote(&ctx, "tui_late_cancel");
+            let session = open(&client).await;
+            disconnect(&ctx, &mut client).await;
+            tokio::time::timeout(Duration::from_secs(10), entered.notified())
+                .await
+                .expect("the task reaches the removal step");
+            cancel.cancel();
+            release.notify_one();
+
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("the task stops when cancelled")
+                .expect("the task does not panic");
+            assert_eq!(sessions.list_ids().await, vec![session]);
+            assert_eq!(ends.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+
+        /// A live ACP session owned by `tui_id`, served by the dummy provider,
+        /// with its durable record owned by `principal`.
+        async fn acp_session_with_a_provider(
+            ctx: &Arc<RpcContext>,
+            acp: &zeroclaw_infra::acp_session_store::AcpSessionStore,
+            workspace: &std::path::Path,
+            sid: &str,
+            tui_id: &str,
+            principal: &str,
+        ) {
+            let ws = workspace.to_str().unwrap();
+            acp.create_session(sid, "test-agent", ws, Some(principal))
+                .unwrap();
+            let agent = crate::agent::agent::Agent::builder()
+                .model_provider(Box::new(DummyModelProvider))
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![],
+                ))
+                .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+                .observer(Arc::new(crate::observability::noop::NoopObserver))
+                .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+                .workspace_dir(workspace.to_path_buf())
+                .agent_alias("test-agent".to_string())
+                .build()
+                .unwrap();
+            ctx.sessions
+                .insert(
+                    sid.to_string(),
+                    crate::rpc::session::RpcSession::new(
+                        agent,
+                        "test-agent",
+                        ws,
+                        crate::rpc::types::ChatMode::Acp,
+                    )
+                    .with_owner(Some(tui_id.to_string()))
+                    .with_owner_principal(Some(principal.to_string())),
+                )
+                .await
+                .unwrap();
+        }
+
+        async fn prompt_locally(ctx: &Arc<RpcContext>, sid: &str) -> RpcResult {
+            let (tx, _rx) = tokio::sync::mpsc::channel(256);
+            let mut operator = RpcDispatcher::new(Arc::clone(ctx), tx, "unix:operator".into());
+            operator.set_authenticated_for_test();
             operator
+                .handle_session_prompt(&json!({
+                    "session_id": sid,
+                    "prompt": "hello",
+                    "client_turn_generation": 1,
+                }))
+                .await
+        }
+
+        #[tokio::test]
+        async fn a_retired_acp_session_keeps_its_checkpointed_turn_and_comes_back() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (ctx, _chat, acp) = persistence_enforcement_ctx(make_acp_test_config(&tmp));
+            let sid = "acp-retired-after-a-turn";
+            let mut client = remote(&ctx, "tui_acp_turn");
+            acp_session_with_a_provider(
+                &ctx,
+                &acp,
+                tmp.path(),
+                sid,
+                "tui_acp_turn",
+                "principal-acp",
+            )
+            .await;
+            prompt_locally(&ctx, sid)
+                .await
+                .expect("the checkpointed turn completes");
+            let before = acp.load_session(sid).unwrap().unwrap();
+            let count = acp.projected_message_count(sid).unwrap();
+            assert!(
+                count.is_some_and(|n| n > 0),
+                "the turn stored messages: {count:?}"
+            );
+            disconnect(&ctx, &mut client).await;
+
+            assert_eq!(
+                retire_orphaned_sessions(&ctx, Instant::now() + TIMEOUT).await,
+                vec![sid.to_string()]
+            );
+            let after = acp.load_session(sid).unwrap().unwrap();
+            assert_eq!(
+                format!("{:?}", after.messages),
+                format!("{:?}", before.messages)
+            );
+            assert_eq!(after.principal_id.as_deref(), Some("principal-acp"));
+            assert_eq!(
+                (after.created_at, after.last_activity, after.token_count),
+                (before.created_at, before.last_activity, before.token_count)
+            );
+            assert_eq!(acp.projected_message_count(sid).unwrap(), count);
+
+            let (operator, _rx) = local_operator(&ctx).await;
+            let restored = operator
                 .handle_session_new_for_test(&json!({
                     "agent_alias": "test-agent",
                     "chat_mode": "acp",
-                    "session_id": session,
+                    "exclude_memory": true,
+                    "session_id": sid,
                 }))
                 .await
                 .expect("the retired ACP session resumes");
+            assert_eq!(
+                restored["message_count"],
+                json!(count.unwrap()),
+                "{restored}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_failed_acp_checkpoint_leaves_no_live_transcript_to_retire() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (ctx, _chat, acp) = persistence_enforcement_ctx(make_acp_test_config(&tmp));
+            let sid = "acp-checkpoint-failed";
+            let mut client = remote(&ctx, "tui_acp_failed");
+            acp_session_with_a_provider(
+                &ctx,
+                &acp,
+                tmp.path(),
+                sid,
+                "tui_acp_failed",
+                "principal-acp",
+            )
+            .await;
+            // A conflicting durable turn makes this turn's checkpoint fail to start.
+            acp.begin_turn_checkpoint(sid, "existing-turn", &[])
+                .unwrap();
+            assert!(prompt_locally(&ctx, sid).await.is_err());
+            disconnect(&ctx, &mut client).await;
+
+            assert!(
+                ctx.sessions.get_agent(sid).await.is_none(),
+                "a turn whose checkpoint failed leaves no live session behind"
+            );
+            assert!(
+                retire_orphaned_sessions(&ctx, Instant::now() + TIMEOUT)
+                    .await
+                    .is_empty()
+            );
+            assert!(acp.load_session(sid).unwrap().unwrap().messages.is_empty());
         }
 
         #[tokio::test]

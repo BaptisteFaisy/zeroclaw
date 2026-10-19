@@ -391,6 +391,10 @@ pub struct SessionStore {
     /// and before it is removed. Taken by the first retirement that reaches it.
     #[cfg(test)]
     test_retirement_pause: std::sync::Mutex<Option<PromptRegistrationPause>>,
+    /// Test-only pause inside the removal step of orphan retirement, while it
+    /// holds the session map. Taken by the first removal that reaches it.
+    #[cfg(test)]
+    test_retirement_removal_pause: std::sync::Mutex<Option<PromptRegistrationPause>>,
 }
 
 /// Generation-owned handle for the canonical cancellation-token registration.
@@ -478,6 +482,8 @@ impl SessionStore {
             test_upload_written_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
             test_retirement_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_retirement_removal_pause: std::sync::Mutex::new(None),
         }
     }
 
@@ -1807,6 +1813,7 @@ impl SessionStore {
         still_eligible: impl FnOnce() -> bool,
     ) -> Option<Arc<Mutex<Agent>>> {
         let mut sessions = self.sessions.lock().await;
+        self.wait_test_retirement_removal_pause().await;
         let unchanged = sessions
             .get(&expected.id)
             .and_then(|current| Self::owned(&expected.id, current))
@@ -2069,6 +2076,29 @@ impl SessionStore {
     #[cfg(not(test))]
     #[inline(always)]
     pub(crate) async fn wait_test_retirement_pause(&self) {}
+
+    #[cfg(test)]
+    async fn wait_test_retirement_removal_pause(&self) {
+        let Some((entered, release)) = self.test_retirement_removal_pause.lock().unwrap().take()
+        else {
+            return;
+        };
+        entered.notify_one();
+        release.notified().await;
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    async fn wait_test_retirement_removal_pause(&self) {}
+
+    #[cfg(test)]
+    pub(crate) fn set_test_retirement_removal_pause(&self) -> PromptRegistrationPause {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.test_retirement_removal_pause.lock().unwrap() =
+            Some((Arc::clone(&entered), Arc::clone(&release)));
+        (entered, release)
+    }
 
     #[cfg(test)]
     pub(crate) fn set_test_retirement_pause(&self) -> PromptRegistrationPause {
