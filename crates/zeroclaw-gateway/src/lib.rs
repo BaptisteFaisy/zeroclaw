@@ -942,6 +942,51 @@ fn config_admin_router(inbound_auth: &Arc<principal_gate::GatewayInboundAuth>) -
         ))
 }
 
+/// How long a stopping gateway lets its connections finish the requests in
+/// flight. It sits well inside the daemon's 500 ms grace for the gateway, so
+/// the drain is over before that grace runs out.
+const CONNECTION_DRAIN: Duration = Duration::from_millis(300);
+
+/// The connection tasks of one gateway's accept loop. Dropping this aborts
+/// every one still running, so no connection outlives its gateway, also when
+/// the daemon aborts the gateway before the drain ends.
+#[derive(Default)]
+struct ConnectionTasks(Vec<tokio::task::JoinHandle<()>>);
+
+impl ConnectionTasks {
+    fn add(&mut self, task: tokio::task::JoinHandle<()>) {
+        self.0.retain(|task| !task.is_finished());
+        self.0.push(task);
+    }
+
+    /// Wait up to `within` for every connection to finish, then abort the
+    /// rest. Whether all finished in time.
+    async fn drain(mut self, within: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + within;
+        for task in &mut self.0 {
+            if tokio::time::timeout_at(deadline, task).await.is_err() {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl Drop for ConnectionTasks {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
+
+/// Resolves when the gateway is told to stop; never, if it no longer can be.
+async fn gateway_stop_requested(stopping: &mut tokio::sync::watch::Receiver<bool>) {
+    if stopping.changed().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
 #[allow(clippy::too_many_lines)]
 // One parameter per daemon-owned dependency; a bundling struct would only
@@ -2549,84 +2594,109 @@ pub async fn run_gateway_with_plugin_webhooks(
         readiness.report_ready(actual_addr);
     }
 
-    if let Some(tls_acceptor) = tls_acceptor {
-        // Manual TLS accept loop — serves each connection via hyper.
-        let app = app.into_make_service_with_connect_info::<SocketAddr>();
-        let mut app = app;
-
-        let mut shutdown_signal = shutdown_rx;
-        loop {
-            tokio::select! {
-                conn = listener.accept() => {
-                    let (tcp_stream, remote_addr) = match conn {
-                        Ok(pair) => pair,
-                        Err(e) => {
-                            if is_recoverable_accept_error(&e) {
-                                // Transient (e.g. EMFILE under fd pressure):
-                                // the listener is still valid. Back off
-                                // briefly to avoid hot-spinning, then keep
-                                // serving rather than killing the daemon
-                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": format!("{}", e)})), "gateway accept() failed with a transient error; backing off and continuing");
-                                tokio::time::sleep(Duration::from_millis(ACCEPT_ERROR_BACKOFF_MS)).await;
-                                continue;
-                            }
-                            return Err(e.into());
+    // One accept loop for plain and TLS connections. Every connection
+    // watches this gateway's stop, and its task is owned by `connections`,
+    // so a stop reaches all of them and none outlives this gateway.
+    let mut app = app.into_make_service_with_connect_info::<SocketAddr>();
+    let mut connections = ConnectionTasks::default();
+    loop {
+        tokio::select! {
+            conn = listener.accept() => {
+                let (tcp_stream, remote_addr) = match conn {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        if is_recoverable_accept_error(&e) {
+                            // Transient (e.g. EMFILE under fd pressure):
+                            // the listener is still valid. Back off
+                            // briefly to avoid hot-spinning, then keep
+                            // serving rather than killing the daemon
+                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": format!("{}", e)})), "gateway accept() failed with a transient error; backing off and continuing");
+                            tokio::time::sleep(Duration::from_millis(ACCEPT_ERROR_BACKOFF_MS)).await;
+                            continue;
                         }
-                    };
-                    let tls_acceptor = tls_acceptor.clone();
-                    let svc = tower::MakeService::<
-                        SocketAddr,
-                        hyper::Request<hyper::body::Incoming>,
-                    >::make_service(&mut app, remote_addr)
-                    .await
-                    .expect("infallible make_service");
+                        return Err(e.into());
+                    }
+                };
+                let tls_acceptor = tls_acceptor.clone();
+                let svc = tower::MakeService::<
+                    SocketAddr,
+                    hyper::Request<hyper::body::Incoming>,
+                >::make_service(&mut app, remote_addr)
+                .await
+                .expect("infallible make_service");
+                // A clone of this loop's receiver, which was subscribed when
+                // the gateway started: it sees a stop that lands while the
+                // connection is being handed over too.
+                let mut stopping = shutdown_rx.clone();
 
-                    zeroclaw_spawn::spawn!(async move {
-                        let tls_stream = match tls_acceptor.accept(tcp_stream).await {
-                            Ok(s) => s,
-                            Err(e) => {
-                                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": format!("{}", e), "remote_addr": remote_addr})), "TLS handshake failed from");
-                                return;
-                            }
-                        };
-                        let io = hyper_util::rt::TokioIo::new(tls_stream);
-                        let hyper_svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
-                            let mut svc = svc.clone();
-                            async move {
-                                tower::Service::call(&mut svc, req).await
-                            }
-                        });
-                        if let Err(e) = hyper_util::server::conn::auto::Builder::new(
-                            hyper_util::rt::TokioExecutor::new(),
-                        )
-                        .serve_connection(io, hyper_svc)
-                        .await
-                        {
-                            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": format!("{}", e), "remote_addr": remote_addr})), "connection error from");
+                connections.add(zeroclaw_spawn::spawn!(async move {
+                    let hyper_svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                        let mut svc = svc.clone();
+                        async move {
+                            tower::Service::call(&mut svc, req).await
                         }
                     });
-                }
-                _ = shutdown_signal.changed() => {
-                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "ZeroClaw Gateway shutting down");
-                    break;
-                }
+                    let builder = hyper_util::server::conn::auto::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    );
+                    // Serve until the connection ends or the gateway stops; then
+                    // finish the request in flight and close (HTTP/1 closes
+                    // once its response is done). The drain below bounds it.
+                    macro_rules! serve_until_stopped {
+                        ($connection:expr) => {{
+                            let connection = $connection;
+                            tokio::pin!(connection);
+                            tokio::select! {
+                                served = connection.as_mut() => served,
+                                () = gateway_stop_requested(&mut stopping) => {
+                                    connection.as_mut().graceful_shutdown();
+                                    connection.as_mut().await
+                                }
+                            }
+                        }};
+                    }
+                    let served = match tls_acceptor {
+                        Some(tls_acceptor) => {
+                            let accepted = tokio::select! {
+                                accepted = tls_acceptor.accept(tcp_stream) => accepted,
+                                () = gateway_stop_requested(&mut stopping) => return,
+                            };
+                            let tls_stream = match accepted {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": format!("{}", e), "remote_addr": remote_addr})), "TLS handshake failed from");
+                                    return;
+                                }
+                            };
+                            let io = hyper_util::rt::TokioIo::new(tls_stream);
+                            serve_until_stopped!(builder.serve_connection(io, hyper_svc))
+                        }
+                        None => {
+                            let io = hyper_util::rt::TokioIo::new(tcp_stream);
+                            serve_until_stopped!(builder.serve_connection_with_upgrades(io, hyper_svc))
+                        }
+                    };
+                    if let Err(e) = served {
+                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": format!("{}", e), "remote_addr": remote_addr})), "connection error from");
+                    }
+                }));
+            }
+            _ = shutdown_rx.changed() => {
+                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "ZeroClaw Gateway shutting down");
+                break;
             }
         }
-    } else {
-        // Plain TCP — use axum's built-in serve.
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(async move {
-            let _ = shutdown_rx.changed().await;
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                "ZeroClaw Gateway shutting down"
-            );
-        })
-        .await?;
+    }
+    // Every connection finishes the request in flight and closes; whatever
+    // is still open after the drain (an event stream, a connection that
+    // ignored the shutdown) is aborted, so it cannot go on serving this
+    // generation's router after a reload.
+    if !connections.drain(CONNECTION_DRAIN).await {
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "gateway connections still open after the drain; closing them"
+        );
     }
 
     // Withdraw the tunnel before slower teardown below: the daemon allows a
