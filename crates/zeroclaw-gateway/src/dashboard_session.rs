@@ -3479,6 +3479,38 @@ mod tests {
             .count()
     }
 
+    /// A sign-in whose provider was repointed before its token was verified
+    /// (the pin it carries no longer matches the accepted policy) is
+    /// refused, and its token is sent to no provider.
+    #[tokio::test]
+    async fn a_sign_in_never_sends_its_token_to_a_repointed_provider() {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        for (case, pin) in [
+            (
+                "another issuer",
+                ProviderPin {
+                    issuer: "https://elsewhere.example".into(),
+                    client_id: "gw".into(),
+                },
+            ),
+            (
+                "another client",
+                ProviderPin {
+                    issuer: server.uri(),
+                    client_id: "gw2".into(),
+                },
+            ),
+        ] {
+            let refused = fixture
+                .auth
+                .sign_in("corp", pin, "at-alice".into(), 3600)
+                .await;
+            assert!(refused.is_err(), "{case}: the sign-in was admitted");
+        }
+        assert_eq!(token_requests(&server).await, 0, "the token was sent");
+    }
+
     /// A re-verification that a publish straddles never sends the held
     /// token to the provider the alias names afterwards. Repointed at
     /// another issuer, or at another client of the same issuer, the session
