@@ -7805,6 +7805,91 @@ path = "{trigger_path}"
         );
     }
 
+    /// A request whose service call was made before the stop, but that is
+    /// first polled after it, is refused like any other: admission is
+    /// decided when the request is first served, not when it was read.
+    #[tokio::test]
+    async fn a_request_taken_before_the_stop_and_served_after_it_is_refused() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let routed = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&routed);
+        let router = axum::Router::new().route(
+            "/",
+            axum::routing::get(move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                async { StatusCode::OK }
+            }),
+        );
+        let (stop, stopping) = tokio::sync::watch::channel(false);
+        let admission = Admission {
+            stopping,
+            tasks: ServeTasks::default(),
+        };
+        let request = axum::http::Request::get("/")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let served = serve_while_current(router, &admission, request);
+        stop.send_replace(true);
+        let response = served.await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            routed.load(Ordering::SeqCst),
+            0,
+            "a request taken before the stop reached the router after it"
+        );
+    }
+
+    /// A WebSocket upgrade request that races the stop on a kept HTTP/1.1
+    /// connection never upgrades. Written, then the stop sent, with no
+    /// yield between, the connection's task sees both at once: either the
+    /// connection closes before the request is read, or the request gets
+    /// the generic 503 and the connection closes.
+    #[tokio::test]
+    async fn an_upgrade_racing_the_stop_never_upgrades() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (addr, shutdown_tx, server) =
+            start_drain_test_gateway(&tmp.path().join("upgrade"), 0, None).await;
+        let mut kept = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let head = drain_test_request(&mut kept, "/health").await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+
+        kept.write_all(
+            b"GET /ws/chat HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\n\
+              Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        shutdown_tx.send(true).unwrap();
+        let mut answer = Vec::new();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            kept.read_to_end(&mut answer),
+        )
+        .await
+        .expect("the kept connection closes");
+        let answer = String::from_utf8_lossy(&answer).to_ascii_lowercase();
+        assert!(
+            !answer.contains(" 101 "),
+            "an upgrade was admitted after the stop: {answer}"
+        );
+        if !answer.is_empty() {
+            assert!(answer.starts_with("http/1.1 503"), "{answer}");
+            assert!(answer.contains("connection: close"), "{answer}");
+            assert!(
+                answer.contains(r#""reason":"gateway_restarting""#),
+                "{answer}"
+            );
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .expect("the gateway returns")
+            .expect("the gateway task does not panic")
+            .expect("the gateway stops cleanly");
+    }
+
     /// A task submitted after the set was cancelled (an HTTP/2 stream
     /// racing the stop) never runs: it is dropped, without another cancel.
     /// Sixteen of them, so a cancel checked in random order would let one
@@ -8001,8 +8086,18 @@ path = "{trigger_path}"
     /// An HTTP/2 client written frame by frame. It never acknowledges a
     /// PING, so a server's graceful shutdown stays in its first phase:
     /// GOAWAY sent, and streams the client sends meanwhile still accepted.
+    /// Its settings turn the server's header table off, so each response
+    /// header block decodes on its own.
     struct RawH2(Box<dyn DrainTestIo>);
 
+    /// One frame read: its type, flags and payload.
+    struct H2Frame {
+        kind: u8,
+        flags: u8,
+        payload: Vec<u8>,
+    }
+
+    const H2_DATA: u8 = 0x0;
     const H2_HEADERS: u8 = 0x1;
     const H2_RST_STREAM: u8 = 0x3;
     const H2_SETTINGS: u8 = 0x4;
@@ -8014,7 +8109,9 @@ path = "{trigger_path}"
             io.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
                 .await
                 .unwrap();
-            io.write_all(&h2_frame(H2_SETTINGS, 0, 0, &[]))
+            // SETTINGS_HEADER_TABLE_SIZE = 0.
+            let settings = [0x00, 0x01, 0, 0, 0, 0];
+            io.write_all(&h2_frame(H2_SETTINGS, 0, 0, &settings))
                 .await
                 .unwrap();
             let mut raw = Self(io);
@@ -8047,7 +8144,10 @@ path = "{trigger_path}"
 
         /// Read frames until one matches `(type, flags, stream)`; `None` if
         /// the connection ends first.
-        async fn next_frame_of(&mut self, matches: impl Fn(u8, u8, u32) -> bool) -> Option<u8> {
+        async fn next_frame_of(
+            &mut self,
+            matches: impl Fn(u8, u8, u32) -> bool,
+        ) -> Option<H2Frame> {
             use tokio::io::AsyncReadExt;
             tokio::time::timeout(std::time::Duration::from_secs(2), async {
                 loop {
@@ -8059,7 +8159,11 @@ path = "{trigger_path}"
                     let stream =
                         u32::from_be_bytes([head[5], head[6], head[7], head[8]]) & 0x7fff_ffff;
                     if matches(head[3], head[4], stream) {
-                        return Some(head[3]);
+                        return Some(H2Frame {
+                            kind: head[3],
+                            flags: head[4],
+                            payload,
+                        });
                     }
                 }
             })
@@ -8068,10 +8172,113 @@ path = "{trigger_path}"
         }
     }
 
+    /// Decode an HPACK Huffman string made only of digits (RFC 7541,
+    /// appendix B: `0` to `2` take five bits, `3` to `9` six); `None` for
+    /// anything else.
+    fn huffman_digits(bytes: &[u8]) -> Option<String> {
+        let bits: Vec<u8> = bytes
+            .iter()
+            .flat_map(|byte| (0..8).rev().map(move |i| (byte >> i) & 1))
+            .collect();
+        let take = |at: usize, n: usize| bits[at..at + n].iter().fold(0u8, |v, b| (v << 1) | b);
+        let mut digits = String::new();
+        let mut at = 0;
+        while at < bits.len() {
+            let rest = bits.len() - at;
+            if rest < 8 && bits[at..].iter().all(|bit| *bit == 1) {
+                break;
+            }
+            if rest >= 5 && take(at, 5) <= 2 {
+                digits.push(char::from(b'0' + take(at, 5)));
+                at += 5;
+            } else if rest >= 6 && (0x19..=0x1f).contains(&take(at, 6)) {
+                digits.push(char::from(b'0' + 3 + take(at, 6) - 0x19));
+                at += 6;
+            } else {
+                return None;
+            }
+        }
+        Some(digits)
+    }
+
+    /// The fields of a header block from a server keeping no header table.
+    /// Names beyond the few a gateway response uses read as `#<index>`, or
+    /// as their literal; a Huffman-coded string decodes only when it is all
+    /// digits (as a status or `Retry-After` is), and reads `<huffman>`
+    /// otherwise.
+    fn h2_header_fields(block: &[u8]) -> Vec<(String, String)> {
+        fn integer(block: &[u8], at: &mut usize, prefix: u32) -> usize {
+            let max = (1usize << prefix) - 1;
+            let mut value = usize::from(block[*at]) & max;
+            *at += 1;
+            if value == max {
+                let mut shift = 0;
+                loop {
+                    let byte = block[*at];
+                    *at += 1;
+                    value += usize::from(byte & 0x7f) << shift;
+                    shift += 7;
+                    if byte & 0x80 == 0 {
+                        break;
+                    }
+                }
+            }
+            value
+        }
+        fn string(block: &[u8], at: &mut usize) -> String {
+            let huffman = block[*at] & 0x80 != 0;
+            let len = integer(block, at, 7);
+            let bytes = &block[*at..*at + len];
+            *at += len;
+            if huffman {
+                huffman_digits(bytes).unwrap_or_else(|| "<huffman>".into())
+            } else {
+                String::from_utf8_lossy(bytes).into_owned()
+            }
+        }
+        fn name(index: usize) -> String {
+            match index {
+                8..=14 => ":status".into(),
+                28 => "content-length".into(),
+                31 => "content-type".into(),
+                33 => "date".into(),
+                53 => "retry-after".into(),
+                _ => format!("#{index}"),
+            }
+        }
+        let mut fields = Vec::new();
+        let mut at = 0;
+        while at < block.len() {
+            let first = block[at];
+            if first & 0x80 != 0 {
+                let index = integer(block, &mut at, 7);
+                let statuses = ["200", "204", "206", "304", "400", "404", "500"];
+                let value = index
+                    .checked_sub(8)
+                    .and_then(|i| statuses.get(i))
+                    .map_or("<indexed>", |status| *status);
+                fields.push((name(index), value.to_string()));
+            } else if first & 0xe0 == 0x20 {
+                integer(block, &mut at, 5);
+            } else {
+                let prefix = if first & 0xc0 == 0x40 { 6 } else { 4 };
+                let index = integer(block, &mut at, prefix);
+                let field = if index == 0 {
+                    string(block, &mut at)
+                } else {
+                    name(index)
+                };
+                fields.push((field, string(block, &mut at)));
+            }
+        }
+        fields
+    }
+
     /// Once stopped, a gateway admits no new HTTP/2 stream, though HTTP/2's
     /// graceful shutdown still accepts the streams a client sent before it
-    /// saw GOAWAY: such a stream is answered without reaching the router.
-    /// Over plain HTTP (h2c) and TLS.
+    /// saw GOAWAY: such a stream gets the generic 503 on the wire, with no
+    /// `Connection` header, and never reaches the router. Over plain HTTP
+    /// (h2c) and TLS.
     #[tokio::test]
     async fn a_stopped_gateway_admits_no_http2_stream_after_its_goaway() {
         let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
@@ -8109,10 +8316,47 @@ path = "{trigger_path}"
                 events.receiver_count() <= before,
                 "a stream sent after GOAWAY reached the stopped gateway's router (TLS: {over_tls})"
             );
+            let answer = answer.expect("the stream sent after GOAWAY is answered");
             assert_eq!(
-                answer,
-                Some(H2_HEADERS),
-                "the stream sent after GOAWAY is answered (TLS: {over_tls})"
+                answer.kind, H2_HEADERS,
+                "the stream sent after GOAWAY is answered, not reset (TLS: {over_tls})"
+            );
+            assert_eq!(answer.flags & 0x4, 0x4, "one header frame");
+            let fields = h2_header_fields(&answer.payload);
+            assert!(
+                fields.contains(&(":status".into(), "503".into())),
+                "TLS: {over_tls}: {fields:?}"
+            );
+            assert!(
+                fields.contains(&("retry-after".into(), "1".into())),
+                "TLS: {over_tls}: {fields:?}"
+            );
+            let allowed = [":status", "content-length", "content-type", "date", "retry-after"];
+            assert!(
+                fields.iter().all(|(name, _)| allowed.contains(&name.as_str())),
+                "no other header, and no Connection (TLS: {over_tls}): {fields:?}"
+            );
+            let mut body = Vec::new();
+            if answer.flags & 0x1 == 0 {
+                loop {
+                    let data = h2
+                        .next_frame_of(|kind, _, stream| stream == 3 && kind == H2_DATA)
+                        .await
+                        .expect("the response body");
+                    body.extend_from_slice(&data.payload);
+                    if data.flags & 0x1 != 0 {
+                        break;
+                    }
+                }
+            }
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                body,
+                serde_json::json!({
+                    "error": "The gateway is restarting. Try again.",
+                    "reason": "gateway_restarting",
+                }),
+                "TLS: {over_tls}"
             );
 
             drop(h2);
