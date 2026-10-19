@@ -7269,12 +7269,9 @@ path = "{trigger_path}"
         .with_no_client_auth();
         let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
 
-        let (addr, shutdown_tx, server) = start_drain_test_gateway(
-            &tmp.path().join("first"),
-            0,
-            Some((&cert_path, &key_path)),
-        )
-        .await;
+        let (addr, shutdown_tx, server) =
+            start_drain_test_gateway(&tmp.path().join("first"), 0, Some((&cert_path, &key_path)))
+                .await;
         let mut idle = drain_test_tls_connect(&connector, addr).await;
         let head = drain_test_request(&mut idle, "/health").await;
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");
@@ -7306,7 +7303,10 @@ path = "{trigger_path}"
         .await;
         let mut fresh = drain_test_tls_connect(&connector, addr).await;
         let head = drain_test_request(&mut fresh, "/health").await;
-        assert!(head.starts_with("HTTP/1.1 200"), "the next gateway serves: {head}");
+        assert!(
+            head.starts_with("HTTP/1.1 200"),
+            "the next gateway serves: {head}"
+        );
         next_shutdown.send(true).unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), next).await;
     }
@@ -7346,7 +7346,10 @@ path = "{trigger_path}"
             start_drain_test_gateway(&tmp.path().join("next"), addr.port(), None).await;
         let mut fresh = tokio::net::TcpStream::connect(addr).await.unwrap();
         let head = drain_test_request(&mut fresh, "/health").await;
-        assert!(head.starts_with("HTTP/1.1 200"), "the next gateway serves: {head}");
+        assert!(
+            head.starts_with("HTTP/1.1 200"),
+            "the next gateway serves: {head}"
+        );
         next_shutdown.send(true).unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), next).await;
     }
