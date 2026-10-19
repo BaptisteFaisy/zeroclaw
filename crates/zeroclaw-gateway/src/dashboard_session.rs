@@ -3545,8 +3545,7 @@ mod tests {
                 &config.gateway.paired_tokens,
                 PairingCodePolicy::default(),
             ));
-            let rpc =
-                Arc::new(RpcInboundAuth::from_config(&config, Arc::clone(&pairing)).unwrap());
+            let rpc = Arc::new(RpcInboundAuth::from_config(&config, Arc::clone(&pairing)).unwrap());
             let inbound = Arc::new(GatewayInboundAuth::from_shared(Arc::clone(&rpc)));
             let fixture = fixture_with(
                 config.clone(),

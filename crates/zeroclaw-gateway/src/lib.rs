@@ -8796,9 +8796,13 @@ path = "{trigger_path}"
         let tmp = tempfile::TempDir::new().unwrap();
         let (cert_path, key_path, connector) = drain_test_tls(tmp.path());
         let idp = crate::dashboard_session::test_support::idp(&["admins"], "gw").await;
-        let (addr, config, shutdown_tx, server) =
-            start_signed_in_tls_gateway(&tmp.path().join("signed-in"), &cert_path, &key_path, &idp.uri())
-                .await;
+        let (addr, config, shutdown_tx, server) = start_signed_in_tls_gateway(
+            &tmp.path().join("signed-in"),
+            &cert_path,
+            &key_path,
+            &idp.uri(),
+        )
+        .await;
         // Signed in on the process's shared store, which every generation reads.
         let pairing = Arc::new(PairingGuard::new(
             config.gateway.require_pairing,
@@ -8807,7 +8811,9 @@ path = "{trigger_path}"
         ));
         let auth = crate::dashboard_session::DashboardAuth::new(
             crate::dashboard_session::DashboardSessions::process_shared(),
-            Arc::new(crate::principal_gate::GatewayInboundAuth::from_config(&config, pairing).unwrap()),
+            Arc::new(
+                crate::principal_gate::GatewayInboundAuth::from_config(&config, pairing).unwrap(),
+            ),
         );
         let (cookie, _) = auth
             .sign_in(
@@ -8842,7 +8848,10 @@ path = "{trigger_path}"
             .expect("a first frame in time")
             .expect("the socket is open")
             .expect("a frame");
-        assert!(first.to_string().contains(r#""type":"connected""#), "{first}");
+        assert!(
+            first.to_string().contains(r#""type":"connected""#),
+            "{first}"
+        );
 
         shutdown_tx.send(true).unwrap();
         let closed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -8855,7 +8864,11 @@ path = "{trigger_path}"
         })
         .await
         .expect("the socket is closed when its gateway stops");
-        assert_eq!(closed, Some(CloseCode::Away), "closed with 1001 (going away)");
+        assert_eq!(
+            closed,
+            Some(CloseCode::Away),
+            "closed with 1001 (going away)"
+        );
         tokio::time::timeout(std::time::Duration::from_secs(2), server)
             .await
             .expect("the gateway returns")

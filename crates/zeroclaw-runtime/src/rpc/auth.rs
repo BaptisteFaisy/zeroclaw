@@ -702,8 +702,14 @@ impl RpcInboundAuth {
         auth_token: Option<&str>,
         auth_provider: Option<&str>,
     ) -> Result<ConnectionAuth, AuthDenied> {
-        self.authenticate_checked(transport, transport_credential, auth_token, auth_provider, None)
-            .await
+        self.authenticate_checked(
+            transport,
+            transport_credential,
+            auth_token,
+            auth_provider,
+            None,
+        )
+        .await
     }
 
     /// [`Self::authenticate`] for a bearer bound to one OIDC provider as it
@@ -748,10 +754,7 @@ impl RpcInboundAuth {
         // bearer: a provider repointed or removed since it was issued never
         // receives it.
         if let Some(binding) = binding
-            && state
-                .oidc_bindings
-                .get(auth_provider.unwrap_or_default())
-                != Some(binding)
+            && state.oidc_bindings.get(auth_provider.unwrap_or_default()) != Some(binding)
         {
             return Err(AuthDenied::from_deny_reason(DenyReason::UnknownProvider));
         }
