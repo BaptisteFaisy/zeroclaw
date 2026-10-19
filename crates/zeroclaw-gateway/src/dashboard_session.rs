@@ -1126,43 +1126,28 @@ pub(crate) fn rejection_response(rejection: SessionRejection) -> Response {
     rejection.body().into_response()
 }
 
+/// Shared test scaffolding for dashboard sign-in: a mock identity provider,
+/// the sign-in config block, and helpers to drive a real served gateway over
+/// sockets with a session cookie.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::Router;
-    use axum::body::Body;
-    use axum::extract::ConnectInfo;
-    use axum::http::Request as HttpRequest;
-    use axum::routing::get;
-    use http_body_util::BodyExt as _;
-    use std::collections::HashMap as Map;
+pub(crate) mod test_support {
+    use std::collections::HashMap;
     use std::net::SocketAddr;
-    use tower::ServiceExt as _;
+    use std::time::Duration;
+
+    use futures_util::StreamExt as _;
     use wiremock::matchers::{method as http_method, path as http_path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     use zeroclaw_api::grants::{Resource, Verb};
-    use zeroclaw_config::pairing::{PairingCodePolicy, PairingGuard};
     use zeroclaw_config::schema::{Config, OidcConfig, OidcValidation, PermissionProfileConfig};
 
-    const HOST: &str = "localhost:42617";
-    const OWN_ORIGIN: &str = "http://localhost:42617";
-
-    fn loopback() -> SocketAddr {
-        SocketAddr::from(([127, 0, 0, 1], 39999))
-    }
-
-    fn remote() -> SocketAddr {
-        SocketAddr::from(([203, 0, 113, 7], 40000))
-    }
-
-    fn unix_now() -> u64 {
-        now_unix()
-    }
+    pub(crate) type WsClient =
+        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
     /// An identity provider with discovery, an authorization endpoint the
     /// test never visits, and an introspection endpoint that vouches for any
     /// token as `sub` with `groups`, issued to `client_id`.
-    async fn idp(groups: &[&str], client_id: &str) -> MockServer {
+    pub(crate) async fn idp(groups: &[&str], client_id: &str) -> MockServer {
         let server = MockServer::start().await;
         let issuer = server.uri();
         Mock::given(http_method("GET"))
@@ -1185,7 +1170,7 @@ mod tests {
                 "iss": issuer,
                 "sub": "alice",
                 "aud": "zeroclaw",
-                "exp": unix_now() + 600,
+                "exp": super::now_unix() + 600,
                 "groups": groups,
                 "preferred_username": "alice@example.com",
             })))
@@ -1194,10 +1179,10 @@ mod tests {
         server
     }
 
-    fn sign_in_config(issuer: &str) -> Config {
-        let mut config = Config::default();
+    /// Turn sign-in on with one `corp` provider at `issuer`: group `admins`
+    /// maps to an administrator profile, group `ops` to a config reader.
+    pub(crate) fn add_sign_in(config: &mut Config, issuer: &str) {
         config.gateway.require_pairing = true;
-        config.gateway.paired_tokens = vec!["zc_paired".into()];
         config.gateway.dashboard_sign_in.oidc = vec!["corp".into()];
         config.oidc.insert(
             "corp".into(),
@@ -1208,7 +1193,7 @@ mod tests {
                 client_secret: Some("s3cret".into()),
                 validation: OidcValidation::Introspection,
                 claim_path: "groups".into(),
-                profile_map: Map::from([
+                profile_map: HashMap::from([
                     ("admins".to_string(), "admin".to_string()),
                     ("ops".to_string(), "config-reader".to_string()),
                 ]),
@@ -1227,10 +1212,162 @@ mod tests {
         config.permission_profiles.insert(
             "config-reader".into(),
             PermissionProfileConfig {
-                grants: Map::from([(Resource::Config, vec![Verb::Read])]),
+                grants: HashMap::from([(Resource::Config, vec![Verb::Read])]),
                 ..PermissionProfileConfig::default()
             },
         );
+    }
+
+    /// The same config with the `admins` group no longer mapped: an account
+    /// in both groups keeps only the config reader's grants.
+    pub(crate) fn without_admin_mapping(config: &Config) -> Config {
+        let mut revoked = config.clone();
+        if let Some(corp) = revoked.oidc.get_mut("corp") {
+            corp.profile_map.remove("admins");
+        }
+        revoked
+    }
+
+    /// Serve `router` on a loopback port with peer addresses, as the gateway
+    /// serves itself.
+    pub(crate) async fn serve(router: axum::Router) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback test gateway");
+        let addr = listener.local_addr().expect("test gateway address");
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .expect("test gateway serves");
+        });
+        (addr, server)
+    }
+
+    /// Open a WebSocket on `path` presenting the session `cookie` from the
+    /// gateway's own origin, as the dashboard does. `Err` carries the HTTP
+    /// status when the upgrade is refused.
+    pub(crate) async fn connect(
+        addr: SocketAddr,
+        path: &str,
+        cookie: &str,
+    ) -> Result<WsClient, u16> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+        // This URL connects only to the test's loopback listener.
+        let mut request = format!("ws://{addr}{path}") // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
+            .into_client_request()
+            .expect("WebSocket request");
+        let headers = request.headers_mut();
+        headers.insert("cookie", cookie.parse().expect("cookie header"));
+        headers.insert(
+            "origin",
+            format!("http://{addr}").parse().expect("origin header"),
+        );
+        match tokio_tungstenite::connect_async(request).await {
+            Ok((client, _)) => Ok(client),
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                Err(response.status().as_u16())
+            }
+            Err(other) => panic!("WebSocket transport failed: {other}"),
+        }
+    }
+
+    /// Read frames until the server closes; the close code, or `None` when
+    /// the deadline passes with the socket still open. Text frames seen on
+    /// the way are returned too.
+    pub(crate) async fn until_closed(
+        client: &mut WsClient,
+        deadline: Duration,
+    ) -> (Option<u16>, Vec<String>) {
+        use tokio_tungstenite::tungstenite::Message as ClientMessage;
+        let mut texts = Vec::new();
+        let outcome = tokio::time::timeout(deadline, async {
+            loop {
+                match client.next().await {
+                    Some(Ok(ClientMessage::Close(frame))) => {
+                        break Some(frame.map_or(1005, |frame| u16::from(frame.code)));
+                    }
+                    Some(Ok(ClientMessage::Text(text))) => texts.push(text.to_string()),
+                    Some(Ok(_)) => {}
+                    // The transport ended without a close frame.
+                    Some(Err(_)) | None => break Some(1006),
+                }
+            }
+        })
+        .await;
+        (outcome.ok().flatten(), texts)
+    }
+
+    /// `POST /auth/sign-out` over a real connection, as the dashboard sends
+    /// it. Returns the HTTP status.
+    pub(crate) async fn sign_out_over_http(addr: SocketAddr, cookie: &str, csrf: &str) -> u16 {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let mut stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect to the test gateway");
+        let request = format!(
+            "POST /auth/sign-out HTTP/1.1\r\nHost: {addr}\r\nCookie: {cookie}\r\n\
+             Origin: http://{addr}\r\n{}: {csrf}\r\nContent-Length: 0\r\n\
+             Connection: close\r\n\r\n",
+            super::CSRF_HEADER
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("send sign-out");
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .await
+            .expect("read sign-out answer");
+        response
+            .split_whitespace()
+            .nth(1)
+            .and_then(|status| status.parse().ok())
+            .expect("an HTTP status line")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::Router;
+    use axum::body::Body;
+    use axum::extract::ConnectInfo;
+    use axum::http::Request as HttpRequest;
+    use axum::routing::get;
+    use http_body_util::BodyExt as _;
+    use std::net::SocketAddr;
+    use std::time::Duration;
+    use tower::ServiceExt as _;
+    use wiremock::matchers::{method as http_method, path as http_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use zeroclaw_config::pairing::{PairingCodePolicy, PairingGuard};
+    use zeroclaw_config::schema::Config;
+
+    const HOST: &str = "localhost:42617";
+    const OWN_ORIGIN: &str = "http://localhost:42617";
+
+    fn loopback() -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 39999))
+    }
+
+    fn remote() -> SocketAddr {
+        SocketAddr::from(([203, 0, 113, 7], 40000))
+    }
+
+    fn unix_now() -> u64 {
+        now_unix()
+    }
+
+    use super::test_support::idp;
+
+    fn sign_in_config(issuer: &str) -> Config {
+        let mut config = Config::default();
+        config.gateway.paired_tokens = vec!["zc_paired".into()];
+        super::test_support::add_sign_in(&mut config, issuer);
         config
     }
 
@@ -1276,15 +1413,31 @@ mod tests {
         inbound: Arc<GatewayInboundAuth>,
         sessions: Arc<DashboardSessions>,
     ) -> Fixture {
+        generation(config, pairing, inbound, sessions, None)
+    }
+
+    /// One gateway generation. A reload builds the next one over the same
+    /// process-shared session store and, as the daemon does, the same canvas
+    /// store.
+    fn generation(
+        config: Config,
+        pairing: Arc<PairingGuard>,
+        inbound: Arc<GatewayInboundAuth>,
+        sessions: Arc<DashboardSessions>,
+        canvas_store: Option<zeroclaw_runtime::tools::CanvasStore>,
+    ) -> Fixture {
+        let base = crate::api::tests::test_state(config);
         let state = AppState {
             pairing,
-            ..crate::api::tests::test_state(config)
+            canvas_store: canvas_store.unwrap_or_else(|| base.canvas_store.clone()),
+            ..base
         };
         let auth = Arc::new(DashboardAuth::new(sessions, Arc::clone(&inbound)));
         let router = Router::new()
             .merge(crate::config_admin_router(&inbound))
             .merge(crate::api_oidc::routes())
             .route("/api/operator-probe", get(operator_probe))
+            .route("/ws/canvas/{id}", get(crate::canvas::handle_ws_canvas))
             .with_state(state.clone())
             .layer(axum::middleware::from_fn_with_state(
                 DashboardLayer {
@@ -1942,7 +2095,7 @@ mod tests {
                 issuer: "unused-by-store-tests".into(),
                 client_id: "gw".into(),
             },
-            bearer: "at-alice".into(),
+            bearer: "at-alice".to_string().into(),
             auth,
             authority: inbound.authority_ref(),
             display_name: "alice".into(),
@@ -2502,4 +2655,115 @@ mod tests {
     fn pin_for(fixture: &Fixture, alias: &str) -> ProviderPin {
         ProviderPin::of(&fixture.state.config.read().oidc[alias])
     }
+
+    // ── Review round 1 (findings 2 and 3) ─────────────────────────────
+
+    fn pairing_for(config: &Config) -> Arc<PairingGuard> {
+        Arc::new(PairingGuard::new(
+            config.gateway.require_pairing,
+            &config.gateway.paired_tokens,
+            PairingCodePolicy::default(),
+        ))
+    }
+
+    /// A socket opened in one gateway generation must not keep that
+    /// generation's grants after a reload: it closes when its generation
+    /// stops, a frame the next generation publishes never reaches it, and
+    /// reconnecting is judged by the new policy.
+    #[tokio::test]
+    async fn a_canvas_socket_does_not_outlive_its_gateway_generation() {
+        let server = idp(&["admins", "ops"], "gw").await;
+        let config = sign_in_config(&server.uri());
+        let sessions = Arc::new(DashboardSessions::default());
+        let pairing = pairing_for(&config);
+        let old = generation(
+            config.clone(),
+            Arc::clone(&pairing),
+            Arc::new(GatewayInboundAuth::from_config(&config, Arc::clone(&pairing)).unwrap()),
+            Arc::clone(&sessions),
+            None,
+        );
+        let (cookie, _) = old
+            .auth
+            .sign_in("corp", pin_for(&old, "corp"), "at-alice".to_string(), 3600)
+            .await
+            .expect("an administrator signs in");
+        let cookie = format!("{SESSION_COOKIE}={cookie}");
+        let (old_addr, old_server) = test_support::serve(old.router.clone()).await;
+        let mut socket = test_support::connect(old_addr, "/ws/canvas/c1", &cookie)
+            .await
+            .expect("an administrator opens the canvas feed");
+
+        // The reload: the old generation is told to stop, and the next one
+        // no longer maps the admin group. Both share the canvas store.
+        old.state.shutdown_tx.send_replace(true);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let revoked = test_support::without_admin_mapping(&config);
+        let pairing = pairing_for(&revoked);
+        let new = generation(
+            revoked.clone(),
+            Arc::clone(&pairing),
+            Arc::new(GatewayInboundAuth::from_config(&revoked, pairing).unwrap()),
+            Arc::clone(&sessions),
+            Some(old.state.canvas_store.clone()),
+        );
+        new.state
+            .canvas_store
+            .render("c1", "text/plain", "published after the reload");
+
+        let (code, texts) = test_support::until_closed(&mut socket, Duration::from_secs(3)).await;
+        assert!(
+            !texts.iter().any(|text| text.contains("published after the reload")),
+            "a frame published after the reload reached the old socket: {texts:?}"
+        );
+        assert!(code.is_some(), "the old generation's socket stays open");
+
+        let (new_addr, new_server) = test_support::serve(new.router.clone()).await;
+        let reconnect = test_support::connect(new_addr, "/ws/canvas/c1", &cookie).await;
+        assert_eq!(
+            reconnect.err(),
+            Some(403),
+            "the new policy no longer grants the canvas feed"
+        );
+        old_server.abort();
+        new_server.abort();
+    }
+
+    #[tokio::test]
+    async fn the_session_store_holds_the_token_in_a_zeroizing_buffer() {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let new = new_session(verified_auth(&fixture).await, &fixture.auth.inbound, 3600);
+        let staged = std::any::type_name_of_val(&new.bearer);
+        assert!(staged.contains("Zeroizing"), "a staged sign-in holds the token as {staged}");
+        fixture.auth.sessions.insert(new, unix_now()).unwrap();
+        let sessions = fixture.auth.sessions.sessions.lock();
+        let held = sessions.values().next().expect("the session is stored");
+        let stored = std::any::type_name_of_val(&held.bearer);
+        assert!(stored.contains("Zeroizing"), "a stored session holds the token as {stored}");
+    }
+
+    /// Nothing but time passes: no request, no sign-in. An expired session
+    /// and its token must still leave the store within the sweep interval.
+    #[tokio::test]
+    async fn an_idle_expired_session_is_swept_without_any_request() {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let auth = verified_auth(&fixture).await;
+        // Its hard expiry (lifetime 0) comes before the token's own expiry.
+        let (_cookie, view) = fixture
+            .auth
+            .sessions
+            .insert(new_session(auth, &fixture.auth.inbound, 0), unix_now())
+            .unwrap();
+        assert_eq!(fixture.auth.sessions.len(), 1, "nothing has checked the store yet");
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(61)).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(fixture.auth.sessions.len(), 0, "the idle sweep removed it");
+        assert!(view.ended.is_cancelled(), "and told its sockets");
+    }
+
 }

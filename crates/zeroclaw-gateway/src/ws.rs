@@ -3216,11 +3216,32 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         /// once this reaches n.
         released: tokio::sync::watch::Sender<usize>,
         servers: Vec<tokio::task::JoinHandle<()>>,
+        /// Present when the gateway serves dashboard sign-in.
+        signed_in: Option<SignedInParts>,
         _tmp: tempfile::TempDir,
+    }
+
+    /// The sign-in half of a signed-in fixture: the session authority, and
+    /// the inbound authority shared with it, so a test can publish a policy
+    /// change the open sockets must see.
+    struct SignedInParts {
+        dashboard: Arc<crate::dashboard_session::DashboardAuth>,
+        rpc_auth: Arc<zeroclaw_runtime::rpc::auth::RpcInboundAuth>,
+        config: zeroclaw_config::schema::Config,
     }
 
     impl ParkedTurnFixture {
         async fn spawn() -> Self {
+            Self::spawn_with(None).await
+        }
+
+        /// The same gateway with dashboard sign-in offering `corp` at
+        /// `issuer`, under the session layer, with `/auth/sign-out` served.
+        async fn spawn_signed_in(issuer: &str) -> Self {
+            Self::spawn_with(Some(issuer)).await
+        }
+
+        async fn spawn_with(sign_in: Option<&str>) -> Self {
             let (request_seen_tx, request_seen) =
                 tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
             let (released, released_rx) = tokio::sync::watch::channel(0usize);
@@ -3308,25 +3329,77 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                 },
             );
 
+            if let Some(issuer) = sign_in {
+                crate::dashboard_session::test_support::add_sign_in(&mut config, issuer);
+            }
+
             let backend = zeroclaw_infra::make_session_backend(&workspace, "sqlite")
                 .expect("sqlite session backend");
+            if sign_in.is_none() {
+                let state = AppState {
+                    session_backend: Some(backend.clone()),
+                    ..crate::api::tests::test_state(config)
+                };
+                let gateway_app = Router::new()
+                    .route("/ws/chat", get(handle_ws_chat))
+                    .with_state(state.clone());
+                let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind local WebSocket gateway");
+                let gateway_addr = gateway_listener.local_addr().expect("gateway address");
+                let gateway_server = zeroclaw_spawn::spawn!(async move {
+                    axum::serve(gateway_listener, gateway_app)
+                        .await
+                        .expect("local WebSocket gateway serves");
+                });
+                return Self {
+                    state,
+                    backend,
+                    gateway_addr,
+                    request_seen,
+                    released,
+                    servers: vec![mock_server, gateway_server],
+                    signed_in: None,
+                    _tmp: tmp,
+                };
+            }
+
+            let pairing = Arc::new(zeroclaw_config::pairing::PairingGuard::new(
+                config.gateway.require_pairing,
+                &config.gateway.paired_tokens,
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
+            ));
+            let rpc_auth = Arc::new(
+                zeroclaw_runtime::rpc::auth::RpcInboundAuth::from_config(
+                    &config,
+                    Arc::clone(&pairing),
+                )
+                .expect("inbound auth builds"),
+            );
+            let dashboard = Arc::new(crate::dashboard_session::DashboardAuth::new(
+                Arc::new(crate::dashboard_session::DashboardSessions::default()),
+                Arc::new(crate::principal_gate::GatewayInboundAuth::from_shared(
+                    Arc::clone(&rpc_auth),
+                )),
+            ));
             let state = AppState {
                 session_backend: Some(backend.clone()),
-                ..crate::api::tests::test_state(config)
+                pairing,
+                ..crate::api::tests::test_state(config.clone())
             };
             let gateway_app = Router::new()
                 .route("/ws/chat", get(handle_ws_chat))
-                .with_state(state.clone());
-            let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("bind local WebSocket gateway");
-            let gateway_addr = gateway_listener.local_addr().expect("gateway address");
-            let gateway_server = zeroclaw_spawn::spawn!(async move {
-                axum::serve(gateway_listener, gateway_app)
-                    .await
-                    .expect("local WebSocket gateway serves");
-            });
-
+                .merge(crate::api_oidc::routes())
+                .with_state(state.clone())
+                .layer(axum::middleware::from_fn_with_state(
+                    crate::dashboard_session::DashboardLayer {
+                        state: state.clone(),
+                        auth: Arc::clone(&dashboard),
+                    },
+                    crate::dashboard_session::layer,
+                ));
+            let (gateway_addr, gateway_server) =
+                crate::dashboard_session::test_support::serve(gateway_app).await;
             Self {
                 state,
                 backend,
@@ -3334,8 +3407,69 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                 request_seen,
                 released,
                 servers: vec![mock_server, gateway_server],
+                signed_in: Some(SignedInParts {
+                    dashboard,
+                    rpc_auth,
+                    config,
+                }),
                 _tmp: tmp,
             }
+        }
+
+        fn signed_in(&self) -> &SignedInParts {
+            self.signed_in
+                .as_ref()
+                .expect("a fixture spawned with spawn_signed_in")
+        }
+
+        /// Sign `alice` in through the configured provider; the cookie header
+        /// and the session's CSRF token.
+        async fn sign_in(&self, lifetime_secs: u64) -> (String, String) {
+            let parts = self.signed_in();
+            let (cookie, session) = parts
+                .dashboard
+                .sign_in(
+                    "corp",
+                    crate::dashboard_session::ProviderPin::of(&parts.config.oidc["corp"]),
+                    "at-alice".to_string(),
+                    lifetime_secs,
+                )
+                .await
+                .expect("alice signs in");
+            (
+                format!("{}={cookie}", crate::dashboard_session::SESSION_COOKIE),
+                session.csrf.clone(),
+            )
+        }
+
+        /// Open a chat socket on `session_id` with the session cookie, from
+        /// the gateway's own origin; the socket and its `session_start`.
+        async fn connect_signed_in(
+            &self,
+            session_id: &str,
+            cookie: &str,
+        ) -> (WsClient, serde_json::Value) {
+            let mut client = crate::dashboard_session::test_support::connect(
+                self.gateway_addr,
+                &format!("/ws/chat?agent=web&session_id={session_id}"),
+                cookie,
+            )
+            .await
+            .expect("a signed-in administrator opens the chat");
+            let session_start = next_text_frame(&mut client).await;
+            assert_eq!(session_start["type"], "session_start");
+            (client, session_start)
+        }
+
+        /// Publish the same policy with the `admins` group no longer mapped.
+        fn revoke_admin(&self) {
+            let parts = self.signed_in();
+            let revoked =
+                crate::dashboard_session::test_support::without_admin_mapping(&parts.config);
+            parts
+                .rpc_auth
+                .publish_accepted(&revoked, parts.rpc_auth.accepted_revision() + 1)
+                .expect("the revoked policy is accepted");
         }
 
         /// Open a chat socket on `session_id` and return it with the
@@ -3477,6 +3611,176 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         client.close(None).await.expect("client close frame");
         drop(client);
         tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    // ── Dashboard sign-in: a session that ends takes the socket with it ──
+    //
+    // Each socket below belongs to a signed-in administrator, and each test
+    // ends that authority while the socket is open: by sign-out over HTTP,
+    // by expiry, or by a policy that no longer grants it. The socket must
+    // close with the session's code, and nothing it sends afterwards may be
+    // acted on. The admitted turn itself is not cancelled; it finishes
+    // unattended, as when a viewer detaches.
+
+    async fn send_raw(client: &mut WsClient, frame: serde_json::Value) {
+        // The server may already be closing; a failed send is not the point.
+        let _ = client.send(ClientMessage::Text(frame.to_string().into())).await;
+    }
+
+    #[test]
+    fn a_signed_in_chat_socket_closes_on_sign_out_mid_turn() {
+        run_ws_regression(
+            "ws-signin-signout-mid-turn",
+            a_signed_in_chat_socket_closes_on_sign_out_mid_turn_inner,
+        );
+    }
+
+    async fn a_signed_in_chat_socket_closes_on_sign_out_mid_turn_inner() {
+        let idp = crate::dashboard_session::test_support::idp(&["admins"], "gw").await;
+        let mut fixture = ParkedTurnFixture::spawn_signed_in(&idp.uri()).await;
+        let (cookie, csrf) = fixture.sign_in(3600).await;
+        let session_id = "signin-signout-mid-turn";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        let (mut client, _) = fixture.connect_signed_in(session_id, &cookie).await;
+        fixture.start_parked_turn(&mut client, "hold this turn").await;
+        assert!(fixture.has_live_turn(&session_key), "the turn is in flight");
+
+        let status = crate::dashboard_session::test_support::sign_out_over_http(
+            fixture.gateway_addr,
+            &cookie,
+            &csrf,
+        )
+        .await;
+        assert_eq!(status, 204, "sign-out succeeds");
+        // What the old socket sends after sign-out must not be acted on.
+        send_raw(
+            &mut client,
+            serde_json::json!({"type": "approval_response", "request_id": "r-1", "decision": "approve"}),
+        )
+        .await;
+        send_raw(&mut client, serde_json::json!({"type": "message", "content": "steer after sign-out"}))
+            .await;
+
+        let (code, _) = crate::dashboard_session::test_support::until_closed(
+            &mut client,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(code, Some(4401), "the socket closes as soon as the session ends");
+        assert!(
+            fixture.has_live_turn(&session_key),
+            "closing the socket does not cancel the admitted turn"
+        );
+        fixture.release_next();
+        fixture.wait_for_turn_to_settle(&session_key).await;
+        let followed_up = fixture.request_seen.try_recv().is_ok();
+        assert!(!followed_up, "nothing sent after sign-out reached the model");
+        fixture.shutdown();
+    }
+
+    #[test]
+    fn a_signed_in_chat_socket_closes_when_its_session_expires_mid_turn() {
+        run_ws_regression(
+            "ws-signin-expiry-mid-turn",
+            a_signed_in_chat_socket_closes_when_its_session_expires_mid_turn_inner,
+        );
+    }
+
+    async fn a_signed_in_chat_socket_closes_when_its_session_expires_mid_turn_inner() {
+        let idp = crate::dashboard_session::test_support::idp(&["admins"], "gw").await;
+        let mut fixture = ParkedTurnFixture::spawn_signed_in(&idp.uri()).await;
+        let (cookie, _) = fixture.sign_in(2).await;
+        let session_id = "signin-expiry-mid-turn";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        let (mut client, _) = fixture.connect_signed_in(session_id, &cookie).await;
+        fixture.start_parked_turn(&mut client, "hold this turn").await;
+
+        let (code, _) = crate::dashboard_session::test_support::until_closed(
+            &mut client,
+            Duration::from_secs(8),
+        )
+        .await;
+        assert_eq!(code, Some(4401), "the socket closes when the session expires, mid-turn");
+        assert!(fixture.has_live_turn(&session_key));
+        fixture.release_next();
+        fixture.wait_for_turn_to_settle(&session_key).await;
+        fixture.shutdown();
+    }
+
+    #[test]
+    fn a_signed_in_chat_socket_closes_when_the_account_loses_admin_mid_turn() {
+        run_ws_regression(
+            "ws-signin-admin-removed-mid-turn",
+            a_signed_in_chat_socket_closes_when_the_account_loses_admin_mid_turn_inner,
+        );
+    }
+
+    async fn a_signed_in_chat_socket_closes_when_the_account_loses_admin_mid_turn_inner() {
+        // In both groups: losing the admin mapping leaves a valid session
+        // that may no longer use the in-process chat.
+        let idp = crate::dashboard_session::test_support::idp(&["admins", "ops"], "gw").await;
+        let mut fixture = ParkedTurnFixture::spawn_signed_in(&idp.uri()).await;
+        let (cookie, _) = fixture.sign_in(3600).await;
+        let session_id = "signin-admin-removed-mid-turn";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        let (mut client, _) = fixture.connect_signed_in(session_id, &cookie).await;
+        fixture.start_parked_turn(&mut client, "hold this turn").await;
+
+        fixture.revoke_admin();
+        send_raw(&mut client, serde_json::json!({"type": "message", "content": "steer after revocation"}))
+            .await;
+        let (code, _) = crate::dashboard_session::test_support::until_closed(
+            &mut client,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(code, Some(4403), "the socket closes once its account loses the access it needs");
+        fixture.release_next();
+        fixture.wait_for_turn_to_settle(&session_key).await;
+        let followed_up = fixture.request_seen.try_recv().is_ok();
+        assert!(!followed_up, "the steering sent after revocation never reached the model");
+        fixture.shutdown();
+    }
+
+    #[test]
+    fn input_buffered_after_sign_out_between_turns_starts_no_turn() {
+        run_ws_regression(
+            "ws-signin-buffered-after-signout",
+            input_buffered_after_sign_out_between_turns_starts_no_turn_inner,
+        );
+    }
+
+    async fn input_buffered_after_sign_out_between_turns_starts_no_turn_inner() {
+        let idp = crate::dashboard_session::test_support::idp(&["admins"], "gw").await;
+        let mut fixture = ParkedTurnFixture::spawn_signed_in(&idp.uri()).await;
+        let (cookie, csrf) = fixture.sign_in(3600).await;
+        let (mut client, _) = fixture.connect_signed_in("signin-buffered", &cookie).await;
+
+        let status = crate::dashboard_session::test_support::sign_out_over_http(
+            fixture.gateway_addr,
+            &cookie,
+            &csrf,
+        )
+        .await;
+        assert_eq!(status, 204);
+        for n in 0..5 {
+            send_raw(
+                &mut client,
+                serde_json::json!({"type": "message", "content": format!("message {n} after sign-out")}),
+            )
+            .await;
+        }
+        let (code, _) = crate::dashboard_session::test_support::until_closed(
+            &mut client,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(code, Some(4401));
+        let started = tokio::time::timeout(Duration::from_millis(500), fixture.request_seen.recv())
+            .await
+            .is_ok();
+        assert!(!started, "a message buffered after sign-out started a turn");
+        fixture.shutdown();
     }
 
     #[test]
