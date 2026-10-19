@@ -63,6 +63,29 @@ The local endpoint bounds what one client can hold:
 Payloads larger than a frame travel as a chunked upload rather than in one
 line. See [Chunked uploads](#chunked-uploads).
 
+## Live sessions
+
+The daemon keeps at most 64 sessions live at once, across all clients. Past
+that, `session/new` is refused with `-32001` ("Session limit reached").
+
+A session stays live when its client disconnects, so the client can reconnect
+with its identity and carry on. A remote client (WSS) that stays away
+releases its sessions. Once the client has had no live connection for
+`wss.orphaned_session_timeout_secs` (default 1800), the daemon closes each of
+its sessions that:
+
+- has also been idle that long;
+- has no turn running;
+- has no approval pending.
+
+Closing one works as `session/close` does: the session leaves the live map,
+and its transcript is kept. The daemon logs each one it closes.
+
+Sessions of local clients are not closed this way. Setting
+`wss.orphaned_session_timeout_secs` to `0` keeps every orphaned session live
+until the daemon restarts. A change takes effect within a minute, without a
+restart.
+
 ## Handshake
 
 The first RPC call must be `initialize`. The daemon rejects all other methods
