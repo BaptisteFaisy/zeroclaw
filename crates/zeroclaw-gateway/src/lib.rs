@@ -1021,7 +1021,12 @@ impl ServeTasks {
         }
     }
 
-    fn abort_all(&self) {
+    /// How many tasks are running.
+    fn live(&self) -> usize {
+        self.0.running.lock().len()
+    }
+
+    fn cancel(&self) {
         for task in self.0.running.lock().values() {
             task.abort();
         }
@@ -1033,7 +1038,7 @@ impl ServeTasks {
         if tokio::time::timeout(within, self.idle()).await.is_ok() {
             return true;
         }
-        self.abort_all();
+        self.cancel();
         if tokio::time::timeout(RETIRE_JOIN, self.idle())
             .await
             .is_err()
@@ -1067,9 +1072,15 @@ where
 /// ended.
 struct ServeTasksGuard(ServeTasks, &'static Retiring);
 
+impl ServeTasksGuard {
+    fn new(tasks: ServeTasks) -> Self {
+        Self(tasks, &RETIRING)
+    }
+}
+
 impl Drop for ServeTasksGuard {
     fn drop(&mut self) {
-        self.0.abort_all();
+        self.0.cancel();
         if !self.0.0.running.lock().is_empty() {
             self.1.add(self.0.clone());
         }
@@ -1114,6 +1125,35 @@ static RETIRING: Retiring = Retiring::new();
 /// gateway never serves while an aborted one's tasks are still running.
 async fn previous_gateways_retired() {
     RETIRING.wait().await;
+}
+
+/// Whether the gateway that accepted a connection still admits requests on
+/// it.
+#[derive(Clone)]
+struct Admission {
+    stopping: tokio::sync::watch::Receiver<bool>,
+    tasks: ServeTasks,
+}
+
+impl Admission {
+    fn admits(&self) -> bool {
+        // Every request is admitted, as before.
+        let _ = (&self.stopping, &self.tasks);
+        true
+    }
+}
+
+/// Serve one request on a connection the gateway accepted.
+async fn serve_while_current<S, B>(
+    mut svc: S,
+    admission: &Admission,
+    req: axum::http::Request<B>,
+) -> Result<Response, std::convert::Infallible>
+where
+    S: tower::Service<axum::http::Request<B>, Response = Response, Error = std::convert::Infallible>,
+{
+    let _ = admission.admits();
+    tower::Service::call(&mut svc, req).await
 }
 
 /// What the accept loop does after `accept()` failed.
@@ -2784,7 +2824,11 @@ pub async fn run_gateway_with_plugin_webhooks(
     // so a stop reaches all of them and none outlives this gateway.
     let mut app = app.into_make_service_with_connect_info::<SocketAddr>();
     let tasks = ServeTasks::default();
-    let _abort_on_drop = ServeTasksGuard(tasks.clone(), &RETIRING);
+    let _abort_on_drop = ServeTasksGuard::new(tasks.clone());
+    let admission = Admission {
+        stopping: shutdown_rx.clone(),
+        tasks: tasks.clone(),
+    };
     loop {
         tokio::select! {
             conn = listener.accept() => {
@@ -2819,13 +2863,13 @@ pub async fn run_gateway_with_plugin_webhooks(
                 // connection is being handed over too.
                 let mut stopping = shutdown_rx.clone();
                 let executor = tasks.clone();
+                let admission = admission.clone();
 
                 tasks.spawn(async move {
                     let hyper_svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
-                        let mut svc = svc.clone();
-                        async move {
-                            tower::Service::call(&mut svc, req).await
-                        }
+                        let svc = svc.clone();
+                        let admission = admission.clone();
+                        async move { serve_while_current(svc, &admission, req).await }
                     });
                     let builder = hyper_util::server::conn::auto::Builder::new(executor);
                     // Serve until the connection ends or the gateway stops; then
