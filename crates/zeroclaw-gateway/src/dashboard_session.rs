@@ -1321,6 +1321,46 @@ pub(crate) mod test_support {
         server
     }
 
+    /// From now on, `server` answers introspection only after `delay`, so a
+    /// check that has to verify the session again takes that long.
+    pub(crate) async fn slow_introspection(
+        server: &MockServer,
+        groups: &[&str],
+        client_id: &str,
+        delay: Duration,
+    ) {
+        Mock::given(http_method("POST"))
+            .and(http_path("/introspect"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({
+                        "active": true,
+                        "token_type": "Bearer",
+                        "client_id": client_id,
+                        "iss": server.uri(),
+                        "sub": "alice",
+                        "aud": "zeroclaw",
+                        "exp": super::now_unix() + 600,
+                        "groups": groups,
+                        "preferred_username": "alice@example.com",
+                    }))
+                    .set_delay(delay),
+            )
+            .with_priority(1)
+            .mount(server)
+            .await;
+    }
+
+    /// Verify the `corp` session again at every check (introspection with
+    /// no revalidation interval).
+    pub(crate) fn verify_every_time(config: &mut Config) {
+        config
+            .oidc
+            .get_mut("corp")
+            .expect("sign-in is configured")
+            .revalidation_secs = 0;
+    }
+
     /// Turn sign-in on with one `corp` provider at `issuer`: group `admins`
     /// maps to an administrator profile, group `ops` to a config reader.
     pub(crate) fn add_sign_in(config: &mut Config, issuer: &str) {
@@ -1568,10 +1608,24 @@ mod tests {
         sessions: Arc<DashboardSessions>,
         canvas_store: Option<zeroclaw_runtime::tools::CanvasStore>,
     ) -> Fixture {
+        build_generation(config, pairing, inbound, sessions, canvas_store, None)
+    }
+
+    type SharedSopEngine = Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>;
+
+    fn build_generation(
+        config: Config,
+        pairing: Arc<PairingGuard>,
+        inbound: Arc<GatewayInboundAuth>,
+        sessions: Arc<DashboardSessions>,
+        canvas_store: Option<zeroclaw_runtime::tools::CanvasStore>,
+        sop_engine: Option<SharedSopEngine>,
+    ) -> Fixture {
         let base = crate::api::tests::test_state(config);
         let state = AppState {
             pairing,
             canvas_store: canvas_store.unwrap_or_else(|| base.canvas_store.clone()),
+            sop_engine,
             ..base
         };
         let auth = Arc::new(DashboardAuth::new(sessions, Arc::clone(&inbound)));
@@ -1580,6 +1634,8 @@ mod tests {
             .merge(crate::api_oidc::routes())
             .route("/api/operator-probe", get(operator_probe))
             .route("/ws/canvas/{id}", get(crate::canvas::handle_ws_canvas))
+            .route("/api/events", get(crate::sse::handle_sse_events))
+            .route("/ws/sop/runs", get(crate::ws_sop_runs::handle_ws_sop_runs))
             .with_state(state.clone())
             .layer(axum::middleware::from_fn_with_state(
                 DashboardLayer {
@@ -2987,5 +3043,520 @@ mod tests {
         }
         assert_eq!(fixture.auth.sessions.len(), 0, "the idle sweep removed it");
         assert!(view.ended.is_cancelled(), "and told its sockets");
+    }
+
+    // ── Review round 2 ────────────────────────────────────────────────
+
+    fn inbound_for(config: &Config) -> Arc<GatewayInboundAuth> {
+        Arc::new(
+            GatewayInboundAuth::from_config(config, pairing_for(config))
+                .expect("inbound auth builds"),
+        )
+    }
+
+    fn cookie_for(cookie: &str) -> String {
+        format!("{SESSION_COOKIE}={cookie}")
+    }
+
+    /// A request whose session has to be verified again, slowly, is refused
+    /// when the session's hard expiry passes while it waits, although the
+    /// token itself is still valid.
+    #[tokio::test]
+    async fn an_http_admission_verified_past_hard_expiry_is_refused() {
+        let server = idp(&["admins"], "gw").await;
+        let mut config = sign_in_config(&server.uri());
+        test_support::verify_every_time(&mut config);
+        let fixture = fixture(config);
+        let (cookie, _) = fixture
+            .auth
+            .sign_in("corp", pin_for(&fixture, "corp"), "at-alice".into(), 2)
+            .await
+            .expect("alice signs in");
+        test_support::slow_introspection(&server, &["admins"], "gw", Duration::from_secs(4))
+            .await;
+        let (status, body) = probe(&fixture, &[("cookie", &cookie_for(&cookie))]).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a request was admitted past the session's hard expiry"
+        );
+        assert_eq!(body["reason"], "session_expired");
+    }
+
+    /// A frame's check that has to verify the session again, slowly, ends
+    /// at the session's hard expiry instead of admitting the frame after it.
+    #[tokio::test]
+    async fn a_frame_check_cut_short_by_expiry_refuses_the_frame() {
+        let server = idp(&["admins"], "gw").await;
+        let mut config = sign_in_config(&server.uri());
+        test_support::verify_every_time(&mut config);
+        let fixture = fixture(config);
+        let (_, session) = fixture
+            .auth
+            .sign_in("corp", pin_for(&fixture, "corp"), "at-alice".into(), 2)
+            .await
+            .expect("alice signs in");
+        let mut watch = SessionWatch::new(Arc::clone(&fixture.auth), session, true, &fixture.state);
+        test_support::slow_introspection(&server, &["admins"], "gw", Duration::from_secs(6))
+            .await;
+        let started = std::time::Instant::now();
+        let verdict = watch.admits_now(&fixture.state).await;
+        assert_eq!(
+            verdict,
+            Err(WS_CLOSE_SESSION_ENDED),
+            "a frame was admitted past the session's hard expiry"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the refusal waited for the slow check: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The same check ends when the socket's gateway generation stops.
+    #[tokio::test]
+    async fn a_frame_check_cut_short_by_generation_stop_refuses_the_frame() {
+        let server = idp(&["admins"], "gw").await;
+        let mut config = sign_in_config(&server.uri());
+        test_support::verify_every_time(&mut config);
+        let fixture = fixture(config);
+        let (_, session) = fixture
+            .auth
+            .sign_in("corp", pin_for(&fixture, "corp"), "at-alice".into(), 3600)
+            .await
+            .expect("alice signs in");
+        let mut watch = SessionWatch::new(Arc::clone(&fixture.auth), session, true, &fixture.state);
+        test_support::slow_introspection(&server, &["admins"], "gw", Duration::from_secs(6))
+            .await;
+        let stop = fixture.state.shutdown_tx.clone();
+        let started = std::time::Instant::now();
+        let (verdict, ()) = tokio::join!(watch.admits_now(&fixture.state), async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            stop.send_replace(true);
+        });
+        assert_eq!(
+            verdict,
+            Err(WS_CLOSE_GOING_AWAY),
+            "a frame was admitted across its generation's stop"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the refusal waited for the slow check: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A stream whose watch is built after its generation was told to stop
+    /// (the request was still being admitted when the reload began) sees
+    /// that stop.
+    #[tokio::test]
+    async fn a_watch_built_after_its_generation_stopped_is_retired() {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let (_, session) = fixture
+            .auth
+            .sign_in("corp", pin_for(&fixture, "corp"), "at-alice".into(), 3600)
+            .await
+            .expect("alice signs in");
+        fixture.state.shutdown_tx.send_replace(true);
+        let mut watch = SessionWatch::new(Arc::clone(&fixture.auth), session, true, &fixture.state);
+        assert_eq!(
+            watch.admits_now(&fixture.state).await,
+            Err(WS_CLOSE_GOING_AWAY),
+            "a watch built after the stop admitted a frame"
+        );
+        let code = tokio::time::timeout(Duration::from_secs(2), watch.lost(&fixture.state)).await;
+        assert_eq!(code.ok(), Some(WS_CLOSE_GOING_AWAY));
+    }
+
+    /// A request that still reaches a stopped generation's router (an open
+    /// keep-alive or TLS connection outlives the listener) is refused rather
+    /// than admitted under that generation's authority.
+    #[tokio::test]
+    async fn a_retired_generation_refuses_cookie_requests() {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let signed_in = sign_in(&fixture, &server).await;
+        fixture.state.shutdown_tx.send_replace(true);
+        for path in ["/api/operator-probe", "/api/events"] {
+            let response = send(
+                &fixture.router,
+                request(
+                    "GET",
+                    path,
+                    loopback(),
+                    &[("cookie", &signed_in.cookie_header())],
+                ),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{path} was admitted by a stopped generation"
+            );
+            assert_eq!(json(response).await["reason"], "gateway_restarting");
+        }
+    }
+
+    /// A socket whose session ends while its periodic recheck waits on the
+    /// identity provider drops that recheck, and the token copy it holds,
+    /// at once.
+    #[tokio::test]
+    async fn a_lost_watch_drops_its_pending_recheck() {
+        let server = idp(&["admins"], "gw").await;
+        let mut config = sign_in_config(&server.uri());
+        test_support::verify_every_time(&mut config);
+        let fixture = fixture(config);
+        let (_, session) = fixture
+            .auth
+            .sign_in("corp", pin_for(&fixture, "corp"), "at-alice".into(), 3600)
+            .await
+            .expect("alice signs in");
+        let mut watch = SessionWatch::new(
+            Arc::clone(&fixture.auth),
+            Arc::clone(&session),
+            true,
+            &fixture.state,
+        );
+        watch.recheck = tokio::time::interval(Duration::from_millis(1));
+        test_support::slow_introspection(&server, &["admins"], "gw", Duration::from_secs(30))
+            .await;
+        let mut watch = Some(watch);
+        let _ = tokio::time::timeout(
+            Duration::from_millis(200),
+            session_lost(&mut watch, &fixture.state),
+        )
+        .await;
+        assert!(
+            watch.as_ref().unwrap().pending.is_some(),
+            "a recheck is waiting on the provider"
+        );
+        assert!(fixture.auth.end(&session));
+        let code = tokio::time::timeout(
+            Duration::from_secs(2),
+            session_lost(&mut watch, &fixture.state),
+        )
+        .await
+        .expect("the watch ends at once");
+        assert_eq!(code, WS_CLOSE_SESSION_ENDED);
+        assert!(
+            watch.as_ref().unwrap().pending.is_none(),
+            "the ended watch still holds its pending recheck"
+        );
+    }
+
+    /// Sign-out also clears the cookie of a session that already ended, so
+    /// signing out from the re-auth prompt leaves the browser no cookie. A
+    /// foreign page still cannot.
+    #[tokio::test]
+    async fn sign_out_clears_the_cookie_of_an_ended_session() {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let (cookie, _) = fixture
+            .auth
+            .sign_in("corp", pin_for(&fixture, "corp"), "at-alice".into(), 0)
+            .await
+            .expect("alice signs in");
+        let cookie = cookie_for(&cookie);
+        for attempt in ["after expiry", "again"] {
+            let response = send(
+                &fixture.router,
+                request(
+                    "POST",
+                    "/auth/sign-out",
+                    loopback(),
+                    &[("cookie", &cookie), ("origin", OWN_ORIGIN)],
+                ),
+            )
+            .await;
+            assert!(
+                set_cookies(&response)
+                    .iter()
+                    .any(|c| c.starts_with(SESSION_COOKIE) && c.contains("Max-Age=0")),
+                "sign-out {attempt} left the cookie in place"
+            );
+        }
+        let foreign = send(
+            &fixture.router,
+            request(
+                "POST",
+                "/auth/sign-out",
+                loopback(),
+                &[("cookie", &cookie), ("origin", "http://evil.example")],
+            ),
+        )
+        .await;
+        assert_eq!(foreign.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !set_cookies(&foreign)
+                .iter()
+                .any(|c| c.starts_with(SESSION_COOKIE)),
+            "a foreign page cleared the cookie"
+        );
+        assert_eq!(json(foreign).await["reason"], "origin");
+    }
+
+    /// The event stream a signed-in administrator opened ends with the
+    /// session (sign-out, expiry) and with its generation (reload), and
+    /// delivers nothing published after that.
+    #[tokio::test]
+    async fn an_event_stream_ends_with_its_session_and_generation() {
+        let server = idp(&["admins"], "gw").await;
+        for case in ["sign-out", "expiry", "reload"] {
+            let fixture = fixture(sign_in_config(&server.uri()));
+            let lifetime = if case == "expiry" { 2 } else { 3600 };
+            let (cookie, session) = fixture
+                .auth
+                .sign_in("corp", pin_for(&fixture, "corp"), "at-alice".into(), lifetime)
+                .await
+                .expect("alice signs in");
+            let response = send(
+                &fixture.router,
+                request(
+                    "GET",
+                    "/api/events",
+                    loopback(),
+                    &[("cookie", &cookie_for(&cookie))],
+                ),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "{case}: the stream opens");
+            let mut body = response.into_body();
+            match case {
+                "sign-out" => assert!(fixture.auth.end(&session)),
+                "reload" => {
+                    fixture.state.shutdown_tx.send_replace(true);
+                }
+                _ => tokio::time::sleep(Duration::from_secs(3)).await,
+            }
+            let _ = fixture
+                .state
+                .event_tx
+                .send(serde_json::json!({"type": "published-after-the-end"}));
+            let delivered = tokio::time::timeout(Duration::from_secs(5), async {
+                let mut seen = String::new();
+                while let Some(frame) = body.frame().await {
+                    if let Ok(data) = frame.expect("stream frame").into_data() {
+                        seen.push_str(&String::from_utf8_lossy(&data));
+                    }
+                }
+                seen
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{case}: the stream outlived its session"));
+            assert!(
+                !delivered.contains("published-after-the-end"),
+                "{case}: an event published after the end was delivered"
+            );
+        }
+    }
+
+    /// The SOP runs feed closes with its session and with its generation,
+    /// whether or not the engine has a run notifier attached.
+    #[tokio::test]
+    async fn a_sop_runs_feed_closes_with_its_session_and_generation() {
+        let server = idp(&["admins"], "gw").await;
+        for notifier in [true, false] {
+            for case in ["sign-out", "reload"] {
+                let config = sign_in_config(&server.uri());
+                let mut engine = zeroclaw_runtime::sop::SopEngine::new(
+                    zeroclaw_config::schema::SopConfig::default(),
+                );
+                if notifier {
+                    engine = engine.with_run_notifier(tokio::sync::broadcast::channel(8).0);
+                }
+                let fixture = build_generation(
+                    config.clone(),
+                    pairing_for(&config),
+                    inbound_for(&config),
+                    Arc::new(DashboardSessions::default()),
+                    None,
+                    Some(Arc::new(std::sync::Mutex::new(engine))),
+                );
+                let (cookie, session) = fixture
+                    .auth
+                    .sign_in("corp", pin_for(&fixture, "corp"), "at-alice".into(), 3600)
+                    .await
+                    .expect("alice signs in");
+                let (addr, served) = test_support::serve(fixture.router.clone()).await;
+                let mut socket = test_support::connect(addr, "/ws/sop/runs", &cookie_for(&cookie))
+                    .await
+                    .expect("an administrator opens the SOP runs feed");
+                let expected = if case == "sign-out" {
+                    assert!(fixture.auth.end(&session));
+                    WS_CLOSE_SESSION_ENDED
+                } else {
+                    fixture.state.shutdown_tx.send_replace(true);
+                    WS_CLOSE_GOING_AWAY
+                };
+                let (code, _) = test_support::until_closed(&mut socket, Duration::from_secs(3)).await;
+                assert_eq!(code, Some(expected), "notifier={notifier}, {case}");
+                served.abort();
+            }
+        }
+    }
+
+    /// Each generation's idle sweep stops when that generation's sign-in
+    /// state is dropped, and the next generation's sweep carries on over
+    /// the same store.
+    #[tokio::test]
+    async fn a_dropped_generations_sweep_stops_and_the_next_one_sweeps() {
+        let server = idp(&["admins"], "gw").await;
+        let config = sign_in_config(&server.uri());
+        let sessions = Arc::new(DashboardSessions::default());
+        let old = fixture_with(
+            config.clone(),
+            pairing_for(&config),
+            inbound_for(&config),
+            Arc::clone(&sessions),
+        );
+        let old_sweep = old
+            .auth
+            ._sweeper
+            .0
+            .clone()
+            .expect("a generation in a runtime sweeps");
+        drop(old);
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(old_sweep.is_finished(), "a dropped generation's sweep keeps running");
+
+        let new = fixture_with(
+            config.clone(),
+            pairing_for(&config),
+            inbound_for(&config),
+            Arc::clone(&sessions),
+        );
+        let auth = verified_auth(&new).await;
+        let (_cookie, view) = sessions
+            .insert(new_session(auth, &new.auth.inbound, 0), unix_now())
+            .unwrap();
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(61)).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(sessions.len(), 0, "the next generation's sweep removed it");
+        assert!(view.ended.is_cancelled());
+    }
+
+    /// An unsafe request carrying the cookie and the right CSRF token but no
+    /// `Origin`, or a cross-site `Sec-Fetch-Site`, is refused.
+    #[tokio::test]
+    async fn an_unsafe_request_without_its_own_origin_is_refused() {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let signed_in = sign_in(&fixture, &server).await;
+        let cookie = signed_in.cookie_header();
+        let cases: [(&str, Vec<(&str, &str)>); 2] = [
+            (
+                "no Origin",
+                vec![("cookie", cookie.as_str()), (CSRF_HEADER, signed_in.csrf.as_str())],
+            ),
+            (
+                "cross-site fetch",
+                vec![
+                    ("cookie", cookie.as_str()),
+                    (CSRF_HEADER, signed_in.csrf.as_str()),
+                    ("origin", OWN_ORIGIN),
+                    ("sec-fetch-site", "cross-site"),
+                ],
+            ),
+        ];
+        for (case, headers) in cases {
+            let response = send(
+                &fixture.router,
+                request("POST", "/auth/sign-out", loopback(), &headers),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{case}");
+            assert_eq!(json(response).await["reason"], "origin", "{case}");
+        }
+        let (status, _) = probe(&fixture, &[("cookie", &cookie)]).await;
+        assert_eq!(status, StatusCode::OK, "the refused sign-outs ended nothing");
+    }
+
+    async fn set_sign_in(state: &AppState, on: bool) {
+        let commit = state
+            .config_authority
+            .begin_config_commit()
+            .await
+            .expect("config commit");
+        let mut config = commit.current_config();
+        config.gateway.dashboard_sign_in.oidc = if on { vec!["corp".into()] } else { Vec::new() };
+        commit
+            .publish(commit.next_revision().expect("revision"), config)
+            .expect("publish");
+    }
+
+    /// Sign-in turned off ends every session even when no request arrives
+    /// before it is turned back on: the next sweep sees it off.
+    #[tokio::test]
+    async fn sign_in_turned_off_ends_sessions_without_a_request() {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let (cookie, session) = fixture
+            .auth
+            .sign_in("corp", pin_for(&fixture, "corp"), "at-alice".into(), 3600)
+            .await
+            .expect("alice signs in");
+        set_sign_in(&fixture.state, false).await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(61)).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::resume();
+        set_sign_in(&fixture.state, true).await;
+        assert!(
+            session.ended.is_cancelled(),
+            "a session outlived sign-in being turned off"
+        );
+        let (status, body) = probe(&fixture, &[("cookie", &cookie_for(&cookie))]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["reason"], "session_invalid");
+    }
+
+    /// A gateway generation built with sign-in off (the reload that turned
+    /// it off) ends every session at once, before any request.
+    #[tokio::test]
+    async fn a_generation_built_with_sign_in_off_ends_every_session() {
+        let server = idp(&["admins"], "gw").await;
+        let config = sign_in_config(&server.uri());
+        let sessions = Arc::new(DashboardSessions::default());
+        let on = fixture_with(
+            config.clone(),
+            pairing_for(&config),
+            inbound_for(&config),
+            Arc::clone(&sessions),
+        );
+        let (cookie, session) = on
+            .auth
+            .sign_in("corp", pin_for(&on, "corp"), "at-alice".into(), 3600)
+            .await
+            .expect("alice signs in");
+        let mut off_config = config.clone();
+        off_config.gateway.dashboard_sign_in.oidc.clear();
+        let _off = fixture_with(
+            off_config.clone(),
+            pairing_for(&off_config),
+            inbound_for(&off_config),
+            Arc::clone(&sessions),
+        );
+        assert!(
+            session.ended.is_cancelled(),
+            "a session outlived a generation with sign-in off"
+        );
+        assert_eq!(sessions.len(), 0);
+        let again = fixture_with(
+            config.clone(),
+            pairing_for(&config),
+            inbound_for(&config),
+            Arc::clone(&sessions),
+        );
+        let (status, body) = probe(&again, &[("cookie", &cookie_for(&cookie))]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["reason"], "session_invalid");
     }
 }

@@ -4159,6 +4159,183 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         fixture.shutdown();
     }
 
+    // ── Review round 2: a check that outlasts its session ─────────────
+
+    #[derive(Clone, Copy, Debug)]
+    enum SlowCheckEnd {
+        /// The session's hard expiry passes during the check.
+        Expiry,
+        /// The socket's gateway generation stops during the check.
+        GenerationStop,
+    }
+
+    /// A real approval prompt is answered while the frame's check has to
+    /// verify the session again and the provider is slow; meanwhile the
+    /// session's hard expiry passes, or its generation stops. The socket
+    /// closes with the matching code, the approval resolves nothing, and the
+    /// steering sent with it never reaches the model.
+    async fn an_approval_answered_during_a_slow_check(end: SlowCheckEnd) {
+        let idp = crate::dashboard_session::test_support::idp(&["admins"], "gw").await;
+        let mut fixture = ParkedTurnFixture::spawn_signed_in_with(&idp.uri(), |config| {
+            config
+                .risk_profiles
+                .get_mut("fixture")
+                .expect("the fixture's risk profile")
+                .always_ask = vec!["file_read".to_string()];
+            std::fs::write(config.data_dir.join("note.txt"), APPROVED_READ).expect("fixture file");
+            crate::dashboard_session::test_support::verify_every_time(config);
+        })
+        .await;
+        fixture.script_tool_call(1, "file_read", serde_json::json!({"path": "note.txt"}));
+        let lifetime = match end {
+            SlowCheckEnd::Expiry => 6,
+            SlowCheckEnd::GenerationStop => 3600,
+        };
+        let (cookie, _) = fixture.sign_in(lifetime).await;
+        let session_id = match end {
+            SlowCheckEnd::Expiry => "signin-slow-check-expiry",
+            SlowCheckEnd::GenerationStop => "signin-slow-check-stop",
+        };
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        let (mut client, _) = fixture.connect_signed_in(session_id, &cookie).await;
+        fixture.start_parked_turn(&mut client, "read the note").await;
+        fixture.release_next();
+        let prompt = next_frame_of(&mut client, "approval_request").await;
+        let request_id = prompt["request_id"]
+            .as_str()
+            .expect("the prompt names its request")
+            .to_string();
+
+        crate::dashboard_session::test_support::slow_introspection(
+            &idp,
+            &["admins"],
+            "gw",
+            Duration::from_secs(10),
+        )
+        .await;
+        send_raw(
+            &mut client,
+            serde_json::json!({"type": "approval_response", "request_id": request_id, "decision": "approve"}),
+        )
+        .await;
+        send_raw(
+            &mut client,
+            serde_json::json!({"type": "message", "content": "steer after the end"}),
+        )
+        .await;
+        let expected = match end {
+            SlowCheckEnd::Expiry => 4401,
+            SlowCheckEnd::GenerationStop => {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                fixture.state.shutdown_tx.send_replace(true);
+                1001
+            }
+        };
+        let (code, _) = crate::dashboard_session::test_support::until_closed(
+            &mut client,
+            Duration::from_secs(9),
+        )
+        .await;
+        assert_eq!(code, Some(expected), "{end:?}: the socket closes at the end");
+
+        let follow_up = fixture.next_provider_request().await.to_string();
+        fixture.release_next();
+        fixture.wait_for_turn_to_settle(&session_key).await;
+        assert!(
+            !follow_up.contains(APPROVED_READ),
+            "{end:?}: an approval checked past the end was honored"
+        );
+        assert!(
+            !follow_up.contains("steer after the end"),
+            "{end:?}: steering checked past the end reached the model"
+        );
+        fixture.shutdown();
+    }
+
+    #[test]
+    fn an_approval_checked_past_the_sessions_hard_expiry_resolves_nothing() {
+        run_ws_regression(
+            "ws-signin-slow-check-expiry",
+            an_approval_checked_past_the_sessions_hard_expiry_resolves_nothing_inner,
+        );
+    }
+
+    async fn an_approval_checked_past_the_sessions_hard_expiry_resolves_nothing_inner() {
+        an_approval_answered_during_a_slow_check(SlowCheckEnd::Expiry).await;
+    }
+
+    #[test]
+    fn an_approval_checked_across_a_generation_stop_resolves_nothing() {
+        run_ws_regression(
+            "ws-signin-slow-check-stop",
+            an_approval_checked_across_a_generation_stop_resolves_nothing_inner,
+        );
+    }
+
+    async fn an_approval_checked_across_a_generation_stop_resolves_nothing_inner() {
+        an_approval_answered_during_a_slow_check(SlowCheckEnd::GenerationStop).await;
+    }
+
+    #[test]
+    fn a_chat_socket_closed_mid_turn_releases_its_session_watch() {
+        run_ws_regression(
+            "ws-signin-release-watch",
+            a_chat_socket_closed_mid_turn_releases_its_session_watch_inner,
+        );
+    }
+
+    /// Once a signed-in chat socket closes mid-turn, the turn that runs on
+    /// unattended holds nothing of the session: not its watch, nor any
+    /// recheck (and token copy) the watch had in flight.
+    async fn a_chat_socket_closed_mid_turn_releases_its_session_watch_inner() {
+        let idp = crate::dashboard_session::test_support::idp(&["admins"], "gw").await;
+        let mut fixture = ParkedTurnFixture::spawn_signed_in(&idp.uri()).await;
+        let (cookie, csrf) = fixture.sign_in(3600).await;
+        let dashboard = Arc::clone(&fixture.signed_in().dashboard);
+        let baseline = Arc::strong_count(&dashboard);
+        let session_id = "signin-release-watch";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        let (mut client, _) = fixture.connect_signed_in(session_id, &cookie).await;
+        fixture.start_parked_turn(&mut client, "hold this turn").await;
+        assert!(
+            Arc::strong_count(&dashboard) > baseline,
+            "the open socket holds its session watch"
+        );
+
+        let status = crate::dashboard_session::test_support::sign_out_over_http(
+            fixture.gateway_addr,
+            &cookie,
+            &csrf,
+        )
+        .await;
+        assert_eq!(status, 204, "sign-out succeeds");
+        let (code, _) = crate::dashboard_session::test_support::until_closed(
+            &mut client,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(code, Some(4401));
+        let released = tokio::time::timeout(Duration::from_secs(3), async {
+            while Arc::strong_count(&dashboard) > baseline {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .is_ok();
+        assert!(
+            fixture.has_live_turn(&session_key),
+            "the turn is still running unattended"
+        );
+        assert!(
+            released,
+            "the unattended turn still holds the session watch ({} > {baseline})",
+            Arc::strong_count(&dashboard)
+        );
+        fixture.release_next();
+        fixture.wait_for_turn_to_settle(&session_key).await;
+        fixture.shutdown();
+    }
+
     #[test]
     fn websocket_client_disconnect_mid_turn_lets_the_turn_finish_and_persist() {
         run_ws_regression(
