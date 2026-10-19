@@ -48304,5 +48304,441 @@ mod tests {
                 .expect("the task stops when cancelled")
                 .expect("the task does not panic");
         }
+
+        /// Counts session-end hooks, which every close fires.
+        struct EndCounter(Arc<std::sync::atomic::AtomicUsize>);
+
+        #[async_trait::async_trait]
+        impl crate::hooks::HookHandler for EndCounter {
+            fn name(&self) -> &str {
+                "end-counter"
+            }
+            async fn on_session_end(&self, _session_id: &str, _channel: &str) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        /// `context(None)` with a session-end counter installed.
+        fn context_counting_ends() -> (
+            tempfile::TempDir,
+            Arc<SessionStore>,
+            Arc<RpcContext>,
+            Arc<std::sync::atomic::AtomicUsize>,
+        ) {
+            let (tmp, sessions, mut ctx) = context(None);
+            let ends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut hooks = crate::hooks::HookRunner::new();
+            hooks.register(Box::new(EndCounter(Arc::clone(&ends))));
+            Arc::get_mut(&mut ctx)
+                .expect("a fresh context has one owner")
+                .hooks = Some(Arc::new(hooks));
+            (tmp, sessions, ctx, ends)
+        }
+
+        async fn resume(client: &RpcDispatcher, session_id: &str) -> serde_json::Value {
+            client
+                .handle_session_new_for_test(&json!({
+                    "agent_alias": "test-agent",
+                    "chat_mode": "chat",
+                    "session_id": session_id,
+                }))
+                .await
+                .expect("session/new resumes the live session")
+        }
+
+        /// Run one retirement sweep at `now` until it reaches the test pause.
+        async fn retirement_paused_at(
+            ctx: &Arc<RpcContext>,
+            now: Instant,
+        ) -> (
+            tokio::task::JoinHandle<Vec<String>>,
+            Arc<tokio::sync::Notify>,
+        ) {
+            let (entered, release) = ctx.sessions.set_test_retirement_pause();
+            let sweep = {
+                let ctx = Arc::clone(ctx);
+                zeroclaw_spawn::spawn!(async move { retire_orphaned_sessions(&ctx, now).await })
+            };
+            tokio::time::timeout(Duration::from_secs(10), entered.notified())
+                .await
+                .expect("the sweep judges the orphan due and pauses before removing it");
+            (sweep, release)
+        }
+
+        #[tokio::test]
+        async fn a_local_resume_while_retirement_is_deciding_keeps_the_session() {
+            let (_tmp, sessions, ctx, ends) = context_counting_ends();
+            let mut gone = remote(&ctx, "tui_gone");
+            let session = open(&gone).await;
+            disconnect(&ctx, &mut gone).await;
+
+            let (sweep, release) = retirement_paused_at(&ctx, Instant::now() + TIMEOUT).await;
+            let local_client = local(&ctx, "tui_local");
+            resume(&local_client, &session).await;
+            release.notify_one();
+            let retired = sweep.await.unwrap();
+
+            assert!(retired.is_empty(), "retired {retired:?}");
+            assert_eq!(sessions.list_ids().await, vec![session.clone()]);
+            assert_eq!(
+                sessions.session_owner_tui_id(&session).await,
+                Some(Some("tui_local".to_string()))
+            );
+            let agent = sessions.get_agent(&session).await.unwrap();
+            assert!(
+                agent
+                    .lock()
+                    .await
+                    .channel_handles()
+                    .get_channel("rpc")
+                    .is_some(),
+                "the resumed connection's approval channel was unregistered"
+            );
+            assert_eq!(
+                ends.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "a session-end hook fired"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_reconnect_while_retirement_is_deciding_keeps_the_session() {
+            let (_tmp, sessions, ctx, ends) = context_counting_ends();
+            let mut gone = remote(&ctx, "tui_back");
+            let session = open(&gone).await;
+            disconnect(&ctx, &mut gone).await;
+
+            let (sweep, release) = retirement_paused_at(&ctx, Instant::now() + TIMEOUT).await;
+            let _back = remote(&ctx, "tui_back");
+            release.notify_one();
+
+            assert!(sweep.await.unwrap().is_empty());
+            assert_eq!(sessions.list_ids().await, vec![session]);
+            assert_eq!(ends.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn an_identity_with_a_connection_still_open_has_not_left() {
+            let (_tmp, sessions, ctx) = context(None);
+            // A signed reconnect registers B while A is still open, then B goes.
+            let mut first = remote(&ctx, "tui_twice");
+            let session = open(&first).await;
+            let mut second = remote(&ctx, "tui_twice");
+            disconnect(&ctx, &mut second).await;
+
+            assert_eq!(
+                ctx.tui_registry.departure("tui_twice"),
+                None,
+                "A is still connected"
+            );
+            let retired =
+                retire_orphaned_sessions(&ctx, Instant::now() + TIMEOUT + Duration::from_secs(1))
+                    .await;
+            assert!(retired.is_empty(), "retired {retired:?} while A is open");
+            resume(&first, &session).await;
+
+            // Only A leaving starts the timeout.
+            disconnect(&ctx, &mut first).await;
+            let left = ctx
+                .tui_registry
+                .departure("tui_twice")
+                .expect("the last connection left")
+                .at;
+            assert!(
+                retire_orphaned_sessions(&ctx, left + TIMEOUT - Duration::from_millis(1))
+                    .await
+                    .is_empty()
+            );
+            assert_eq!(
+                retire_orphaned_sessions(&ctx, left + TIMEOUT).await,
+                vec![session]
+            );
+            assert!(sessions.list_ids().await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn initializing_again_does_not_leave_the_earlier_registration_behind() {
+            let (_tmp, _sessions, ctx) = context(None);
+            let (tx, _rx) = tokio::sync::mpsc::channel(64);
+            let mut client = RpcDispatcher::new(Arc::clone(&ctx), tx, "unix:test".into());
+            client
+                .handle_initialize(&json!({ "tui_id": "tui_reinit" }))
+                .await
+                .expect("initialize");
+            client
+                .handle_initialize(&json!({ "tui_id": "tui_reinit" }))
+                .await
+                .expect("initialize again, as a revalidation does");
+            disconnect(&ctx, &mut client).await;
+            assert!(
+                ctx.tui_registry.departure("tui_reinit").is_some(),
+                "the connection is gone, so its identity has no live connection"
+            );
+        }
+
+        /// A chat backend whose transcript writes fail while `failing` is set.
+        #[derive(Default)]
+        struct FlakyChatBackend {
+            failing: std::sync::atomic::AtomicBool,
+            rows: std::sync::Mutex<
+                std::collections::HashMap<String, Vec<zeroclaw_providers::ChatMessage>>,
+            >,
+        }
+
+        impl zeroclaw_infra::session_backend::SessionBackend for FlakyChatBackend {
+            fn load(&self, session_key: &str) -> Vec<zeroclaw_providers::ChatMessage> {
+                self.rows
+                    .lock()
+                    .unwrap()
+                    .get(session_key)
+                    .cloned()
+                    .unwrap_or_default()
+            }
+            fn append(
+                &self,
+                session_key: &str,
+                message: &zeroclaw_providers::ChatMessage,
+            ) -> std::io::Result<()> {
+                self.rows
+                    .lock()
+                    .unwrap()
+                    .entry(session_key.to_string())
+                    .or_default()
+                    .push(message.clone());
+                Ok(())
+            }
+            fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
+                Ok(self
+                    .rows
+                    .lock()
+                    .unwrap()
+                    .get_mut(session_key)
+                    .and_then(Vec::pop)
+                    .is_some())
+            }
+            fn list_sessions(&self) -> Vec<String> {
+                self.rows.lock().unwrap().keys().cloned().collect()
+            }
+            fn session_exists(&self, session_key: &str) -> bool {
+                self.rows.lock().unwrap().contains_key(session_key)
+            }
+            fn set_session_agent_alias(
+                &self,
+                session_key: &str,
+                _agent_alias: &str,
+            ) -> std::io::Result<()> {
+                self.rows
+                    .lock()
+                    .unwrap()
+                    .entry(session_key.to_string())
+                    .or_default();
+                Ok(())
+            }
+            fn rewrite_messages(
+                &self,
+                session_key: &str,
+                messages: &[zeroclaw_providers::ChatMessage],
+            ) -> std::io::Result<()> {
+                if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(std::io::Error::other("simulated transcript write failure"));
+                }
+                self.rows
+                    .lock()
+                    .unwrap()
+                    .insert(session_key.to_string(), messages.to_vec());
+                Ok(())
+            }
+        }
+
+        fn two_turns() -> Vec<zeroclaw_api::model_provider::ChatMessage> {
+            vec![
+                zeroclaw_api::model_provider::ChatMessage::user("hello"),
+                zeroclaw_api::model_provider::ChatMessage::assistant("hi there"),
+            ]
+        }
+
+        #[tokio::test]
+        async fn history_that_cannot_be_persisted_keeps_its_session_until_it_can() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let backend = Arc::new(FlakyChatBackend::default());
+            let queue = Arc::new(SessionActorQueue::new(32, 30, 600));
+            let sessions = Arc::new(SessionStore::new(64, queue));
+            let ctx = RpcContext::for_persistence_tests(
+                make_acp_test_config(&tmp),
+                Arc::clone(&sessions),
+                Some(backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+                None,
+            );
+            let mut client = remote(&ctx, "tui_unsaved");
+            let session = open(&client).await;
+            // The turn's history is live, and its post-turn write failed.
+            sessions.seed_history(&session, &two_turns()).await;
+            disconnect(&ctx, &mut client).await;
+            let later = Instant::now() + TIMEOUT;
+
+            backend
+                .failing
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            assert!(retire_orphaned_sessions(&ctx, later).await.is_empty());
+            assert_eq!(
+                sessions.list_ids().await,
+                vec![session.clone()],
+                "the only copy was dropped"
+            );
+
+            backend
+                .failing
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(
+                retire_orphaned_sessions(&ctx, later).await,
+                vec![session.clone()]
+            );
+            assert_eq!(
+                backend.load(&format!("rpc_{session}")).len(),
+                2,
+                "retired without its history"
+            );
+        }
+
+        #[tokio::test]
+        async fn history_without_a_backend_keeps_its_session() {
+            let (_tmp, sessions, ctx) = context(None);
+            let mut client = remote(&ctx, "tui_nowhere");
+            let session = open(&client).await;
+            sessions.seed_history(&session, &two_turns()).await;
+            disconnect(&ctx, &mut client).await;
+
+            assert!(
+                retire_orphaned_sessions(&ctx, Instant::now() + TIMEOUT)
+                    .await
+                    .is_empty()
+            );
+            assert_eq!(sessions.list_ids().await, vec![session]);
+        }
+
+        #[tokio::test]
+        async fn a_retired_chat_session_keeps_its_row_and_comes_back() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (ctx, backend, _acp) = persistence_enforcement_ctx(make_acp_test_config(&tmp));
+            let mut client = remote(&ctx, "tui_chat");
+            let session = open(&client).await;
+            let key = format!("rpc_{session}");
+            ctx.sessions.seed_history(&session, &two_turns()).await;
+            backend
+                .set_session_principal(&key, "principal-kept")
+                .unwrap();
+            disconnect(&ctx, &mut client).await;
+
+            assert_eq!(
+                retire_orphaned_sessions(&ctx, Instant::now() + TIMEOUT).await,
+                vec![session.clone()]
+            );
+            assert!(ctx.sessions.list_ids().await.is_empty());
+            let messages = backend.load(&key);
+            assert_eq!(
+                messages
+                    .iter()
+                    .map(|m| m.content.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["hello", "hi there"]
+            );
+            let row = backend
+                .list_sessions_with_metadata()
+                .into_iter()
+                .find(|meta| meta.key == key)
+                .expect("the row is still there");
+            assert_eq!(row.principal_id.as_deref(), Some("principal-kept"));
+            assert_eq!(row.agent_alias.as_deref(), Some("test-agent"));
+
+            let (operator, _rx) = local_operator(&ctx).await;
+            let restored = resume(&operator, &session).await;
+            assert_eq!(restored["message_count"], json!(2), "{restored}");
+        }
+
+        #[tokio::test]
+        async fn a_retired_acp_session_keeps_its_record_and_comes_back() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (ctx, _backend, acp) = persistence_enforcement_ctx(make_acp_test_config(&tmp));
+            let mut client = remote(&ctx, "tui_acp");
+            let session = client
+                .handle_session_new_for_test(
+                    &json!({ "agent_alias": "test-agent", "chat_mode": "acp" }),
+                )
+                .await
+                .expect("ACP session/new")["session_id"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            disconnect(&ctx, &mut client).await;
+
+            assert_eq!(
+                retire_orphaned_sessions(&ctx, Instant::now() + TIMEOUT).await,
+                vec![session.clone()]
+            );
+            assert!(
+                acp.load_session(&session).unwrap().is_some(),
+                "the ACP record is gone"
+            );
+            let (operator, _rx) = local_operator(&ctx).await;
+            operator
+                .handle_session_new_for_test(&json!({
+                    "agent_alias": "test-agent",
+                    "chat_mode": "acp",
+                    "session_id": session,
+                }))
+                .await
+                .expect("the retired ACP session resumes");
+        }
+
+        #[tokio::test]
+        async fn a_turn_counts_as_activity_when_it_finishes() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let sid = "s-long-turn";
+            let (ctx, _backend, (mut started, release, _requests)) =
+                turn_parity_fixture(&tmp, sid, Some("tui_away")).await;
+            let (mut driver, mut driver_rx) = local_operator(&ctx).await;
+
+            send_prompt(&mut driver, 1, sid, 1).await;
+            await_provider_start(&mut started).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let finishing = Instant::now();
+            release.send(()).unwrap();
+            let (response, _) = response_and_notifications(&mut driver_rx, 1).await;
+            assert!(response.get("error").is_none(), "{response}");
+
+            let last_active = ctx.sessions.owned_session(sid).await.unwrap().last_active;
+            assert!(
+                last_active >= finishing,
+                "idle time is measured from the turn's start, not its end"
+            );
+        }
+
+        #[tokio::test]
+        async fn cancelling_the_task_mid_sweep_leaves_the_session_alone() {
+            let (_tmp, sessions, mut ctx) = context(Some(1));
+            let ends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut hooks = crate::hooks::HookRunner::new();
+            hooks.register(Box::new(EndCounter(Arc::clone(&ends))));
+            Arc::get_mut(&mut ctx).unwrap().hooks = Some(Arc::new(hooks));
+            let (entered, release) = sessions.set_test_retirement_pause();
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let task = spawn_orphan_retirement(&ctx, cancel.clone());
+
+            let mut client = remote(&ctx, "tui_cancel");
+            let session = open(&client).await;
+            disconnect(&ctx, &mut client).await;
+            tokio::time::timeout(Duration::from_secs(10), entered.notified())
+                .await
+                .expect("the task reaches the session");
+            cancel.cancel();
+            release.notify_one();
+
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("the task stops when cancelled")
+                .expect("the task does not panic");
+            assert_eq!(sessions.list_ids().await, vec![session]);
+            assert_eq!(ends.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
     }
 }

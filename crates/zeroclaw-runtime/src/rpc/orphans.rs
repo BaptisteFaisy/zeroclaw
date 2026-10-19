@@ -87,6 +87,7 @@ async fn retire(
     if !still_due {
         return false;
     }
+    ctx.sessions.wait_test_retirement_pause().await;
     if let Some(agent) = ctx.sessions.get_agent(&candidate.id).await {
         agent
             .lock()

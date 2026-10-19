@@ -387,6 +387,10 @@ pub struct SessionStore {
     /// commit that reaches it.
     #[cfg(test)]
     test_upload_written_hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Test-only pause in orphan retirement, after a session is judged due
+    /// and before it is removed. Taken by the first retirement that reaches it.
+    #[cfg(test)]
+    test_retirement_pause: std::sync::Mutex<Option<PromptRegistrationPause>>,
 }
 
 /// Generation-owned handle for the canonical cancellation-token registration.
@@ -472,6 +476,8 @@ impl SessionStore {
             test_upload_effect_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
             test_upload_written_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_retirement_pause: std::sync::Mutex::new(None),
         }
     }
 
@@ -2023,6 +2029,28 @@ impl SessionStore {
     #[cfg(not(test))]
     #[inline(always)]
     pub(crate) fn notify_test_removal_signal_attempted(&self) {}
+
+    #[cfg(test)]
+    pub(crate) async fn wait_test_retirement_pause(&self) {
+        let Some((entered, release)) = self.test_retirement_pause.lock().unwrap().take() else {
+            return;
+        };
+        entered.notify_one();
+        release.notified().await;
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(crate) async fn wait_test_retirement_pause(&self) {}
+
+    #[cfg(test)]
+    pub(crate) fn set_test_retirement_pause(&self) -> PromptRegistrationPause {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.test_retirement_pause.lock().unwrap() =
+            Some((Arc::clone(&entered), Arc::clone(&release)));
+        (entered, release)
+    }
 
     #[cfg(test)]
     pub(crate) async fn wait_test_control_pause(&self) {
