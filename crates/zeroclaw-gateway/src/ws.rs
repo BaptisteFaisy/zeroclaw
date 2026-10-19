@@ -159,7 +159,7 @@ pub async fn handle_ws_chat(
         }
         use crate::dashboard_session::{DashboardCaller, SessionWatch};
         if let (DashboardCaller::Session(session), Some(Extension(auth))) = (caller, dashboard) {
-            session_watch = Some(SessionWatch::new(auth, session, true));
+            session_watch = Some(SessionWatch::new(auth, session, true, &state));
         }
     }
 
@@ -289,8 +289,8 @@ where
     close_with(sender, receiver, WS_CLOSE_GOING_AWAY, reason).await;
 }
 
-/// Close a chat socket with `code`, waiting briefly for the peer's close.
-async fn close_with<S, R>(sender: &mut S, receiver: &mut R, code: u16, reason: &'static str)
+/// Close a socket with `code`, waiting briefly for the peer's close.
+pub(crate) async fn close_with<S, R>(sender: &mut S, receiver: &mut R, code: u16, reason: &'static str)
 where
     S: futures_util::Sink<Message> + Unpin,
     R: futures_util::Stream<Item = Result<Message, axum::Error>> + Unpin,
@@ -879,6 +879,15 @@ async fn handle_socket(
         let _ = sender.send(Message::Text(frame.to_string().into())).await;
     }
 
+    // A first message that arrived after the session ended starts nothing.
+    if first_msg_fallback.is_some()
+        && let Err(code) =
+            crate::dashboard_session::session_admits_now(&mut session_watch, &state).await
+    {
+        close_with(&mut sender, &mut receiver, code, "dashboard session ended").await;
+        return;
+    }
+
     // Process the first message if it was not a connect frame
     if let Some(ref text) = first_msg_fallback {
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
@@ -897,7 +906,23 @@ async fn handle_socket(
                         }
                     };
                     if let Some(_turn_lease) = turn_lease {
-                        let _session_guard = match state.session_queue.acquire(&session_key).await {
+                        let acquired =
+                            match acquire_turn_permit(&state, &session_key, &mut session_watch)
+                                .await
+                            {
+                                Ok(acquired) => acquired,
+                                Err(code) => {
+                                    close_with(
+                                        &mut sender,
+                                        &mut receiver,
+                                        code,
+                                        "dashboard session ended",
+                                    )
+                                    .await;
+                                    return;
+                                }
+                            };
+                        let _session_guard = match acquired {
                             Ok(guard) => guard,
                             Err(e) => {
                                 let err = serde_json::json!({
@@ -923,6 +948,7 @@ async fn handle_socket(
                             &session_key,
                             &session_id,
                             auth_subject.as_deref(),
+                            &mut session_watch,
                         )
                         .await;
                         if client_gone {
@@ -981,6 +1007,16 @@ async fn handle_socket(
                     Ok(Message::Close(_)) | Err(_) => break,
                     _ => continue,
                 };
+
+                // Checked before anything the socket sent is acted on, so
+                // input buffered after the session ended starts no turn and
+                // answers no approval.
+                if let Err(code) =
+                    crate::dashboard_session::session_admits_now(&mut session_watch, &state).await
+                {
+                    close_with(&mut sender, &mut receiver, code, "dashboard session ended").await;
+                    break;
+                }
 
                 // Parse incoming message
                 let parsed: serde_json::Value = match serde_json::from_str(&msg) {
@@ -1091,7 +1127,16 @@ async fn handle_socket(
                 };
 
                 // Acquire session lock to serialize concurrent turns
-                let _session_guard = match state.session_queue.acquire(&session_key).await {
+                let acquired =
+                    match acquire_turn_permit(&state, &session_key, &mut session_watch).await {
+                        Ok(acquired) => acquired,
+                        Err(code) => {
+                            close_with(&mut sender, &mut receiver, code, "dashboard session ended")
+                                .await;
+                            break;
+                        }
+                    };
+                let _session_guard = match acquired {
                     Ok(guard) => guard,
                     Err(e) => {
                         let err = serde_json::json!({
@@ -1118,6 +1163,7 @@ async fn handle_socket(
                     &session_key,
                     &session_id,
                     auth_subject.as_deref(),
+                    &mut session_watch,
                 )
                 .await;
                 if client_gone {
@@ -1180,6 +1226,31 @@ async fn handle_socket(
 
         }
     }
+}
+
+/// Wait for the permit that serializes a session's turns, for as long as the
+/// dashboard session behind the socket still admits it, then check it once
+/// more: the wait can outlast the session or its access. `Err` carries the
+/// code to close the socket with.
+async fn acquire_turn_permit(
+    state: &AppState,
+    session_key: &str,
+    session_watch: &mut Option<crate::dashboard_session::SessionWatch>,
+) -> Result<
+    Result<crate::session_queue::SessionGuard, crate::session_queue::SessionQueueError>,
+    u16,
+> {
+    let acquired = tokio::select! {
+        biased;
+        code = crate::dashboard_session::session_lost(&mut *session_watch, state) => {
+            return Err(code);
+        }
+        acquired = state.session_queue.acquire(session_key) => acquired,
+    };
+    if acquired.is_ok() {
+        crate::dashboard_session::session_admits_now(session_watch, state).await?;
+    }
+    Ok(acquired)
 }
 
 fn resolve_session_cwd(
@@ -1908,6 +1979,8 @@ async fn process_chat_message(
     // Transport-authenticated approval subject (paired-token hash), threaded so a
     // mid-turn SOP approval frame carries the same identity as the top-level path.
     auth_subject: Option<&str>,
+    // The dashboard session that opened the socket, if one did.
+    session: &mut Option<crate::dashboard_session::SessionWatch>,
 ) -> bool {
     use futures_util::StreamExt as _;
     use zeroclaw_runtime::agent::TurnEvent;
@@ -2063,6 +2136,15 @@ async fn process_chat_message(
                                 // a ToolLoopCancelled error which closes event_rx and
                                 // breaks this loop on the `event_rx.recv()` arm below.
                             }
+                            // The session behind a signed-in socket ended or lost the
+                            // access it needs: the socket closes now, not when the turn
+                            // finishes, and is treated as a viewer that left. Ahead of
+                            // the client arm so buffered input cannot win the race.
+                            code = crate::dashboard_session::session_lost(&mut *session, state), if !client_gone => {
+                                detach_mid_turn(session_key, &turn_id, pending_approvals);
+                                close_with(&mut *sender, &mut *receiver, code, "dashboard session ended").await;
+                                client_gone = true;
+                            }
                             client_msg = receiver.next(), if !client_gone => {
                                 let text = match classify_client_frame(client_msg) {
                                     ClientFrame::Text(text) => text,
@@ -2080,6 +2162,14 @@ async fn process_chat_message(
                                         continue;
                                     }
                                 };
+                                if let Err(code) =
+                                    crate::dashboard_session::session_admits_now(&mut *session, state).await
+                                {
+                                    detach_mid_turn(session_key, &turn_id, pending_approvals);
+                                    close_with(&mut *sender, &mut *receiver, code, "dashboard session ended").await;
+                                    client_gone = true;
+                                    continue;
+                                }
                                 let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) else {
                                     let err = serde_json::json!({
                                         "type": "error",

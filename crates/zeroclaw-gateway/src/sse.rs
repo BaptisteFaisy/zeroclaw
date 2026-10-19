@@ -51,7 +51,7 @@ pub async fn handle_sse_events(
             .unwrap_or("");
 
         let session = if token.is_empty() {
-            operator_session(dashboard.as_ref().map(|axum::Extension(auth)| auth))
+            operator_session(dashboard.as_ref().map(|axum::Extension(auth)| auth), &state)
         } else {
             OperatorSession::Absent
         };

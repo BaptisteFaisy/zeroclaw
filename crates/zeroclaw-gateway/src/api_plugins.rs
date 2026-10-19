@@ -104,7 +104,7 @@ pub async fn list_plugins(State(state): State<AppState>, headers: HeaderMap) -> 
             .unwrap_or_default();
         if token.is_empty() {
             use crate::dashboard_session::{OperatorSession, operator_session};
-            match operator_session(None) {
+            match operator_session(None, &state) {
                 OperatorSession::Admitted(_) => {}
                 OperatorSession::Denied(denied) => return denied,
                 OperatorSession::Absent => return StatusCode::UNAUTHORIZED.into_response(),

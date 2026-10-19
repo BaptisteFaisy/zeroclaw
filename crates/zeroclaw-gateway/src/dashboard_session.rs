@@ -37,6 +37,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
+use zeroize::Zeroizing;
 use zeroclaw_api::grants::ResolvedGrants;
 use zeroclaw_api::principal::{ActorKind, Principal};
 use zeroclaw_runtime::rpc::auth::{ConnectionAuth, RpcInboundAuth};
@@ -119,7 +120,9 @@ struct Session {
     provider: ProviderPin,
     /// The access token the sign-in was issued. Memory only; never logged
     /// and never sent anywhere but the inbound authority that verifies it.
-    bearer: String,
+    /// Wiped when the session leaves the store, as is every copy taken to
+    /// verify it.
+    bearer: Zeroizing<String>,
     auth: ConnectionAuth,
     /// The authority `auth` was verified by. A reload builds a new one, and
     /// a session verified by another is verified again before it is used.
@@ -165,7 +168,7 @@ pub(crate) struct StoreFull;
 struct NewSession {
     alias: String,
     provider: ProviderPin,
-    bearer: String,
+    bearer: Zeroizing<String>,
     auth: ConnectionAuth,
     authority: Weak<RpcInboundAuth>,
     display_name: String,
@@ -217,6 +220,17 @@ impl DashboardSessions {
         for key in ended {
             self.remember_expired(key, now);
         }
+    }
+
+    /// Sweep with no request in hand: the idle sweep, so an expired
+    /// session's token leaves memory even if nothing names it again.
+    fn sweep_now(&self, now: u64) {
+        let mut sessions = self.sessions.lock();
+        self.sweep(&mut sessions, now);
+        drop(sessions);
+        self.expired
+            .lock()
+            .retain(|_, at| now.saturating_sub(*at) < EXPIRED_MEMORY_SECS);
     }
 
     fn remember_expired(&self, key: [u8; 32], now: u64) {
@@ -503,6 +517,47 @@ impl DashboardCaller {
 pub struct DashboardAuth {
     pub(crate) sessions: Arc<DashboardSessions>,
     pub(crate) inbound: Arc<GatewayInboundAuth>,
+    _sweeper: SweeperGuard,
+}
+
+/// How often the store is swept when no request arrives: an expired
+/// session, and the token it holds, is gone within this long of expiring.
+const IDLE_SWEEP: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A gateway generation's idle sweep, stopped when the generation's
+/// [`DashboardAuth`] is dropped, so reloads do not pile up sweepers.
+struct SweeperGuard(Option<tokio::task::AbortHandle>);
+
+impl SweeperGuard {
+    fn start(sessions: &Arc<DashboardSessions>) -> Self {
+        // Built outside a runtime (no requests can arrive either): the
+        // sweeps on admission and sign-in are all there is.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return Self(None);
+        }
+        let sessions = Arc::downgrade(sessions);
+        let task = zeroclaw_spawn::spawn!(async move {
+            let start = tokio::time::Instant::now() + IDLE_SWEEP;
+            let mut ticks = tokio::time::interval_at(start, IDLE_SWEEP);
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticks.tick().await;
+                let Some(sessions) = sessions.upgrade() else {
+                    break;
+                };
+                sessions.sweep_now(now_unix());
+            }
+        });
+        Self(Some(task.abort_handle()))
+    }
+}
+
+impl Drop for SweeperGuard {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
 }
 
 /// Why a sign-in that the identity provider completed did not become a
@@ -520,7 +575,12 @@ pub(crate) enum SignInRefusal {
 
 impl DashboardAuth {
     pub fn new(sessions: Arc<DashboardSessions>, inbound: Arc<GatewayInboundAuth>) -> Self {
-        Self { sessions, inbound }
+        let sweeper = SweeperGuard::start(&sessions);
+        Self {
+            sessions,
+            inbound,
+            _sweeper: sweeper,
+        }
     }
 
     /// Verify the access token a dashboard sign-in was issued and store the
@@ -535,6 +595,8 @@ impl DashboardAuth {
         access_token: String,
         lifetime_secs: u64,
     ) -> Result<(String, Arc<SessionAuth>), SignInRefusal> {
+        // Wiped on every path out, a refused sign-in included.
+        let access_token = Zeroizing::new(access_token);
         let selection = format!("oidc.{alias}");
         let auth = self
             .inbound
@@ -930,7 +992,19 @@ pub(crate) const WS_CLOSE_ACCESS_LOST: u16 = 4403;
 
 type Recheck = std::pin::Pin<Box<dyn std::future::Future<Output = DashboardCaller> + Send>>;
 
+/// WebSocket close code for a socket whose gateway generation stopped (a
+/// reload or shutdown): the client may reconnect, and the next generation's
+/// authority decides whether it may.
+pub(crate) const WS_CLOSE_GOING_AWAY: u16 = 1001;
+
 /// A long-lived socket's view of the dashboard session that opened it.
+///
+/// It ends the socket's authority on any of: the session ending (sign-out,
+/// eviction, revocation), its expiry, a recheck the current policy fails,
+/// or the socket's own gateway generation stopping. The last matters
+/// because a reload builds a new authority: a socket that outlived its
+/// generation would otherwise keep checking against the policy it was
+/// opened under.
 pub(crate) struct SessionWatch {
     auth: Arc<DashboardAuth>,
     session: Arc<SessionAuth>,
@@ -941,6 +1015,10 @@ pub(crate) struct SessionWatch {
     /// busy socket would otherwise abandon every recheck that needs a round
     /// trip to the identity provider.
     pending: Option<Recheck>,
+    /// The generation's stop signal (`AppState::shutdown_tx`), subscribed
+    /// when the socket opened.
+    stopping: tokio::sync::watch::Receiver<bool>,
+    stopped: bool,
 }
 
 impl SessionWatch {
@@ -948,6 +1026,7 @@ impl SessionWatch {
         auth: Arc<DashboardAuth>,
         session: Arc<SessionAuth>,
         require_admin: bool,
+        state: &AppState,
     ) -> Self {
         let start = tokio::time::Instant::now() + SOCKET_RECHECK;
         let mut recheck = tokio::time::interval_at(start, SOCKET_RECHECK);
@@ -958,6 +1037,8 @@ impl SessionWatch {
             require_admin,
             recheck,
             pending: None,
+            stopping: state.shutdown_tx.subscribe(),
+            stopped: false,
         }
     }
 
@@ -965,23 +1046,79 @@ impl SessionWatch {
         self.session.principal().id.as_str()
     }
 
+    /// Resolves when this generation is told to stop. Waits for a new signal
+    /// rather than reading the current value, like the gateway's listener;
+    /// never resolves if the signal can no longer arrive.
+    async fn generation_stopped(stopping: &mut tokio::sync::watch::Receiver<bool>) {
+        if stopping.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    /// The close code if the session no longer admits the socket by what is
+    /// already known (ended, expired, generation stopped), without a recheck.
+    fn known_lost(&mut self) -> Option<u16> {
+        if self.session.ended.is_cancelled() || self.session.expires_at <= now_unix() {
+            return Some(WS_CLOSE_SESSION_ENDED);
+        }
+        if self.stopped || self.stopping.has_changed().unwrap_or(false) {
+            self.stopped = true;
+            return Some(WS_CLOSE_GOING_AWAY);
+        }
+        None
+    }
+
+    fn judge(&mut self, outcome: DashboardCaller) -> Result<(), u16> {
+        match outcome {
+            DashboardCaller::Session(session) if !self.require_admin || session.is_admin() => {
+                self.session = session;
+                Ok(())
+            }
+            DashboardCaller::Session(_) => Err(WS_CLOSE_ACCESS_LOST),
+            DashboardCaller::Rejected(_) => Err(WS_CLOSE_SESSION_ENDED),
+        }
+    }
+
+    /// Check the session now, before acting on input the socket sent: the
+    /// same checks as a request, against the current policy, rather than
+    /// waiting for the periodic recheck.
+    pub(crate) async fn admits_now(&mut self, state: &AppState) -> Result<(), u16> {
+        if let Some(code) = self.known_lost() {
+            return Err(code);
+        }
+        self.pending = None;
+        let outcome = self.auth.recheck(state, &self.session).await;
+        self.judge(outcome)
+    }
+
     /// Resolves with the close code once the session stops admitting the
     /// socket. Cancel-safe: dropping the future loses nothing, since a
     /// started recheck lives in `self.pending` and the next call resumes it.
     async fn lost(&mut self, state: &AppState) -> u16 {
         loop {
+            if let Some(code) = self.known_lost() {
+                return code;
+            }
             let remaining = self.session.expires_at.saturating_sub(now_unix());
             let expiry = tokio::time::sleep(std::time::Duration::from_secs(remaining));
             let outcome = match self.pending.as_mut() {
                 Some(pending) => tokio::select! {
                     () = self.session.ended.cancelled() => return WS_CLOSE_SESSION_ENDED,
                     () = expiry => return WS_CLOSE_SESSION_ENDED,
+                    () = Self::generation_stopped(&mut self.stopping) => {
+                        self.stopped = true;
+                        return WS_CLOSE_GOING_AWAY;
+                    }
                     outcome = pending => outcome,
                 },
                 None => {
                     tokio::select! {
                         () = self.session.ended.cancelled() => return WS_CLOSE_SESSION_ENDED,
                         () = expiry => return WS_CLOSE_SESSION_ENDED,
+                        () = Self::generation_stopped(&mut self.stopping) => {
+                            self.stopped = true;
+                            return WS_CLOSE_GOING_AWAY;
+                        }
                         _ = self.recheck.tick() => {}
                     }
                     let auth = Arc::clone(&self.auth);
@@ -994,12 +1131,8 @@ impl SessionWatch {
                 }
             };
             self.pending = None;
-            match outcome {
-                DashboardCaller::Session(session) if !self.require_admin || session.is_admin() => {
-                    self.session = session;
-                }
-                DashboardCaller::Session(_) => return WS_CLOSE_ACCESS_LOST,
-                DashboardCaller::Rejected(_) => return WS_CLOSE_SESSION_ENDED,
+            if let Err(code) = self.judge(outcome) {
+                return code;
             }
         }
     }
@@ -1011,6 +1144,19 @@ pub(crate) async fn session_lost(watch: &mut Option<SessionWatch>, state: &AppSt
     match watch {
         Some(watch) => watch.lost(state).await,
         None => std::future::pending().await,
+    }
+}
+
+/// [`SessionWatch::admits_now`] for a socket that may have no session; a
+/// socket without one is always admitted here (its own credential check
+/// already ran when it opened).
+pub(crate) async fn session_admits_now(
+    watch: &mut Option<SessionWatch>,
+    state: &AppState,
+) -> Result<(), u16> {
+    match watch {
+        Some(watch) => watch.admits_now(state).await,
+        None => Ok(()),
     }
 }
 
@@ -1026,7 +1172,10 @@ pub(crate) enum OperatorSession {
     Denied(Response),
 }
 
-pub(crate) fn operator_session(dashboard: Option<&Arc<DashboardAuth>>) -> OperatorSession {
+pub(crate) fn operator_session(
+    dashboard: Option<&Arc<DashboardAuth>>,
+    state: &AppState,
+) -> OperatorSession {
     let Some(caller) = current_caller() else {
         return OperatorSession::Absent;
     };
@@ -1034,9 +1183,9 @@ pub(crate) fn operator_session(dashboard: Option<&Arc<DashboardAuth>>) -> Operat
         return OperatorSession::Denied(denied.into_response());
     }
     match (caller, dashboard) {
-        (DashboardCaller::Session(session), Some(auth)) => {
-            OperatorSession::Admitted(Some(SessionWatch::new(Arc::clone(auth), session, true)))
-        }
+        (DashboardCaller::Session(session), Some(auth)) => OperatorSession::Admitted(Some(
+            SessionWatch::new(Arc::clone(auth), session, true, state),
+        )),
         _ => OperatorSession::Admitted(None),
     }
 }
@@ -2362,6 +2511,7 @@ mod tests {
             Arc::clone(&fixture.auth),
             Arc::clone(&session),
             true,
+            &fixture.state,
         ));
         assert!(fixture.auth.end(&session));
         let code = tokio::time::timeout(
@@ -2633,7 +2783,7 @@ mod tests {
                     .unwrap(),
             ),
         ));
-        let mut watch = SessionWatch::new(reloaded, session, true);
+        let mut watch = SessionWatch::new(reloaded, session, true, &fixture.state);
         watch.recheck = tokio::time::interval(std::time::Duration::from_millis(1));
         let mut watch = Some(watch);
         // Each 20 ms slice is one turn of a busy socket's loop.

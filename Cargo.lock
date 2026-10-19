@@ -14114,6 +14114,7 @@ dependencies = [
  "zeroclaw-spawn",
  "zeroclaw-tls",
  "zeroclaw-tools",
+ "zeroize",
 ]
 
 [[package]]

@@ -1206,6 +1206,9 @@ async fn handle_pkce_callback(
             },
             Some((dashboard, provider, lifetime_secs)),
         ) => {
+            // The dashboard never refreshes: a refresh token the provider
+            // returned anyway is wiped here rather than merely dropped.
+            drop(token.refresh_token.map(zeroize::Zeroizing::new));
             let landing = DashboardLanding {
                 alias,
                 provider,

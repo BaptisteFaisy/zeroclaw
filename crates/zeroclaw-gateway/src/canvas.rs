@@ -188,6 +188,7 @@ pub async fn handle_ws_canvas(
         let session = if token.is_empty() {
             crate::dashboard_session::operator_session(
                 dashboard.as_ref().map(|axum::Extension(auth)| auth),
+                &state,
             )
         } else {
             crate::dashboard_session::OperatorSession::Absent
@@ -262,9 +263,10 @@ async fn handle_canvas_socket(
     });
     let _ = sender.send(Message::Text(ack.to_string().into())).await;
 
-    // Spawn a task that forwards broadcast updates to the WebSocket
+    // Forward broadcast updates to the WebSocket. It never completes on its
+    // own: once the feed ends the socket stays open until the client leaves.
     let canvas_id_clone = canvas_id.clone();
-    let send_task = zeroclaw_spawn::spawn!(async move {
+    let forward = async {
         loop {
             match rx.recv().await {
                 Ok(frame) => {
@@ -293,7 +295,8 @@ async fn handle_canvas_socket(
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
-    });
+        std::future::pending::<()>().await;
+    };
 
     // Read loop: we mostly ignore incoming messages but handle close/ping
     let read_loop = async {
@@ -304,12 +307,14 @@ async fn handle_canvas_socket(
             }
         }
     };
-    // A dashboard session that ends, or loses its access, ends the feed.
-    tokio::select! {
-        () = read_loop => {}
-        _ = crate::dashboard_session::session_lost(&mut session_watch, &state) => {}
+    // A dashboard session that ends, or loses its access, ends the feed with
+    // the session's close code.
+    let lost = tokio::select! {
+        () = read_loop => None,
+        () = forward => None,
+        code = crate::dashboard_session::session_lost(&mut session_watch, &state) => Some(code),
+    };
+    if let Some(code) = lost {
+        crate::ws::close_with(&mut sender, &mut receiver, code, "dashboard session ended").await;
     }
-
-    // Abort the send task when the connection is closed
-    send_task.abort();
 }

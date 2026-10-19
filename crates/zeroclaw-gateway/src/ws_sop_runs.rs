@@ -53,6 +53,7 @@ pub async fn handle_ws_sop_runs(
         let session = if token.is_empty() {
             crate::dashboard_session::operator_session(
                 dashboard.as_ref().map(|axum::Extension(auth)| auth),
+                &state,
             )
         } else {
             crate::dashboard_session::OperatorSession::Absent
@@ -133,19 +134,13 @@ async fn handle_socket(
         return;
     }
 
-    // No notifier attached (headless embedder): the snapshot stands; keep the
-    // socket open until the client leaves rather than closing abruptly.
-    let Some(mut rx) = rx else {
-        while let Some(m) = receiver.next().await {
-            match m {
-                Ok(Message::Close(_)) | Err(_) => break,
-                _ => {}
-            }
-        }
-        return;
-    };
-
-    let send_task = zeroclaw_spawn::spawn!(async move {
+    // Forward run changes. It never completes on its own: with no notifier
+    // attached (headless embedder) the snapshot stands, and the socket stays
+    // open until the client leaves rather than closing abruptly.
+    let forward = async {
+        let Some(mut rx) = rx else {
+            return std::future::pending::<()>().await;
+        };
         loop {
             match rx.recv().await {
                 Ok(run) => {
@@ -165,7 +160,8 @@ async fn handle_socket(
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
-    });
+        std::future::pending::<()>().await;
+    };
 
     let read_loop = async {
         while let Some(m) = receiver.next().await {
@@ -175,11 +171,14 @@ async fn handle_socket(
             }
         }
     };
-    // A dashboard session that ends, or loses its access, ends the feed.
-    tokio::select! {
-        () = read_loop => {}
-        _ = crate::dashboard_session::session_lost(&mut session_watch, &state) => {}
+    // A dashboard session that ends, or loses its access, ends the feed with
+    // the session's close code, with or without a notifier.
+    let lost = tokio::select! {
+        () = read_loop => None,
+        () = forward => None,
+        code = crate::dashboard_session::session_lost(&mut session_watch, &state) => Some(code),
+    };
+    if let Some(code) = lost {
+        crate::ws::close_with(&mut sender, &mut receiver, code, "dashboard session ended").await;
     }
-
-    send_task.abort();
 }
