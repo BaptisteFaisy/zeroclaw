@@ -2925,6 +2925,9 @@ pub async fn run_gateway_with_plugin_webhooks(
             }
         }
     }
+    // Let go of the port at once, as `axum::serve` does: a connection made
+    // from here on is refused, not accepted into a backlog nothing serves.
+    drop(listener);
     // Every connection finishes the request in flight and closes; whatever
     // is still open after the drain (an event stream, a connection that
     // ignored the shutdown) is cancelled. Nothing waits on it beyond that:
