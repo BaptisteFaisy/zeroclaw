@@ -943,9 +943,17 @@ fn config_admin_router(inbound_auth: &Arc<principal_gate::GatewayInboundAuth>) -
 }
 
 /// How long a stopping gateway lets its connections finish the requests in
-/// flight. It sits well inside the daemon's 500 ms grace for the gateway, so
-/// the drain is over before that grace runs out.
+/// flight. With [`RETIRE_JOIN`] it stays inside the daemon's 500 ms grace for
+/// the gateway, so retirement is over before that grace runs out.
 const CONNECTION_DRAIN: Duration = Duration::from_millis(300);
+
+/// How long retirement waits for the tasks it aborted to actually end.
+/// Aborting only asks: a task ends, and drops what it owns, when it is next
+/// polled.
+const RETIRE_JOIN: Duration = Duration::from_millis(100);
+
+/// How long a new gateway waits for an aborted gateway's tasks to end.
+const RETIRE_BARRIER: Duration = Duration::from_secs(2);
 
 /// Every task one gateway's serving runs: one per connection, and the
 /// stream tasks hyper's HTTP/2 spawns through its executor. A task leaves
@@ -1019,13 +1027,21 @@ impl ServeTasks {
         }
     }
 
-    /// Wait up to `within` for every task to finish, then abort the rest.
-    /// Whether all finished in time.
+    /// Wait up to `within` for every task to finish, then abort the rest and
+    /// wait until they have ended too. Whether all finished in time.
     async fn retire_within(&self, within: Duration) -> bool {
         if tokio::time::timeout(within, self.idle()).await.is_ok() {
             return true;
         }
         self.abort_all();
+        if tokio::time::timeout(RETIRE_JOIN, self.idle()).await.is_err() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "gateway tasks were still running after they were aborted"
+            );
+        }
         false
     }
 }
@@ -1036,24 +1052,66 @@ where
     F::Output: Send + 'static,
 {
     fn execute(&self, future: F) {
-        drop(zeroclaw_spawn::spawn!(async move {
+        self.spawn(async move {
             let _ = future.await;
-        }));
+        });
     }
 }
 
 /// Owned by a gateway's serve loop. If the gateway is dropped before its
-/// drain ran (the daemon aborted it), its tasks are aborted here.
-struct ServeTasksGuard(ServeTasks);
+/// drain ran (the daemon aborted it), its tasks are aborted here, and left
+/// for the next gateway to wait on: aborting alone does not prove they have
+/// ended.
+struct ServeTasksGuard(ServeTasks, &'static Retiring);
 
 impl Drop for ServeTasksGuard {
     fn drop(&mut self) {
         self.0.abort_all();
+        if !self.0.0.running.lock().is_empty() {
+            self.1.add(self.0.clone());
+        }
     }
 }
 
-/// Wait for the tasks of the gateways before this one to end.
-async fn previous_gateways_retired() {}
+/// Aborted gateways whose tasks may still be winding down.
+struct Retiring(parking_lot::Mutex<Vec<ServeTasks>>);
+
+impl Retiring {
+    const fn new() -> Self {
+        Self(parking_lot::Mutex::new(Vec::new()))
+    }
+
+    fn add(&self, tasks: ServeTasks) {
+        self.0.lock().push(tasks);
+    }
+
+    /// Wait until the tasks of every gateway left here have ended.
+    async fn wait(&self) {
+        let retiring = std::mem::take(&mut *self.0.lock());
+        for tasks in retiring {
+            if tokio::time::timeout(RETIRE_BARRIER, tasks.idle())
+                .await
+                .is_err()
+            {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    "an earlier gateway's tasks were still running when this one started"
+                );
+            }
+        }
+    }
+}
+
+/// The gateways of this process that were aborted before their drain ran.
+static RETIRING: Retiring = Retiring::new();
+
+/// Wait for the tasks of the gateways before this one to end, so a new
+/// gateway never serves while an aborted one's tasks are still running.
+async fn previous_gateways_retired() {
+    RETIRING.wait().await;
+}
 
 /// What the accept loop does after `accept()` failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1067,20 +1125,35 @@ enum AcceptErrorAction {
 }
 
 fn accept_error_action(error: &std::io::Error, tls: bool) -> AcceptErrorAction {
-    let _ = tls;
-    if is_recoverable_accept_error(error) {
-        AcceptErrorAction::RetryAfter(Duration::from_millis(ACCEPT_ERROR_BACKOFF_MS))
+    if tls {
+        return if is_recoverable_accept_error(error) {
+            AcceptErrorAction::RetryAfter(Duration::from_millis(ACCEPT_ERROR_BACKOFF_MS))
+        } else {
+            AcceptErrorAction::Fail
+        };
+    }
+    // The plain listener's rule from `axum::serve`: a connection that failed
+    // before it was accepted is skipped, anything else (running out of file
+    // descriptors, say) is waited out for a second, and it never gives up.
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+    ) {
+        AcceptErrorAction::Retry
     } else {
-        AcceptErrorAction::Fail
+        AcceptErrorAction::RetryAfter(Duration::from_secs(1))
     }
 }
 
 /// Wait `delay` before accepting again. Whether the gateway was told to stop
 /// meanwhile.
 async fn accept_backoff(delay: Duration, stopping: &mut tokio::sync::watch::Receiver<bool>) -> bool {
-    let _ = stopping;
-    tokio::time::sleep(delay).await;
-    false
+    tokio::select! {
+        () = tokio::time::sleep(delay) => false,
+        () = gateway_stop_requested(stopping) => true,
+    }
 }
 
 /// Resolves when the gateway is told to stop; never, if it no longer can be.
@@ -2705,7 +2778,7 @@ pub async fn run_gateway_with_plugin_webhooks(
     // so a stop reaches all of them and none outlives this gateway.
     let mut app = app.into_make_service_with_connect_info::<SocketAddr>();
     let tasks = ServeTasks::default();
-    let _abort_on_drop = ServeTasksGuard(tasks.clone());
+    let _abort_on_drop = ServeTasksGuard(tasks.clone(), &RETIRING);
     loop {
         tokio::select! {
             conn = listener.accept() => {
@@ -7534,8 +7607,11 @@ path = "{trigger_path}"
             let _held = held;
             std::future::pending::<()>().await;
         });
-        drop(ServeTasksGuard(tasks.clone()));
-        previous_gateways_retired().await;
+        // A registry of its own, so gateways other tests start cannot take
+        // these tasks off it first.
+        static RETIRING_HERE: Retiring = Retiring::new();
+        drop(ServeTasksGuard(tasks.clone(), &RETIRING_HERE));
+        RETIRING_HERE.wait().await;
         assert_eq!(
             Arc::strong_count(&owned),
             1,
