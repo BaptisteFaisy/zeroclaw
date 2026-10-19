@@ -18,7 +18,8 @@
 //!   operation must re-verify or fail closed.
 //! - JWKS refresh is bounded: an unknown `kid` may trigger at most one
 //!   fetch per cooldown window, so a stream of bad tokens cannot hammer
-//!   the IdP.
+//!   the IdP. One fetch runs at a time: a check that needs the keys while
+//!   a fetch is in flight waits for that fetch and gets its result.
 //! - Actor class (human vs. service) is declared, never inferred from the
 //!   `sub`/`client_id` relationship: `service_clients` and
 //!   `interactive_clients` classify by verified `client_id`, and
@@ -29,6 +30,7 @@
 //!   claims, unmatched audience — is a denial, never a fallback.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -36,6 +38,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use parking_lot::{Mutex, RwLock};
 use serde::Deserialize;
+use tokio::sync::watch;
 use zeroclaw_api::principal::{
     AuthMethod, AuthOutcome, AuthenticatedIdentity, DenyReason, IdentitySubject,
 };
@@ -439,6 +442,55 @@ fn verify_signature(header: &JwtHeader, jwk: &Jwk, signed: &str, sig: &[u8]) -> 
     }
 }
 
+async fn discover(
+    http: &reqwest::Client,
+    issuer: &str,
+    alias: &str,
+    cache: &RwLock<Option<Discovery>>,
+) -> anyhow::Result<Discovery> {
+    if let Some(d) = cache.read().clone() {
+        return Ok(d);
+    }
+    let url = format!(
+        "{}/.well-known/openid-configuration",
+        issuer.trim_end_matches('/')
+    );
+    let response = http.get(&url).send().await?.error_for_status()?;
+    let body = read_response_limited(response).await?;
+    let d: Discovery = serde_json::from_slice(&body)?;
+    // The document must assert the issuer we configured, or we fetched
+    // somebody else's metadata (or a spoofed/misrouted endpoint).
+    if d.issuer.as_deref() != Some(issuer) {
+        anyhow::bail!(
+            "discovery document issuer does not match the configured issuer for oidc.{alias}"
+        );
+    }
+    if let Some(uri) = d.jwks_uri.as_deref() {
+        validate_discovered_endpoint(uri, "jwks_uri")?;
+    }
+    if let Some(endpoint) = d.introspection_endpoint.as_deref() {
+        validate_discovered_endpoint(endpoint, "introspection_endpoint")?;
+    }
+    *cache.write() = Some(d.clone());
+    Ok(d)
+}
+
+async fn fetch_jwks(
+    http: &reqwest::Client,
+    issuer: &str,
+    alias: &str,
+    discovery: &RwLock<Option<Discovery>>,
+) -> anyhow::Result<HashMap<String, Jwk>> {
+    let discovery = discover(http, issuer, alias, discovery).await?;
+    let uri = discovery
+        .jwks_uri
+        .ok_or_else(|| anyhow::Error::msg("issuer discovery has no jwks_uri"))?;
+    let response = http.get(&uri).send().await?.error_for_status()?;
+    let body = read_response_limited(response).await?;
+    let set: JwkSet = serde_json::from_slice(&body)?;
+    select_verification_keys(set)
+}
+
 /// Test-only hold point: the next check that finds the key cache stale stops
 /// there until the test releases it.
 #[cfg(test)]
@@ -454,13 +506,16 @@ pub struct OidcAuthProvider {
     alias: String,
     config: OidcConfig,
     http: reqwest::Client,
-    discovery: RwLock<Option<Discovery>>,
-    jwks: RwLock<HashMap<String, Jwk>>,
+    discovery: Arc<RwLock<Option<Discovery>>>,
+    jwks: Arc<RwLock<HashMap<String, Jwk>>>,
     /// Earliest moment the next unknown-`kid` JWKS refresh may run.
     jwks_refresh_after: Mutex<Option<Instant>>,
     /// A cached key set becomes stale after this deadline even when its
     /// current token `kid` is known.
-    jwks_fresh_until: Mutex<Option<Instant>>,
+    jwks_fresh_until: Arc<Mutex<Option<Instant>>>,
+    /// The latest JWKS fetch. It holds `None` while the fetch is in flight
+    /// and `Some(fetched)` once it has ended.
+    jwks_fetch: Mutex<Option<watch::Receiver<Option<bool>>>>,
     /// Test-only: see [`StalePause`].
     #[cfg(test)]
     stale_check_pause: Mutex<Option<StalePause>>,
@@ -478,10 +533,11 @@ impl OidcAuthProvider {
             alias,
             config,
             http,
-            discovery: RwLock::new(None),
-            jwks: RwLock::new(HashMap::new()),
+            discovery: Arc::new(RwLock::new(None)),
+            jwks: Arc::new(RwLock::new(HashMap::new())),
             jwks_refresh_after: Mutex::new(None),
-            jwks_fresh_until: Mutex::new(None),
+            jwks_fresh_until: Arc::new(Mutex::new(None)),
+            jwks_fetch: Mutex::new(None),
             #[cfg(test)]
             stale_check_pause: Mutex::new(None),
         })
@@ -498,59 +554,79 @@ impl OidcAuthProvider {
     }
 
     async fn discovery(&self) -> anyhow::Result<Discovery> {
-        if let Some(d) = self.discovery.read().clone() {
-            return Ok(d);
-        }
-        let url = format!(
-            "{}/.well-known/openid-configuration",
-            self.config.issuer.trim_end_matches('/')
-        );
-        let response = self.http.get(&url).send().await?.error_for_status()?;
-        let body = read_response_limited(response).await?;
-        let d: Discovery = serde_json::from_slice(&body)?;
-        // The document must assert the issuer we configured, or we fetched
-        // somebody else's metadata (or a spoofed/misrouted endpoint).
-        if d.issuer.as_deref() != Some(self.config.issuer.as_str()) {
-            anyhow::bail!(
-                "discovery document issuer does not match the configured issuer for oidc.{}",
-                self.alias
-            );
-        }
-        if let Some(uri) = d.jwks_uri.as_deref() {
-            validate_discovered_endpoint(uri, "jwks_uri")?;
-        }
-        if let Some(endpoint) = d.introspection_endpoint.as_deref() {
-            validate_discovered_endpoint(endpoint, "introspection_endpoint")?;
-        }
-        *self.discovery.write() = Some(d.clone());
-        Ok(d)
+        discover(
+            &self.http,
+            &self.config.issuer,
+            &self.alias,
+            &self.discovery,
+        )
+        .await
     }
 
     /// Refresh the JWKS cache, rate-limited to one fetch per cooldown
     /// window. Returns whether a refresh actually ran.
+    ///
+    /// Only one fetch runs at a time. A check that arrives while one is in
+    /// flight waits for it and gets its result, whatever the cooldown says.
+    /// The fetch runs on its own task, so it ends even when the check that
+    /// started it is dropped, and a waiter waits no longer than the fetch's
+    /// own HTTP timeouts allow.
     async fn refresh_jwks_bounded(&self) -> anyhow::Result<bool> {
-        {
-            let mut after = self.jwks_refresh_after.lock();
-            if let Some(after) = *after
-                && Instant::now() < after
-            {
-                return Ok(false);
+        let mut fetch = {
+            let mut latest = self.jwks_fetch.lock();
+            let in_flight = latest
+                .as_ref()
+                .filter(|fetch| fetch.borrow().is_none())
+                .cloned();
+            match in_flight {
+                Some(fetch) => fetch,
+                None => {
+                    {
+                        let mut after = self.jwks_refresh_after.lock();
+                        if let Some(after) = *after
+                            && Instant::now() < after
+                        {
+                            return Ok(false);
+                        }
+                        // Claim the slot before the network call, so a failed
+                        // or slow fetch still counts against the cooldown.
+                        *after = Some(Instant::now() + JWKS_REFRESH_COOLDOWN);
+                    }
+                    let fetch = self.spawn_jwks_fetch();
+                    *latest = Some(fetch.clone());
+                    fetch
+                }
             }
-            // Claim the slot before the network call so concurrent bad
-            // tokens cannot trigger parallel fetch storms.
-            *after = Some(Instant::now() + JWKS_REFRESH_COOLDOWN);
+        };
+        match fetch.wait_for(Option::is_some).await.map(|ended| *ended) {
+            Ok(Some(true)) => Ok(true),
+            _ => Err(anyhow::Error::msg("the JWKS fetch failed")),
         }
-        let discovery = self.discovery().await?;
-        let uri = discovery
-            .jwks_uri
-            .ok_or_else(|| anyhow::Error::msg("issuer discovery has no jwks_uri"))?;
-        let response = self.http.get(&uri).send().await?.error_for_status()?;
-        let body = read_response_limited(response).await?;
-        let set: JwkSet = serde_json::from_slice(&body)?;
-        let next = select_verification_keys(set)?;
-        *self.jwks.write() = next;
-        *self.jwks_fresh_until.lock() = Some(Instant::now() + JWKS_CACHE_TTL);
-        Ok(true)
+    }
+
+    /// Start a JWKS fetch on its own task. The receiver reports whether it
+    /// replaced the cached keys; a fetch that ends early, for example at
+    /// shutdown, reports nothing and counts as failed.
+    fn spawn_jwks_fetch(&self) -> watch::Receiver<Option<bool>> {
+        let (report, fetch) = watch::channel(None);
+        let http = self.http.clone();
+        let issuer = self.config.issuer.clone();
+        let alias = self.alias.clone();
+        let discovery = Arc::clone(&self.discovery);
+        let jwks = Arc::clone(&self.jwks);
+        let fresh_until = Arc::clone(&self.jwks_fresh_until);
+        ::zeroclaw_spawn::spawn!(async move {
+            let fetched = match fetch_jwks(&http, &issuer, &alias, &discovery).await {
+                Ok(next) => {
+                    *jwks.write() = next;
+                    *fresh_until.lock() = Some(Instant::now() + JWKS_CACHE_TTL);
+                    true
+                }
+                Err(_) => false,
+            };
+            report.send_replace(Some(fetched));
+        });
+        fetch
     }
 
     #[cfg(test)]
@@ -597,6 +673,9 @@ impl OidcAuthProvider {
             self.hold_after_stale_check().await;
             match self.refresh_jwks_bounded().await {
                 Ok(true) => {}
+                // A fetch that ended after this check found the cache stale
+                // may have refreshed it; its cooldown is no reason to refuse.
+                Ok(false) if self.jwks_is_fresh() => {}
                 Ok(false) => return deny(DenyReason::Misconfigured),
                 Err(_) => return deny(DenyReason::Misconfigured),
             };
