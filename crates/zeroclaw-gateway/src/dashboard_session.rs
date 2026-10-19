@@ -1351,15 +1351,20 @@ pub(crate) mod test_support {
             .await;
     }
 
-    /// Verify the `corp` session again at every check (introspection with
-    /// no revalidation interval).
-    pub(crate) fn verify_every_time(config: &mut Config) {
+    /// Verify a `corp` session again once `secs` have passed since it was
+    /// last verified. A check after that verifies once and, if the provider
+    /// still vouches for the token, admits the session for `secs` more.
+    pub(crate) fn revalidate_after(config: &mut Config, secs: u64) {
         config
             .oidc
             .get_mut("corp")
             .expect("sign-in is configured")
-            .revalidation_secs = 0;
+            .revalidation_secs = secs;
     }
+
+    /// How long after a verification its revalidation deadline has surely
+    /// passed, for a `revalidate_after(config, 2)` session.
+    pub(crate) const UNTIL_DUE: Duration = Duration::from_millis(3100);
 
     /// Turn sign-in on with one `corp` provider at `issuer`: group `admins`
     /// maps to an administrator profile, group `ops` to a config reader.
@@ -3065,13 +3070,15 @@ mod tests {
     async fn an_http_admission_verified_past_hard_expiry_is_refused() {
         let server = idp(&["admins"], "gw").await;
         let mut config = sign_in_config(&server.uri());
-        test_support::verify_every_time(&mut config);
+        test_support::revalidate_after(&mut config, 2);
         let fixture = fixture(config);
         let (cookie, _) = fixture
             .auth
-            .sign_in("corp", pin_for(&fixture, "corp"), "at-alice".into(), 2)
+            .sign_in("corp", pin_for(&fixture, "corp"), "at-alice".into(), 5)
             .await
             .expect("alice signs in");
+        // Due for verification, which now takes past the hard expiry.
+        tokio::time::sleep(test_support::UNTIL_DUE).await;
         test_support::slow_introspection(&server, &["admins"], "gw", Duration::from_secs(4))
             .await;
         let (status, body) = probe(&fixture, &[("cookie", &cookie_for(&cookie))]).await;
@@ -3089,15 +3096,16 @@ mod tests {
     async fn a_frame_check_cut_short_by_expiry_refuses_the_frame() {
         let server = idp(&["admins"], "gw").await;
         let mut config = sign_in_config(&server.uri());
-        test_support::verify_every_time(&mut config);
+        test_support::revalidate_after(&mut config, 2);
         let fixture = fixture(config);
         let (_, session) = fixture
             .auth
-            .sign_in("corp", pin_for(&fixture, "corp"), "at-alice".into(), 2)
+            .sign_in("corp", pin_for(&fixture, "corp"), "at-alice".into(), 5)
             .await
             .expect("alice signs in");
         let mut watch = SessionWatch::new(Arc::clone(&fixture.auth), session, true, &fixture.state);
-        test_support::slow_introspection(&server, &["admins"], "gw", Duration::from_secs(6))
+        tokio::time::sleep(test_support::UNTIL_DUE).await;
+        test_support::slow_introspection(&server, &["admins"], "gw", Duration::from_secs(8))
             .await;
         let started = std::time::Instant::now();
         let verdict = watch.admits_now(&fixture.state).await;
@@ -3107,7 +3115,7 @@ mod tests {
             "a frame was admitted past the session's hard expiry"
         );
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            started.elapsed() < Duration::from_secs(6),
             "the refusal waited for the slow check: {:?}",
             started.elapsed()
         );
@@ -3118,7 +3126,7 @@ mod tests {
     async fn a_frame_check_cut_short_by_generation_stop_refuses_the_frame() {
         let server = idp(&["admins"], "gw").await;
         let mut config = sign_in_config(&server.uri());
-        test_support::verify_every_time(&mut config);
+        test_support::revalidate_after(&mut config, 2);
         let fixture = fixture(config);
         let (_, session) = fixture
             .auth
@@ -3126,7 +3134,8 @@ mod tests {
             .await
             .expect("alice signs in");
         let mut watch = SessionWatch::new(Arc::clone(&fixture.auth), session, true, &fixture.state);
-        test_support::slow_introspection(&server, &["admins"], "gw", Duration::from_secs(6))
+        tokio::time::sleep(test_support::UNTIL_DUE).await;
+        test_support::slow_introspection(&server, &["admins"], "gw", Duration::from_secs(8))
             .await;
         let stop = fixture.state.shutdown_tx.clone();
         let started = std::time::Instant::now();
@@ -3205,7 +3214,7 @@ mod tests {
     async fn a_lost_watch_drops_its_pending_recheck() {
         let server = idp(&["admins"], "gw").await;
         let mut config = sign_in_config(&server.uri());
-        test_support::verify_every_time(&mut config);
+        test_support::revalidate_after(&mut config, 2);
         let fixture = fixture(config);
         let (_, session) = fixture
             .auth
@@ -3218,6 +3227,7 @@ mod tests {
             true,
             &fixture.state,
         );
+        tokio::time::sleep(test_support::UNTIL_DUE).await;
         watch.recheck = tokio::time::interval(Duration::from_millis(1));
         test_support::slow_introspection(&server, &["admins"], "gw", Duration::from_secs(30))
             .await;

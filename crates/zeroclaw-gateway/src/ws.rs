@@ -4183,12 +4183,12 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                 .expect("the fixture's risk profile")
                 .always_ask = vec!["file_read".to_string()];
             std::fs::write(config.data_dir.join("note.txt"), APPROVED_READ).expect("fixture file");
-            crate::dashboard_session::test_support::verify_every_time(config);
+            crate::dashboard_session::test_support::revalidate_after(config, 2);
         })
         .await;
         fixture.script_tool_call(1, "file_read", serde_json::json!({"path": "note.txt"}));
         let lifetime = match end {
-            SlowCheckEnd::Expiry => 6,
+            SlowCheckEnd::Expiry => 12,
             SlowCheckEnd::GenerationStop => 3600,
         };
         let (cookie, _) = fixture.sign_in(lifetime).await;
@@ -4206,11 +4206,14 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             .expect("the prompt names its request")
             .to_string();
 
+        // The approval's check is due to verify again, and the provider is
+        // now slower than what is left of the session.
+        tokio::time::sleep(crate::dashboard_session::test_support::UNTIL_DUE).await;
         crate::dashboard_session::test_support::slow_introspection(
             &idp,
             &["admins"],
             "gw",
-            Duration::from_secs(10),
+            Duration::from_secs(16),
         )
         .await;
         send_raw(
@@ -4233,7 +4236,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         };
         let (code, _) = crate::dashboard_session::test_support::until_closed(
             &mut client,
-            Duration::from_secs(9),
+            Duration::from_secs(12),
         )
         .await;
         assert_eq!(code, Some(expected), "{end:?}: the socket closes at the end");
