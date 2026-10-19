@@ -3397,6 +3397,96 @@ mod tests {
         }
     }
 
+    /// A re-verification that a policy publish straddles is tried once more
+    /// with the token held, as the grants check is: the new policy still
+    /// admits the account, so the session goes on instead of ending.
+    #[tokio::test]
+    async fn a_reverification_straddling_a_policy_publish_is_tried_again() {
+        let server = idp(&["admins"], "gw").await;
+        let mut config = sign_in_config(&server.uri());
+        test_support::revalidate_after(&mut config, 2);
+        let pairing = Arc::new(PairingGuard::new(
+            true,
+            &config.gateway.paired_tokens,
+            PairingCodePolicy::default(),
+        ));
+        let rpc = Arc::new(RpcInboundAuth::from_config(&config, Arc::clone(&pairing)).unwrap());
+        let inbound = Arc::new(GatewayInboundAuth::from_shared(Arc::clone(&rpc)));
+        let fixture = fixture_with(
+            config.clone(),
+            pairing,
+            inbound,
+            Arc::new(DashboardSessions::default()),
+        );
+        let signed_in = sign_in(&fixture, &server).await;
+        tokio::time::sleep(test_support::UNTIL_DUE).await;
+        test_support::slow_introspection(&server, &["admins"], "gw", Duration::from_millis(600))
+            .await;
+        // Another group mapped: an authorization input alice doesn't depend on.
+        let mut republished = config;
+        republished
+            .oidc
+            .get_mut("corp")
+            .unwrap()
+            .profile_map
+            .insert("auditors".into(), "config-reader".into());
+        let before = rpc.generation();
+        let publisher = Arc::clone(&rpc);
+        let (response, ()) = tokio::join!(
+            send(
+                &fixture.router,
+                request(
+                    "GET",
+                    "/api/operator-probe",
+                    loopback(),
+                    &[("cookie", &signed_in.cookie_header())],
+                ),
+            ),
+            async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                publisher
+                    .publish_accepted(&republished, publisher.accepted_revision() + 1)
+                    .unwrap();
+            }
+        );
+        assert_ne!(rpc.generation(), before, "the publish moved the policy");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a publish during re-verification ended a session the new policy admits"
+        );
+    }
+
+    /// A generation whose stop channel has closed is over: nothing can serve
+    /// it or tell it anything more. So it reads as retired, and so does a
+    /// socket's watch on it, even when the stop it was sent went unseen.
+    #[tokio::test]
+    async fn a_closed_stop_channel_reads_as_retired() {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let (_, session) = fixture
+            .auth
+            .sign_in("corp", pin_for(&fixture, "corp"), "at-alice".into(), 3600)
+            .await
+            .expect("alice signs in");
+        let mut watch = SessionWatch::new(Arc::clone(&fixture.auth), session, true, &fixture.state);
+        let mut auth = DashboardAuth::new(
+            Arc::new(DashboardSessions::default()),
+            inbound_for(&sign_in_config(&server.uri())),
+        );
+        let (stop, stopping) = tokio::sync::watch::channel(false);
+        auth.stopping = Some(stopping.clone());
+        watch.stopping = stopping;
+        stop.send_replace(true);
+        drop(stop);
+        assert!(auth.is_retired(), "a closed channel read as a live generation");
+        assert_eq!(
+            watch.known_lost(),
+            Some(WS_CLOSE_GOING_AWAY),
+            "a socket's watch on a closed generation saw no stop"
+        );
+    }
+
     /// A cookie request still verifying its session when its generation
     /// stops gets the gateway's restart answer, shaped for its protocol:
     /// HTTP/1.1 is told to close, HTTP/2 gets no `Connection` header (its
