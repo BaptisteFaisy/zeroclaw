@@ -1142,7 +1142,7 @@ where
 /// What a stopped gateway answers: try again on a new connection, which the
 /// next gateway serves. Nothing in it comes from the stopped gateway's
 /// configuration or state.
-fn gateway_restarting(version: axum::http::Version) -> Response {
+pub(crate) fn gateway_restarting(version: axum::http::Version) -> Response {
     let mut response = (
         StatusCode::SERVICE_UNAVAILABLE,
         [(header::RETRY_AFTER, "1")],

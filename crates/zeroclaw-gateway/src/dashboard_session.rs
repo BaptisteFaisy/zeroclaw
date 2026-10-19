@@ -1402,10 +1402,11 @@ pub async fn layer(
     let Some(cookie) = scope.session_value(request.headers()) else {
         return next.run(request).await;
     };
-    // A stopped generation admits nobody: an open keep-alive or TLS
-    // connection can still reach its router after its listener closed.
+    // A stopped generation admits nobody. The transport already refuses a
+    // request first served after the stop; this catches one it admitted
+    // just before.
     if layer.auth.is_retired() {
-        return generation_stopped_response();
+        return crate::gateway_restarting(request.version());
     }
     let host = request
         .headers()
@@ -1423,7 +1424,8 @@ pub async fn layer(
                 .admit(|alias| provider_for(&offered, alias), &cookie)
                 .await;
             if layer.auth.is_retired() {
-                return generation_stopped_response();
+                // The gateway's own restart answer, shaped for the protocol.
+                return crate::gateway_restarting(request.version());
             }
             match caller {
                 DashboardCaller::Session(session) => {
@@ -1445,25 +1447,6 @@ pub async fn layer(
     // tabs and later requests hear why ("expired") instead of the answer for
     // no credential at all. Sign-out clears it; a new sign-in replaces it.
     DASHBOARD_CALLER.scope(caller, next.run(request)).await
-}
-
-/// The answer for a cookie request that reached a stopped generation: the
-/// client tries again, and the next generation's authority decides.
-fn generation_stopped_response() -> Response {
-    let mut response = (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(serde_json::json!({
-            "error": "The gateway is restarting. Try again.",
-            "reason": "gateway_restarting",
-        })),
-    )
-        .into_response();
-    let headers = response.headers_mut();
-    headers.insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
-    // A client reusing this connection would only reach the stopped
-    // generation again; it has to open a new one to reach the next.
-    headers.insert(header::CONNECTION, HeaderValue::from_static("close"));
-    response
 }
 
 /// A rejected session's answer as a full response, for routes that answer
