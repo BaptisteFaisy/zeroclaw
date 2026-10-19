@@ -1980,6 +1980,36 @@ mod tests {
         assert!(!backend.session_exists("ghost"));
     }
 
+    /// `try_load` is the read that refuses to guess: a transcript that can't
+    /// be read, or has a row that can't be decoded, is an error, never a
+    /// shorter history.
+    #[test]
+    fn try_load_reports_an_unreadable_transcript() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend.append("s", &ChatMessage::user("hello")).unwrap();
+        backend.append("s", &ChatMessage::assistant("hi")).unwrap();
+        assert_eq!(backend.try_load("s").unwrap().len(), 2);
+
+        let db = Connection::open(tmp.path().join("sessions/sessions.db")).unwrap();
+        db.execute(
+            "UPDATE sessions SET content = CAST(x'ff' AS BLOB) WHERE content = 'hi'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            backend.try_load("s").is_err(),
+            "an undecodable row must not read as a shorter transcript"
+        );
+
+        db.execute_batch("ALTER TABLE sessions RENAME TO sessions_unreadable;")
+            .unwrap();
+        assert!(
+            backend.try_load("s").is_err(),
+            "an unreadable transcript must not read as an empty one"
+        );
+    }
+
     #[test]
     fn migrate_from_jsonl_imports_and_renames() {
         let tmp = TempDir::new().unwrap();

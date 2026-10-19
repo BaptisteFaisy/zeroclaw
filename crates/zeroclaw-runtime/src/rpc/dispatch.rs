@@ -48118,6 +48118,7 @@ mod tests {
         use serde_json::json;
         use std::sync::Arc;
         use std::time::{Duration, Instant};
+        use zeroclaw_api::model_provider::ConversationMessage;
         use zeroclaw_infra::session_queue::SessionActorQueue;
 
         /// The default `wss.orphaned_session_timeout_secs`.
@@ -48490,84 +48491,6 @@ mod tests {
             );
         }
 
-        /// A chat backend whose transcript writes (appends and rewrites) fail
-        /// while `failing` is set.
-        #[derive(Default)]
-        struct FlakyChatBackend {
-            failing: std::sync::atomic::AtomicBool,
-            rows: std::sync::Mutex<
-                std::collections::HashMap<String, Vec<zeroclaw_providers::ChatMessage>>,
-            >,
-        }
-
-        impl zeroclaw_infra::session_backend::SessionBackend for FlakyChatBackend {
-            fn load(&self, session_key: &str) -> Vec<zeroclaw_providers::ChatMessage> {
-                self.rows
-                    .lock()
-                    .unwrap()
-                    .get(session_key)
-                    .cloned()
-                    .unwrap_or_default()
-            }
-            fn append(
-                &self,
-                session_key: &str,
-                message: &zeroclaw_providers::ChatMessage,
-            ) -> std::io::Result<()> {
-                if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
-                    return Err(std::io::Error::other("simulated transcript write failure"));
-                }
-                self.rows
-                    .lock()
-                    .unwrap()
-                    .entry(session_key.to_string())
-                    .or_default()
-                    .push(message.clone());
-                Ok(())
-            }
-            fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
-                Ok(self
-                    .rows
-                    .lock()
-                    .unwrap()
-                    .get_mut(session_key)
-                    .and_then(Vec::pop)
-                    .is_some())
-            }
-            fn list_sessions(&self) -> Vec<String> {
-                self.rows.lock().unwrap().keys().cloned().collect()
-            }
-            fn session_exists(&self, session_key: &str) -> bool {
-                self.rows.lock().unwrap().contains_key(session_key)
-            }
-            fn set_session_agent_alias(
-                &self,
-                session_key: &str,
-                _agent_alias: &str,
-            ) -> std::io::Result<()> {
-                self.rows
-                    .lock()
-                    .unwrap()
-                    .entry(session_key.to_string())
-                    .or_default();
-                Ok(())
-            }
-            fn rewrite_messages(
-                &self,
-                session_key: &str,
-                messages: &[zeroclaw_providers::ChatMessage],
-            ) -> std::io::Result<()> {
-                if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
-                    return Err(std::io::Error::other("simulated transcript write failure"));
-                }
-                self.rows
-                    .lock()
-                    .unwrap()
-                    .insert(session_key.to_string(), messages.to_vec());
-                Ok(())
-            }
-        }
-
         fn two_turns() -> Vec<zeroclaw_api::model_provider::ChatMessage> {
             vec![
                 zeroclaw_api::model_provider::ChatMessage::user("hello"),
@@ -48576,46 +48499,32 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn history_that_cannot_be_persisted_keeps_its_session_until_it_can() {
+        async fn a_history_its_store_lacks_keeps_the_session_until_it_is_stored() {
             let tmp = tempfile::TempDir::new().unwrap();
-            let backend = Arc::new(FlakyChatBackend::default());
-            let queue = Arc::new(SessionActorQueue::new(32, 30, 600));
-            let sessions = Arc::new(SessionStore::new(64, queue));
-            let ctx = RpcContext::for_persistence_tests(
-                make_acp_test_config(&tmp),
-                Arc::clone(&sessions),
-                Some(backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
-                None,
-            );
+            let (ctx, backend, _acp) = persistence_enforcement_ctx(make_acp_test_config(&tmp));
             let mut client = remote(&ctx, "tui_unsaved");
             let session = open(&client).await;
+            let key = format!("rpc_{session}");
             // The turn's history is live, and its post-turn write failed.
-            sessions.seed_history(&session, &two_turns()).await;
+            ctx.sessions.seed_history(&session, &two_turns()).await;
             disconnect(&ctx, &mut client).await;
             let later = Instant::now() + TIMEOUT;
 
-            backend
-                .failing
-                .store(true, std::sync::atomic::Ordering::SeqCst);
             assert!(retire_orphaned_sessions(&ctx, later).await.is_empty());
             assert_eq!(
-                sessions.list_ids().await,
+                ctx.sessions.list_ids().await,
                 vec![session.clone()],
                 "the only copy was dropped"
             );
+            assert!(
+                stored_contents(&backend, &key).is_empty(),
+                "retirement wrote the transcript"
+            );
 
-            backend
-                .failing
-                .store(false, std::sync::atomic::Ordering::SeqCst);
-            assert_eq!(
-                retire_orphaned_sessions(&ctx, later).await,
-                vec![session.clone()]
-            );
-            assert_eq!(
-                backend.load(&format!("rpc_{session}")).len(),
-                2,
-                "retired without its history"
-            );
+            // Once the history is stored (by a later turn's write, say), the session can go.
+            store_as_a_turn_would(&backend, &key, &two_turns());
+            assert_eq!(retire_orphaned_sessions(&ctx, later).await, vec![session]);
+            assert_eq!(stored_contents(&backend, &key), vec!["hello", "hi there"]);
         }
 
         #[tokio::test]
@@ -48641,7 +48550,9 @@ mod tests {
             let mut client = remote(&ctx, "tui_chat");
             let session = open(&client).await;
             let key = format!("rpc_{session}");
+            // A turn's history, stored by its post-turn write.
             ctx.sessions.seed_history(&session, &two_turns()).await;
+            store_as_a_turn_would(&backend, &key, &two_turns());
             backend
                 .set_session_principal(&key, "principal-kept")
                 .unwrap();
@@ -48789,6 +48700,192 @@ mod tests {
                 "message times were rewritten"
             );
             assert_eq!(row(&backend), row_before, "session metadata was rewritten");
+        }
+
+        /// A chat backend that deletes the session (as an independent writer
+        /// such as the gateway's delete route would) right after answering an
+        /// existence check, and counts appends.
+        struct DeletedAfterCheckBackend {
+            inner: Arc<dyn zeroclaw_infra::session_backend::SessionBackend>,
+            delete_on_next_check: std::sync::atomic::AtomicBool,
+            deleted: std::sync::atomic::AtomicBool,
+            appends: std::sync::atomic::AtomicUsize,
+        }
+
+        impl zeroclaw_infra::session_backend::SessionBackend for DeletedAfterCheckBackend {
+            fn load(&self, session_key: &str) -> Vec<zeroclaw_providers::ChatMessage> {
+                self.inner.load(session_key)
+            }
+            fn try_load(
+                &self,
+                session_key: &str,
+            ) -> std::io::Result<Vec<zeroclaw_providers::ChatMessage>> {
+                self.inner.try_load(session_key)
+            }
+            fn append(
+                &self,
+                session_key: &str,
+                message: &zeroclaw_providers::ChatMessage,
+            ) -> std::io::Result<()> {
+                self.appends
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.inner.append(session_key, message)
+            }
+            fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
+                self.inner.remove_last(session_key)
+            }
+            fn list_sessions(&self) -> Vec<String> {
+                self.inner.list_sessions()
+            }
+            fn session_exists(&self, session_key: &str) -> bool {
+                let exists = self.inner.session_exists(session_key);
+                if exists
+                    && self
+                        .delete_on_next_check
+                        .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    self.inner.delete_session(session_key).unwrap();
+                    self.deleted
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                exists
+            }
+            fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
+                self.inner.delete_session(session_key)
+            }
+            fn set_session_agent_alias(
+                &self,
+                session_key: &str,
+                agent_alias: &str,
+            ) -> std::io::Result<()> {
+                self.inner.set_session_agent_alias(session_key, agent_alias)
+            }
+            fn rewrite_messages(
+                &self,
+                session_key: &str,
+                messages: &[zeroclaw_providers::ChatMessage],
+            ) -> std::io::Result<()> {
+                self.inner.rewrite_messages(session_key, messages)
+            }
+            fn replace_conversation_state_if_exists(
+                &self,
+                session_key: &str,
+                messages: &[zeroclaw_providers::ChatMessage],
+                breadcrumb_present: bool,
+            ) -> std::io::Result<bool> {
+                self.inner.replace_conversation_state_if_exists(
+                    session_key,
+                    messages,
+                    breadcrumb_present,
+                )
+            }
+        }
+
+        #[tokio::test]
+        async fn a_session_deleted_while_retirement_checks_it_stays_deleted() {
+            for kind in ["sqlite", "jsonl"] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let config = make_acp_test_config(&tmp);
+                let inner = zeroclaw_infra::make_session_backend(&config.data_dir, kind).unwrap();
+                let backend = Arc::new(DeletedAfterCheckBackend {
+                    inner: Arc::clone(&inner),
+                    delete_on_next_check: std::sync::atomic::AtomicBool::new(false),
+                    deleted: std::sync::atomic::AtomicBool::new(false),
+                    appends: std::sync::atomic::AtomicUsize::new(0),
+                });
+                let queue = Arc::new(SessionActorQueue::new(32, 30, 600));
+                let sessions = Arc::new(SessionStore::new(64, queue));
+                let ctx = RpcContext::for_persistence_tests(
+                    config,
+                    Arc::clone(&sessions),
+                    Some(
+                        backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>
+                    ),
+                    None,
+                );
+                let mut client = remote(&ctx, "tui_deleted");
+                let session = open(&client).await;
+                let key = format!("rpc_{session}");
+                // The store holds the first message; the reply's write failed.
+                inner
+                    .append(
+                        &key,
+                        &zeroclaw_api::model_provider::ChatMessage::user("hello"),
+                    )
+                    .unwrap();
+                sessions.seed_history(&session, &two_turns()).await;
+                disconnect(&ctx, &mut client).await;
+                backend
+                    .delete_on_next_check
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+
+                retire_orphaned_sessions(&ctx, Instant::now() + TIMEOUT).await;
+
+                assert_eq!(
+                    backend.appends.load(std::sync::atomic::Ordering::SeqCst),
+                    0,
+                    "{kind}: retirement wrote to the transcript"
+                );
+                if backend.deleted.load(std::sync::atomic::Ordering::SeqCst) {
+                    assert!(
+                        !inner.session_exists(&key),
+                        "{kind}: the deleted session came back"
+                    );
+                    assert!(
+                        inner.load(&key).is_empty(),
+                        "{kind}: deleted messages came back"
+                    );
+                }
+                assert_eq!(
+                    sessions.list_ids().await,
+                    vec![session],
+                    "{kind}: a history its store lacks must keep its session"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn an_unreadable_transcript_keeps_the_session() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = make_acp_test_config(&tmp);
+            let db = config.data_dir.join("sessions/sessions.db");
+            let (ctx, backend, _acp) = persistence_enforcement_ctx(config);
+            let mut client = remote(&ctx, "tui_unreadable");
+            let session = open(&client).await;
+            let key = format!("rpc_{session}");
+            ctx.sessions.seed_history(&session, &two_turns()).await;
+            store_as_a_turn_would(&backend, &key, &two_turns());
+            disconnect(&ctx, &mut client).await;
+            let rows = |db: &std::path::Path| -> i64 {
+                rusqlite::Connection::open(db)
+                    .unwrap()
+                    .query_row(
+                        "SELECT COUNT(*) FROM sessions WHERE session_key = ?1",
+                        [&key],
+                        |row| row.get(0),
+                    )
+                    .unwrap()
+            };
+            // The reply's row can't be decoded; the session's metadata still reads.
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute(
+                "UPDATE sessions SET content = CAST(x'ff' AS BLOB) WHERE content = 'hi there'",
+                [],
+            )
+            .unwrap();
+            let later = Instant::now() + TIMEOUT;
+
+            assert!(retire_orphaned_sessions(&ctx, later).await.is_empty());
+            assert_eq!(ctx.sessions.list_ids().await, vec![session.clone()]);
+            assert_eq!(rows(&db), 2, "retirement wrote to an unreadable transcript");
+
+            conn.execute(
+                "UPDATE sessions SET content = 'hi there' WHERE typeof(content) = 'blob'",
+                [],
+            )
+            .unwrap();
+            assert_eq!(retire_orphaned_sessions(&ctx, later).await, vec![session]);
+            assert_eq!(rows(&db), 2);
         }
 
         #[tokio::test]
@@ -48963,6 +49060,69 @@ mod tests {
                     .is_empty()
             );
             assert!(acp.load_session(sid).unwrap().unwrap().messages.is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_failed_terminal_acp_checkpoint_leaves_no_live_transcript_to_retire() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = make_acp_test_config(&tmp);
+            let acp_db = config.data_dir.join("sessions/acp-sessions.db");
+            let (ctx, _chat, acp) = persistence_enforcement_ctx(config);
+            let sid = "acp-terminal-checkpoint-failed";
+            let mut client = remote(&ctx, "tui_acp_terminal");
+            acp_session_with_a_provider(
+                &ctx,
+                &acp,
+                tmp.path(),
+                sid,
+                "tui_acp_terminal",
+                "principal-acp",
+            )
+            .await;
+            // The turn runs and records its checkpoint; finishing it fails.
+            let conn = rusqlite::Connection::open(&acp_db).unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER fail_terminal_checkpoint
+                 BEFORE DELETE ON acp_turn_checkpoints
+                 BEGIN
+                     SELECT RAISE(FAIL, 'injected terminal checkpoint failure');
+                 END;",
+            )
+            .unwrap();
+            assert!(prompt_locally(&ctx, sid).await.is_err());
+            disconnect(&ctx, &mut client).await;
+
+            assert!(
+                ctx.sessions.get_agent(sid).await.is_none(),
+                "a turn whose checkpoint could not be finished leaves no live session"
+            );
+            assert!(
+                retire_orphaned_sessions(&ctx, Instant::now() + TIMEOUT)
+                    .await
+                    .is_empty()
+            );
+
+            conn.execute_batch("DROP TRIGGER fail_terminal_checkpoint;")
+                .unwrap();
+            let (operator, _rx) = local_operator(&ctx).await;
+            operator
+                .handle_session_new_for_test(&json!({
+                    "agent_alias": "test-agent",
+                    "chat_mode": "acp",
+                    "exclude_memory": true,
+                    "session_id": sid,
+                }))
+                .await
+                .expect("the committed checkpoint is recoverable");
+            let restored = acp.load_session(sid).unwrap().unwrap();
+            assert!(
+                restored.messages.iter().any(|message| matches!(
+                    message,
+                    ConversationMessage::Chat(chat) if chat.role == "user" && chat.content == "hello"
+                )),
+                "the turn's committed prompt was lost: {:?}",
+                restored.messages
+            );
         }
 
         #[tokio::test]
