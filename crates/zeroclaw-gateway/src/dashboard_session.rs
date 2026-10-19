@@ -2369,7 +2369,10 @@ mod tests {
         assert_eq!(fixture.auth.sessions.len(), 0);
         let (status, body) = probe(&fixture, &[("cookie", &cookie_header)]).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert_eq!(body["reason"], "session_expired", "the next request hears it too");
+        assert_eq!(
+            body["reason"], "session_expired",
+            "the next request hears it too"
+        );
     }
 
     /// A session ended by a policy change answers "expired" in every tab of
@@ -2422,7 +2425,10 @@ mod tests {
         assert_eq!(json(first).await["reason"], "session_expired");
         let (status, body) = probe(&fixture, &[("cookie", &signed_in.cookie_header())]).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert_eq!(body["reason"], "session_expired", "another tab hears it too");
+        assert_eq!(
+            body["reason"], "session_expired",
+            "another tab hears it too"
+        );
     }
 
     /// Another browser's sign-in sweeps expired sessions out of the store.
