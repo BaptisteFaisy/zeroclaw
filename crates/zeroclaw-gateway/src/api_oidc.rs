@@ -1257,10 +1257,7 @@ async fn finish_dashboard_sign_in(
         return_to,
         popup,
     } = landing;
-    match dashboard
-        .sign_in(&alias, provider, access_token, lifetime_secs)
-        .await
-    {
+    match dashboard.sign_in(&alias, provider, access_token, lifetime_secs).await {
         Ok((cookie, session)) => {
             ::zeroclaw_log::record!(
                 INFO,

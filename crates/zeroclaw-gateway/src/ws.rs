@@ -157,10 +157,9 @@ pub async fn handle_ws_chat(
         if let Err(denied) = caller.admit_operator() {
             return denied.into_response();
         }
-        if let (crate::dashboard_session::DashboardCaller::Session(session), Some(Extension(auth))) =
-            (caller, dashboard)
-        {
-            session_watch = Some(crate::dashboard_session::SessionWatch::new(auth, session, true));
+        use crate::dashboard_session::{DashboardCaller, SessionWatch};
+        if let (DashboardCaller::Session(session), Some(Extension(auth))) = (caller, dashboard) {
+            session_watch = Some(SessionWatch::new(auth, session, true));
         }
     }
 

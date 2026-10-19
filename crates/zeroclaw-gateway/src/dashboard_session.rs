@@ -561,8 +561,7 @@ impl DashboardAuth {
     /// earlier: the same checks as for a request.
     pub(crate) async fn recheck(&self, state: &AppState, session: &SessionAuth) -> DashboardCaller {
         let offered = offered_providers(state);
-        self.admit_key(|alias| provider_for(&offered, alias), session.key)
-            .await
+        self.admit_key(|alias| provider_for(&offered, alias), session.key).await
     }
 
     /// The session a cookie names, checked as RPC checks a bound connection
@@ -799,7 +798,12 @@ impl CookieScope<'_> {
     /// a cross-site top-level navigation from the identity provider and a
     /// `Strict` cookie would not be sent with it; it lives as long as the
     /// flow.
-    pub(crate) fn binding_cookie(&self, state: &str, value: &str, max_age_secs: u64) -> HeaderValue {
+    pub(crate) fn binding_cookie(
+        &self,
+        state: &str,
+        value: &str,
+        max_age_secs: u64,
+    ) -> HeaderValue {
         let (name, path) = self.binding_name_and_path(state);
         let header = format!(
             "{name}={value}; Path={path}; HttpOnly; SameSite=Lax; Max-Age={max_age_secs}{}",
@@ -1075,10 +1079,7 @@ pub async fn layer(
         Err(rejection) => DashboardCaller::Rejected(rejection),
         Ok(()) => {
             let offered = offered_providers(&layer.state);
-            let caller = layer
-                .auth
-                .admit(|alias| provider_for(&offered, alias), &cookie)
-                .await;
+            let caller = layer.auth.admit(|alias| provider_for(&offered, alias), &cookie).await;
             match caller {
                 DashboardCaller::Session(session) => {
                     match check_csrf(request.method(), request.headers(), &session) {
@@ -1894,7 +1895,14 @@ mod tests {
         assert!(
             cookies
                 .iter()
-                .all(|cookie| fixture.auth.sessions.sessions.lock().contains_key(&session_key(cookie))),
+                .all(|cookie| {
+                    fixture
+                        .auth
+                        .sessions
+                        .sessions
+                        .lock()
+                        .contains_key(&session_key(cookie))
+                }),
             "every existing session survives"
         );
     }
