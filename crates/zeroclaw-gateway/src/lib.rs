@@ -978,7 +978,12 @@ struct ServeTaskDone(Arc<ServeTasksInner>);
 
 impl Drop for ServeTaskDone {
     fn drop(&mut self) {
-        if self.0.live.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+        if self
+            .0
+            .live
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            == 1
+        {
             self.0.idle.notify_waiters();
         }
     }
@@ -989,7 +994,9 @@ impl ServeTasks {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        self.0.live.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.0
+            .live
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let task = ServeTask {
             future: Box::pin(future),
             _done: ServeTaskDone(Arc::clone(&self.0)),
@@ -1119,7 +1126,11 @@ async fn serve_while_current<S, B>(
     req: axum::http::Request<B>,
 ) -> Result<Response, std::convert::Infallible>
 where
-    S: tower::Service<axum::http::Request<B>, Response = Response, Error = std::convert::Infallible>,
+    S: tower::Service<
+            axum::http::Request<B>,
+            Response = Response,
+            Error = std::convert::Infallible,
+        >,
 {
     if !admission.admits() {
         return Ok(gateway_restarting(req.version()));
@@ -7710,7 +7721,9 @@ path = "{trigger_path}"
             );
             let headers = response.headers();
             assert_eq!(
-                headers.get(header::RETRY_AFTER).and_then(|v| v.to_str().ok()),
+                headers
+                    .get(header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok()),
                 Some("1"),
                 "{version:?}"
             );
@@ -7745,13 +7758,10 @@ path = "{trigger_path}"
             stopping,
             tasks: ServeTasks::default(),
         };
-        let response = serve_while_current(
-            router.clone(),
-            &admission,
-            request(Version::HTTP_11, false),
-        )
-        .await
-        .unwrap();
+        let response =
+            serve_while_current(router.clone(), &admission, request(Version::HTTP_11, false))
+                .await
+                .unwrap();
         assert_eq!(response.status(), StatusCode::OK, "admitted while current");
         assert_eq!(routed.load(Ordering::SeqCst), 1);
 
@@ -7780,13 +7790,10 @@ path = "{trigger_path}"
             tasks: tasks.clone(),
         };
         tasks.cancel();
-        let response = serve_while_current(
-            router.clone(),
-            &admission,
-            request(Version::HTTP_11, false),
-        )
-        .await
-        .unwrap();
+        let response =
+            serve_while_current(router.clone(), &admission, request(Version::HTTP_11, false))
+                .await
+                .unwrap();
         assert_gateway_restarting(response, Version::HTTP_11).await;
         assert_eq!(
             routed.load(Ordering::SeqCst),
@@ -8001,8 +8008,12 @@ path = "{trigger_path}"
     impl RawH2 {
         async fn open(mut io: Box<dyn DrainTestIo>) -> Self {
             use tokio::io::AsyncWriteExt;
-            io.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").await.unwrap();
-            io.write_all(&h2_frame(H2_SETTINGS, 0, 0, &[])).await.unwrap();
+            io.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+                .await
+                .unwrap();
+            io.write_all(&h2_frame(H2_SETTINGS, 0, 0, &[]))
+                .await
+                .unwrap();
             let mut raw = Self(io);
             raw.next_frame_of(|kind, flags, _| kind == H2_SETTINGS && flags & 0x1 == 0)
                 .await
@@ -8069,7 +8080,7 @@ path = "{trigger_path}"
             let (addr, shutdown_tx, server) = start_drain_test_gateway_with(
                 &tmp.path().join(if over_tls { "tls" } else { "plain" }),
                 0,
-                over_tls.then(|| (cert_path.as_path(), key_path.as_path())),
+                over_tls.then_some((cert_path.as_path(), key_path.as_path())),
                 Some(bus),
             )
             .await;
@@ -8122,7 +8133,7 @@ path = "{trigger_path}"
         let tmp = tempfile::TempDir::new().unwrap();
         let (cert_path, key_path, connector) = drain_test_tls(tmp.path());
         for over_tls in [false, true] {
-            let certs = over_tls.then(|| (cert_path.as_path(), key_path.as_path()));
+            let certs = over_tls.then_some((cert_path.as_path(), key_path.as_path()));
             let tls = over_tls.then_some(&connector);
             let label = if over_tls { "tls" } else { "plain" };
             let (addr, shutdown_tx, server) = start_drain_test_gateway_with(
@@ -8135,10 +8146,9 @@ path = "{trigger_path}"
             let mut kept_h1 = drain_test_connect(addr, tls).await;
             let head = drain_test_request(&mut kept_h1, "/health").await;
             assert!(head.starts_with("HTTP/1.1 200"), "{label}: {head}");
-            let (kept_h2, connection) =
-                h2::client::handshake(drain_test_connect(addr, tls).await)
-                    .await
-                    .expect("HTTP/2 handshake");
+            let (kept_h2, connection) = h2::client::handshake(drain_test_connect(addr, tls).await)
+                .await
+                .expect("HTTP/2 handshake");
             let kept_h2_driver = zeroclaw_spawn::spawn!(async move {
                 let _ = connection.await;
             });
@@ -8189,10 +8199,9 @@ path = "{trigger_path}"
             let mut fresh_h1 = drain_test_connect(addr, tls).await;
             let head = drain_test_request(&mut fresh_h1, "/api/events").await;
             assert!(head.starts_with("HTTP/1.1 200"), "{label}: {head}");
-            let (fresh_h2, connection) =
-                h2::client::handshake(drain_test_connect(addr, tls).await)
-                    .await
-                    .expect("HTTP/2 handshake with the next gateway");
+            let (fresh_h2, connection) = h2::client::handshake(drain_test_connect(addr, tls).await)
+                .await
+                .expect("HTTP/2 handshake with the next gateway");
             let fresh_h2_driver = zeroclaw_spawn::spawn!(async move {
                 let _ = connection.await;
             });
