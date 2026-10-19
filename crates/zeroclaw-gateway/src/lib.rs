@@ -7225,6 +7225,19 @@ path = "{trigger_path}"
         tokio::sync::watch::Sender<bool>,
         tokio::task::JoinHandle<Result<()>>,
     ) {
+        start_drain_test_gateway_with(data, port, tls, None).await
+    }
+
+    async fn start_drain_test_gateway_with(
+        data: &std::path::Path,
+        port: u16,
+        tls: Option<(&std::path::Path, &std::path::Path)>,
+        event_bus: Option<zeroclaw_runtime::observability::EventBus>,
+    ) -> (
+        SocketAddr,
+        tokio::sync::watch::Sender<bool>,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
         let mut config = Config {
             data_dir: data.join("data"),
             config_path: data.join("config.toml"),
@@ -7256,7 +7269,7 @@ path = "{trigger_path}"
                 "127.0.0.1",
                 port,
                 config,
-                None,
+                event_bus,
                 Some(controls),
                 None,
                 None,
@@ -7365,6 +7378,8 @@ path = "{trigger_path}"
         let mut streaming = drain_test_tls_connect(&connector, addr).await;
         let head = drain_test_request(&mut streaming, "/api/events").await;
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        // A connection whose TLS handshake never starts.
+        let mut handshaking = tokio::net::TcpStream::connect(addr).await.unwrap();
 
         shutdown_tx.send(true).unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(2), server)
@@ -7381,6 +7396,10 @@ path = "{trigger_path}"
             drain_test_closed(&mut streaming).await.is_some(),
             "the connection with an event stream in flight is closed"
         );
+        assert!(
+            drain_test_closed(&mut handshaking).await.is_some(),
+            "the connection still waiting for its TLS handshake is closed"
+        );
 
         let (_, next_shutdown, next) = start_drain_test_gateway(
             &tmp.path().join("next"),
@@ -7396,6 +7415,186 @@ path = "{trigger_path}"
         );
         next_shutdown.send(true).unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), next).await;
+    }
+
+    /// An HTTP/2 event stream (h2c on the plain listener) is retired with its
+    /// gateway: by the time the gateway returns, the stream's task has ended,
+    /// and its subscription to the event bus with it.
+    #[tokio::test]
+    async fn a_stopped_gateway_has_retired_its_http2_streams_when_it_returns() {
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let bus = zeroclaw_runtime::observability::EventBus::new();
+        let events = bus.sender().clone();
+        let (addr, shutdown_tx, server) =
+            start_drain_test_gateway_with(&tmp.path().join("h2"), 0, None, Some(bus)).await;
+        let before = events.receiver_count();
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (client, connection) = h2::client::handshake(tcp).await.expect("h2c handshake");
+        let driver = zeroclaw_spawn::spawn!(async move {
+            let _ = connection.await;
+        });
+        let mut client = client.ready().await.expect("the h2 connection is ready");
+        let request = axum::http::Request::get(format!("http://{addr}/api/events"))
+            .body(())
+            .unwrap();
+        let (response, _) = client.send_request(request, true).expect("send the request");
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), response)
+            .await
+            .expect("response deadline")
+            .expect("response");
+        assert_eq!(response.status(), 200);
+        let _body = response.into_body();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while events.receiver_count() <= before {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the event stream subscribes to the bus");
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .expect("an HTTP/2 stream held up the gateway's stop")
+            .expect("the gateway task does not panic")
+            .expect("the gateway stops cleanly");
+        assert!(
+            events.receiver_count() <= before,
+            "an HTTP/2 stream outlived its gateway's retirement"
+        );
+        driver.abort();
+    }
+
+    /// Retiring waits until the tasks it aborted have actually ended, so
+    /// nothing they owned outlives it.
+    #[tokio::test]
+    async fn retiring_waits_until_the_aborted_tasks_have_ended() {
+        let tasks = ServeTasks::default();
+        let owned = Arc::new(());
+        let held = Arc::clone(&owned);
+        tasks.spawn(async move {
+            let _held = held;
+            std::future::pending::<()>().await;
+        });
+        assert!(
+            !tasks.retire_within(Duration::from_millis(10)).await,
+            "the task outlasts the drain"
+        );
+        assert_eq!(
+            Arc::strong_count(&owned),
+            1,
+            "an aborted task still held what it owned when retiring returned"
+        );
+    }
+
+    /// The tasks hyper's HTTP/2 spawns for its streams belong to the gateway
+    /// too, and are retired with its connections.
+    #[tokio::test]
+    async fn stream_tasks_hyper_spawns_are_retired_with_the_connections() {
+        let tasks = ServeTasks::default();
+        let owned = Arc::new(());
+        let held = Arc::clone(&owned);
+        hyper::rt::Executor::execute(&tasks, async move {
+            let _held = held;
+            std::future::pending::<()>().await;
+        });
+        tasks.retire_within(Duration::from_millis(10)).await;
+        assert_eq!(
+            Arc::strong_count(&owned),
+            1,
+            "a stream task outlived its gateway's retirement"
+        );
+    }
+
+    /// Retiring takes at most the drain plus the join of what it aborted,
+    /// which together fit inside the daemon's 500 ms grace.
+    #[tokio::test]
+    async fn retiring_ends_within_the_daemons_grace() {
+        tokio::time::pause();
+        let tasks = ServeTasks::default();
+        tasks.spawn(std::future::pending());
+        let started = tokio::time::Instant::now();
+        tasks.retire_within(CONNECTION_DRAIN).await;
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "retiring took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A gateway the daemon aborted before its drain ran leaves its tasks
+    /// aborted but possibly not yet ended; the next gateway waits for them.
+    #[tokio::test]
+    async fn the_next_gateway_waits_for_an_aborted_gateways_tasks() {
+        let tasks = ServeTasks::default();
+        let owned = Arc::new(());
+        let held = Arc::clone(&owned);
+        tasks.spawn(async move {
+            let _held = held;
+            std::future::pending::<()>().await;
+        });
+        drop(ServeTasksGuard(tasks.clone()));
+        previous_gateways_retired().await;
+        assert_eq!(
+            Arc::strong_count(&owned),
+            1,
+            "the next gateway started before the aborted one's tasks had ended"
+        );
+    }
+
+    /// The plain listener keeps the rule it had: a failed connection is
+    /// skipped at once, anything else retried after a second, never fatal.
+    /// The TLS listener keeps its own.
+    #[test]
+    fn each_listener_keeps_its_accept_error_rule() {
+        use std::io::{Error, ErrorKind};
+        for kind in [
+            ErrorKind::ConnectionRefused,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::ConnectionReset,
+        ] {
+            assert_eq!(
+                accept_error_action(&Error::from(kind), false),
+                AcceptErrorAction::Retry,
+                "plain, {kind:?}"
+            );
+        }
+        for kind in [ErrorKind::Other, ErrorKind::PermissionDenied] {
+            assert_eq!(
+                accept_error_action(&Error::from(kind), false),
+                AcceptErrorAction::RetryAfter(Duration::from_secs(1)),
+                "plain, {kind:?}"
+            );
+        }
+        assert_eq!(
+            accept_error_action(&Error::from(ErrorKind::ConnectionAborted), true),
+            AcceptErrorAction::RetryAfter(Duration::from_millis(ACCEPT_ERROR_BACKOFF_MS)),
+            "TLS, a transient error"
+        );
+        assert_eq!(
+            accept_error_action(&Error::from(ErrorKind::PermissionDenied), true),
+            AcceptErrorAction::Fail,
+            "TLS, a broken listener"
+        );
+    }
+
+    /// A stop does not wait for an accept-error backoff to run out.
+    #[tokio::test]
+    async fn a_stop_cuts_an_accept_backoff_short() {
+        let (stop, mut stopping) = tokio::sync::watch::channel(false);
+        let (stopped, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                accept_backoff(Duration::from_secs(60), &mut stopping),
+                async {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    stop.send_replace(true);
+                }
+            )
+        })
+        .await
+        .expect("the backoff waited out its delay despite the stop");
+        assert!(stopped, "the stop is reported");
     }
 
     /// The same over plain HTTP: a gateway told to stop returns promptly
