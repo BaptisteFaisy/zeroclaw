@@ -3862,6 +3862,16 @@ impl RpcDispatcher {
 
         let env = self.retained_tui_env(&connection_auth, req.env);
         let tui_sig = self.ctx.tui_registry.sign(&tui_id);
+        // A connection holds one registration. Initializing again (to
+        // revalidate, say) replaces this connection's earlier registration
+        // instead of leaving it live beside the new one, so the identity is
+        // still seen to leave when the connection ends.
+        if let Some((previous_id, previous_epoch)) = self.tui_registration() {
+            let previous_id = previous_id.to_string();
+            self.ctx
+                .tui_registry
+                .unregister(&previous_id, previous_epoch);
+        }
         let tui_epoch = self
             .ctx
             .tui_registry
@@ -7211,6 +7221,10 @@ impl RpcDispatcher {
                 }
             }
         }
+
+        // The turn's end is the session's latest activity: orphan retirement
+        // measures idle time from here, not from the turn's start.
+        self.ctx.sessions.touch(sid).await;
 
         // Keep the terminal count aligned with session/new and session/messages:
         // it is the durable projected conversation length, not the number of

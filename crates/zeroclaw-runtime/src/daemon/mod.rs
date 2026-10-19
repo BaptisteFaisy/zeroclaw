@@ -1134,7 +1134,10 @@ pub async fn run_with_authority(
     // `wss.orphaned_session_timeout_secs`, so they do not hold the live
     // session map until a restart.
     if let Some(ctx) = rpc_ctx.as_ref() {
-        crate::rpc::orphans::spawn_orphan_retirement(ctx, channels_cancel.clone());
+        handles.push(crate::rpc::orphans::spawn_orphan_retirement(
+            ctx,
+            channels_cancel.clone(),
+        ));
     }
 
     // Local IPC RPC listener (Unix socket on Unix, Named Pipe on Windows).

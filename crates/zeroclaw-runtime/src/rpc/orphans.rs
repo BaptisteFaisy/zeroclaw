@@ -7,20 +7,37 @@
 //! restart. Once the owning identity has had no live connection for
 //! `wss.orphaned_session_timeout_secs`, each of its sessions that has been idle
 //! as long, has no turn running and has no approval pending is closed, as
-//! `session/close` would close it. The transcript stays where it is; only the
-//! live session goes.
+//! `session/close` would close it. A chat session's current history is written
+//! to its store first, and a session whose history cannot be written stays
+//! live; only the live session goes.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use tokio_util::sync::CancellationToken;
+
 use super::context::RpcContext;
 use super::session::OwnedSession;
+
+/// How long retirement waits for a session's agent before leaving the session
+/// for a later check.
+const AGENT_WAIT: Duration = Duration::from_secs(5);
 
 /// Close every orphaned remote session that is due at `now` and return the
 /// ids closed. Also forgets the departures of identities that no longer own a
 /// live session.
 pub async fn retire_orphaned_sessions(ctx: &RpcContext, now: Instant) -> Vec<String> {
+    retire_until_cancelled(ctx, now, &CancellationToken::new()).await
+}
+
+/// [`retire_orphaned_sessions`], stopping before the next session, and before
+/// any session's removal, once `cancel` fires.
+async fn retire_until_cancelled(
+    ctx: &RpcContext,
+    now: Instant,
+    cancel: &CancellationToken,
+) -> Vec<String> {
     let timeout_secs = ctx.config.read().wss.orphaned_session_timeout_secs;
     let checked_at = Instant::now();
     let owned = ctx.sessions.owned_sessions().await;
@@ -28,7 +45,12 @@ pub async fn retire_orphaned_sessions(ctx: &RpcContext, now: Instant) -> Vec<Str
     if timeout_secs > 0 {
         let timeout = Duration::from_secs(timeout_secs);
         for candidate in &owned {
-            if is_due(ctx, candidate, timeout, now) && retire(ctx, candidate, timeout, now).await {
+            if cancel.is_cancelled() {
+                break;
+            }
+            if is_due(ctx, candidate, timeout, now)
+                && retire(ctx, candidate, timeout, now, cancel).await
+            {
                 retired.push(candidate.id.clone());
             }
         }
@@ -69,39 +91,44 @@ async fn retire(
     candidate: &OwnedSession,
     timeout: Duration,
     now: Instant,
+    cancel: &CancellationToken,
 ) -> bool {
-    // Serialize with prompts and client closes on the same session.
+    // Serialize with prompts and client closes on the same session. The wait
+    // is bounded by the queue's own lock timeout.
     let Ok(_permit) = ctx.sessions.session_queue.acquire(&candidate.id).await else {
         return false;
     };
     // The same incarnation, still idle and still orphaned, under the permit.
-    let still_due = ctx
-        .sessions
-        .owned_session(&candidate.id)
-        .await
-        .is_some_and(|current| {
-            current.generation == candidate.generation
-                && current.owner_tui_id == candidate.owner_tui_id
-                && is_due(ctx, &current, timeout, now)
-        });
-    if !still_due {
+    let Some(current) = ctx.sessions.owned_session(&candidate.id).await else {
         return false;
-    }
-    ctx.sessions.wait_test_retirement_pause().await;
-    if let Some(agent) = ctx.sessions.get_agent(&candidate.id).await {
-        agent
-            .lock()
-            .await
-            .channel_handles()
-            .unregister_channel("rpc");
-    }
-    if !ctx
-        .sessions
-        .remove_generation(&candidate.id, candidate.generation)
-        .await
+    };
+    if current.generation != candidate.generation
+        || current.owner_tui_id != candidate.owner_tui_id
+        || !is_due(ctx, &current, timeout, now)
+        || !transcript_is_stored(ctx, &current).await
     {
         return false;
     }
+    ctx.sessions.wait_test_retirement_pause().await;
+    if cancel.is_cancelled() {
+        return false;
+    }
+    // Decided and removed in one step: a resume, a recorded activity or a
+    // reconnect after the checks above leaves the session alone.
+    let Some(agent) = ctx
+        .sessions
+        .remove_if_unchanged(&current, || is_due(ctx, &current, timeout, now))
+        .await
+    else {
+        return false;
+    };
+    // Only the agent detached here, never a successor's.
+    agent
+        .lock()
+        .await
+        .channel_handles()
+        .unregister_channel("rpc");
+    drop(agent);
     if let Some(ref hooks) = ctx.hooks {
         hooks.fire_session_end(&candidate.id, "rpc").await;
     }
@@ -120,6 +147,57 @@ async fn retire(
     true
 }
 
+/// Whether the live history of `session` is held by its durable store, writing
+/// a chat session's history now if it is not.
+///
+/// An ACP session's turns each commit through its checkpoint, and a turn whose
+/// checkpoint fails removes its live session, so a live ACP session's history
+/// is already in the ACP store. A chat session's post-turn write can fail
+/// without that, and a daemon can run without a chat store, so its current
+/// history is written here with the same guarded replacement a turn uses: a
+/// deleted row is never recreated, and history it would leave nowhere keeps
+/// the session live.
+async fn transcript_is_stored(ctx: &RpcContext, session: &OwnedSession) -> bool {
+    if matches!(
+        ctx.sessions.chat_mode(&session.id).await,
+        Some(crate::rpc::types::ChatMode::Acp)
+    ) {
+        return true;
+    }
+    let Some(agent) = ctx.sessions.get_agent(&session.id).await else {
+        return false;
+    };
+    let Ok(agent) = tokio::time::timeout(AGENT_WAIT, agent.lock()).await else {
+        return false;
+    };
+    let durable = zeroclaw_providers::durable_chat_messages(agent.history());
+    let Some(backend) = ctx.session_backend.as_ref() else {
+        return durable.is_empty();
+    };
+    match backend.replace_conversation_state_if_exists(
+        &format!("rpc_{}", session.id),
+        &durable,
+        agent.history_has_trim_breadcrumb(),
+    ) {
+        Ok(true) => true,
+        Ok(false) => durable.is_empty(),
+        Err(error) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Write)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "session_id": session.id,
+                        "error": error.to_string(),
+                    })),
+                "Could not store an orphaned session's history; keeping it live"
+            );
+            false
+        }
+    }
+}
+
 /// How long to wait between checks: the timeout itself when it is short,
 /// otherwise a minute. With retirement off, a minute, so that turning it on
 /// takes effect without a restart.
@@ -131,11 +209,12 @@ fn check_interval(timeout_secs: u64) -> Duration {
 }
 
 /// Run [`retire_orphaned_sessions`] until `cancel` fires or `ctx` is dropped.
-/// The task holds `ctx` only while it checks, so it never keeps a finished
-/// daemon generation alive.
+/// The task holds `ctx` only while it checks, and a check stops at its next
+/// safe point once `cancel` fires, so a finished daemon generation is not kept
+/// alive or changed after it is told to stop.
 pub fn spawn_orphan_retirement(
     ctx: &Arc<RpcContext>,
-    cancel: tokio_util::sync::CancellationToken,
+    cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     let ctx = Arc::downgrade(ctx);
     zeroclaw_spawn::spawn!(async move {
@@ -153,7 +232,10 @@ pub fn spawn_orphan_retirement(
             let Some(ctx) = ctx.upgrade() else {
                 return;
             };
-            retire_orphaned_sessions(&ctx, Instant::now()).await;
+            retire_until_cancelled(&ctx, Instant::now(), &cancel).await;
+            if cancel.is_cancelled() {
+                return;
+            }
         }
     })
 }

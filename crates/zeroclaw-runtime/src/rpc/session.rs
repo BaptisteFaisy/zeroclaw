@@ -1795,6 +1795,33 @@ impl SessionStore {
             .collect()
     }
 
+    /// Remove the live session `expected.id` for orphan retirement, only if it
+    /// is still exactly the session that was judged: the same incarnation,
+    /// owner and last activity, with no turn in flight, and `still_eligible`
+    /// still holds. All of it is decided under the map lock that rebinding a
+    /// session and recording its activity also take, so neither can land
+    /// between the decision and the removal. Returns the detached agent.
+    pub(crate) async fn remove_if_unchanged(
+        &self,
+        expected: &OwnedSession,
+        still_eligible: impl FnOnce() -> bool,
+    ) -> Option<Arc<Mutex<Agent>>> {
+        let mut sessions = self.sessions.lock().await;
+        let unchanged = sessions
+            .get(&expected.id)
+            .and_then(|current| Self::owned(&expected.id, current))
+            .is_some_and(|current| current == *expected);
+        if !unchanged || self.has_inflight_turn(&expected.id) || !still_eligible() {
+            return None;
+        }
+        let removed = sessions.remove(&expected.id)?;
+        drop(sessions);
+        if let Some(notify) = removed.pending_generation.as_ref() {
+            notify.notify_waiters();
+        }
+        Some(Arc::clone(&removed.agent))
+    }
+
     /// The live session `id`, if it has an owning TUI identity.
     pub async fn owned_session(&self, id: &str) -> Option<OwnedSession> {
         self.sessions

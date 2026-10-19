@@ -59,6 +59,18 @@ pub struct TuiDeparture {
     pub remote: bool,
 }
 
+/// Which identities have a live connection, and since when the others have
+/// had none. One lock, so a registration and a departure never interleave.
+#[derive(Default)]
+struct Presence {
+    /// Every live registration of each identity, by epoch, with whether it is
+    /// remote. A signed reconnect can register an identity again while its
+    /// earlier connection is still open, and only the last one to end makes
+    /// the identity absent.
+    live: HashMap<String, HashMap<TuiEpoch, bool>>,
+    departed: HashMap<String, TuiDeparture>,
+}
+
 /// Daemon-wide registry of connected TUI clients.
 /// **Source of truth** for live TUI connection state. Not persisted —
 /// rebuilt on each daemon start from incoming `initialize` handshakes.
@@ -70,10 +82,10 @@ pub struct TuiRegistry {
     /// Connected TUIs keyed by `tui_id`, each stamped with the epoch of the
     /// registration that installed it.
     connected: Mutex<HashMap<String, (TuiEpoch, TuiEntry)>>,
-    /// Identities with no live registration, since when. An entry appears
-    /// when an identity's live registration is removed and goes away when the
+    /// Live registrations per identity, and departures: a departure appears
+    /// when an identity's last live registration ends and goes away when the
     /// identity registers again.
-    departed: Mutex<HashMap<String, TuiDeparture>>,
+    presence: Mutex<Presence>,
     /// Hands out the next registration epoch. Monotonic for the life of the
     /// registry, so an epoch identifies one registration and is never reused.
     next_epoch: AtomicU64,
@@ -110,7 +122,7 @@ impl TuiRegistry {
         Self {
             signing_key,
             connected: Mutex::new(HashMap::new()),
-            departed: Mutex::new(HashMap::new()),
+            presence: Mutex::new(Presence::default()),
             next_epoch: AtomicU64::new(0),
         }
     }
@@ -135,7 +147,7 @@ impl TuiRegistry {
                 Self {
                     signing_key: None,
                     connected: Mutex::new(HashMap::new()),
-                    departed: Mutex::new(HashMap::new()),
+                    presence: Mutex::new(Presence::default()),
                     next_epoch: AtomicU64::new(0),
                 }
             }
@@ -147,7 +159,7 @@ impl TuiRegistry {
         Self {
             signing_key: None,
             connected: Mutex::new(HashMap::new()),
-            departed: Mutex::new(HashMap::new()),
+            presence: Mutex::new(Presence::default()),
             next_epoch: AtomicU64::new(0),
         }
     }
@@ -210,10 +222,14 @@ impl TuiRegistry {
     pub fn register(&self, entry: TuiEntry) -> TuiEpoch {
         let epoch = self.next_epoch.fetch_add(1, Ordering::Relaxed);
         let mut connected = self.connected.lock().unwrap_or_else(|e| e.into_inner());
-        self.departed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&entry.tui_id);
+        let mut presence = self.presence.lock().unwrap_or_else(|e| e.into_inner());
+        presence
+            .live
+            .entry(entry.tui_id.clone())
+            .or_default()
+            .insert(epoch, entry.remote);
+        presence.departed.remove(&entry.tui_id);
+        drop(presence);
         connected.insert(entry.tui_id.clone(), (epoch, entry));
         epoch
     }
@@ -230,27 +246,36 @@ impl TuiRegistry {
         if connected
             .get(tui_id)
             .is_some_and(|(live, _)| *live == epoch)
-            && let Some((_, entry)) = connected.remove(tui_id)
         {
-            self.departed
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(
-                    entry.tui_id,
-                    TuiDeparture {
-                        at: Instant::now(),
-                        remote: entry.remote,
-                    },
-                );
+            connected.remove(tui_id);
+        }
+        let mut presence = self.presence.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(registrations) = presence.live.get_mut(tui_id) else {
+            return;
+        };
+        let Some(remote) = registrations.remove(&epoch) else {
+            return;
+        };
+        if registrations.is_empty() {
+            presence.live.remove(tui_id);
+            presence.departed.insert(
+                tui_id.to_string(),
+                TuiDeparture {
+                    at: Instant::now(),
+                    remote,
+                },
+            );
         }
     }
 
     /// When `tui_id`'s last live registration ended, if it has not
-    /// registered again since. `None` for a connected or unknown identity.
+    /// registered again since. `None` while any registration of it is live,
+    /// and for an unknown identity.
     pub fn departure(&self, tui_id: &str) -> Option<TuiDeparture> {
-        self.departed
+        self.presence
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .departed
             .get(tui_id)
             .copied()
     }
@@ -258,9 +283,10 @@ impl TuiRegistry {
     /// Forget the departures for which `keep` is false, once nothing can
     /// depend on them any more (their identity owns no live session).
     pub fn retain_departures(&self, mut keep: impl FnMut(&str, &TuiDeparture) -> bool) {
-        self.departed
+        self.presence
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .departed
             .retain(|tui_id, departure| keep(tui_id, departure));
     }
 
@@ -397,7 +423,7 @@ mod tests {
         let registry = TuiRegistry {
             signing_key: Some(vec![0xAB; 32]),
             connected: Mutex::new(HashMap::new()),
-            departed: Mutex::new(HashMap::new()),
+            presence: Mutex::new(Presence::default()),
             next_epoch: AtomicU64::new(0),
         };
         let id = "tui_deadbeef";
@@ -410,7 +436,7 @@ mod tests {
         let registry = TuiRegistry {
             signing_key: Some(vec![0xAB; 32]),
             connected: Mutex::new(HashMap::new()),
-            departed: Mutex::new(HashMap::new()),
+            presence: Mutex::new(Presence::default()),
             next_epoch: AtomicU64::new(0),
         };
         let id = "tui_deadbeef";
@@ -428,7 +454,7 @@ mod tests {
         let registry = TuiRegistry {
             signing_key: Some(vec![0xAB; 32]),
             connected: Mutex::new(HashMap::new()),
-            departed: Mutex::new(HashMap::new()),
+            presence: Mutex::new(Presence::default()),
             next_epoch: AtomicU64::new(0),
         };
         let sig = registry.sign("tui_aaaaaaaa").unwrap();
