@@ -3414,6 +3414,66 @@ mod tests {
         }
     }
 
+    /// A cookie request still verifying its session when its generation
+    /// stops gets the gateway's restart answer, shaped for its protocol:
+    /// HTTP/1.1 is told to close, HTTP/2 gets no `Connection` header (its
+    /// connection gets GOAWAY instead). The route never runs.
+    #[tokio::test]
+    async fn a_cookie_request_held_across_the_stop_gets_its_protocols_restart_answer() {
+        use axum::http::Version;
+        for version in [Version::HTTP_11, Version::HTTP_2] {
+            let server = idp(&["admins"], "gw").await;
+            let mut config = sign_in_config(&server.uri());
+            test_support::revalidate_after(&mut config, 2);
+            let fixture = fixture(config);
+            let signed_in = sign_in(&fixture, &server).await;
+            tokio::time::sleep(test_support::UNTIL_DUE).await;
+            test_support::slow_introspection(&server, &["admins"], "gw", Duration::from_secs(2))
+                .await;
+            let mut held = request(
+                "GET",
+                "/api/operator-probe",
+                loopback(),
+                &[("cookie", &signed_in.cookie_header())],
+            );
+            *held.version_mut() = version;
+            let stop = fixture.state.shutdown_tx.clone();
+            let (response, ()) = tokio::join!(send(&fixture.router, held), async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                stop.send_replace(true);
+            });
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{version:?}: a request held across the stop was admitted"
+            );
+            let headers = response.headers();
+            assert_eq!(
+                headers
+                    .get(header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok()),
+                Some("1"),
+                "{version:?}"
+            );
+            let connection = headers
+                .get(header::CONNECTION)
+                .and_then(|value| value.to_str().ok());
+            if version == Version::HTTP_2 {
+                assert_eq!(connection, None, "HTTP/2 has no Connection header");
+            } else {
+                assert_eq!(connection, Some("close"), "{version:?}");
+            }
+            assert_eq!(
+                json(response).await,
+                serde_json::json!({
+                    "error": "The gateway is restarting. Try again.",
+                    "reason": "gateway_restarting",
+                }),
+                "{version:?}"
+            );
+        }
+    }
+
     /// A socket whose session ends while its periodic recheck waits on the
     /// identity provider drops that recheck, and the token copy it holds,
     /// at once.
