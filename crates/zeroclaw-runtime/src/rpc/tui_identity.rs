@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
@@ -26,6 +27,10 @@ pub struct TuiEntry {
     pub peer_label: String,
     /// Transport protocol: `"unix"` or `"wss"`.
     pub transport: String,
+    /// Whether the connection came over a remote plane: anything but local
+    /// IPC. Only a remote identity's sessions are retired once it has been
+    /// gone long enough (`wss.orphaned_session_timeout_secs`).
+    pub remote: bool,
     /// Full shell environment captured from the TUI process at connect time.
     /// Used to pass the user's real env (PATH, SSH_AUTH_SOCK, etc.) through
     /// to subprocesses spawned by the daemon on their behalf.
@@ -45,6 +50,15 @@ pub struct TuiEntry {
 /// registered under, so it can only ever remove its own registration.
 pub type TuiEpoch = u64;
 
+/// When an identity's last live registration ended, kept until the identity
+/// reconnects or owns no live session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TuiDeparture {
+    pub at: Instant,
+    /// Whether that last registration came over a remote plane.
+    pub remote: bool,
+}
+
 /// Daemon-wide registry of connected TUI clients.
 /// **Source of truth** for live TUI connection state. Not persisted —
 /// rebuilt on each daemon start from incoming `initialize` handshakes.
@@ -56,6 +70,10 @@ pub struct TuiRegistry {
     /// Connected TUIs keyed by `tui_id`, each stamped with the epoch of the
     /// registration that installed it.
     connected: Mutex<HashMap<String, (TuiEpoch, TuiEntry)>>,
+    /// Identities with no live registration, since when. An entry appears
+    /// when an identity's live registration is removed and goes away when the
+    /// identity registers again.
+    departed: Mutex<HashMap<String, TuiDeparture>>,
     /// Hands out the next registration epoch. Monotonic for the life of the
     /// registry, so an epoch identifies one registration and is never reused.
     next_epoch: AtomicU64,
@@ -92,6 +110,7 @@ impl TuiRegistry {
         Self {
             signing_key,
             connected: Mutex::new(HashMap::new()),
+            departed: Mutex::new(HashMap::new()),
             next_epoch: AtomicU64::new(0),
         }
     }
@@ -116,6 +135,7 @@ impl TuiRegistry {
                 Self {
                     signing_key: None,
                     connected: Mutex::new(HashMap::new()),
+                    departed: Mutex::new(HashMap::new()),
                     next_epoch: AtomicU64::new(0),
                 }
             }
@@ -127,6 +147,7 @@ impl TuiRegistry {
         Self {
             signing_key: None,
             connected: Mutex::new(HashMap::new()),
+            departed: Mutex::new(HashMap::new()),
             next_epoch: AtomicU64::new(0),
         }
     }
@@ -188,10 +209,12 @@ impl TuiRegistry {
     /// back to [`Self::unregister`] so a late teardown cannot evict a successor.
     pub fn register(&self, entry: TuiEntry) -> TuiEpoch {
         let epoch = self.next_epoch.fetch_add(1, Ordering::Relaxed);
-        self.connected
+        let mut connected = self.connected.lock().unwrap_or_else(|e| e.into_inner());
+        self.departed
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(entry.tui_id.clone(), (epoch, entry));
+            .remove(&entry.tui_id);
+        connected.insert(entry.tui_id.clone(), (epoch, entry));
         epoch
     }
 
@@ -207,9 +230,38 @@ impl TuiRegistry {
         if connected
             .get(tui_id)
             .is_some_and(|(live, _)| *live == epoch)
+            && let Some((_, entry)) = connected.remove(tui_id)
         {
-            connected.remove(tui_id);
+            self.departed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(
+                    entry.tui_id,
+                    TuiDeparture {
+                        at: Instant::now(),
+                        remote: entry.remote,
+                    },
+                );
         }
+    }
+
+    /// When `tui_id`'s last live registration ended, if it has not
+    /// registered again since. `None` for a connected or unknown identity.
+    pub fn departure(&self, tui_id: &str) -> Option<TuiDeparture> {
+        self.departed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(tui_id)
+            .copied()
+    }
+
+    /// Forget the departures for which `keep` is false, once nothing can
+    /// depend on them any more (their identity owns no live session).
+    pub fn retain_departures(&self, mut keep: impl FnMut(&str, &TuiDeparture) -> bool) {
+        self.departed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|tui_id, departure| keep(tui_id, departure));
     }
 
     /// Snapshot of all connected TUIs.
@@ -345,6 +397,7 @@ mod tests {
         let registry = TuiRegistry {
             signing_key: Some(vec![0xAB; 32]),
             connected: Mutex::new(HashMap::new()),
+            departed: Mutex::new(HashMap::new()),
             next_epoch: AtomicU64::new(0),
         };
         let id = "tui_deadbeef";
@@ -357,6 +410,7 @@ mod tests {
         let registry = TuiRegistry {
             signing_key: Some(vec![0xAB; 32]),
             connected: Mutex::new(HashMap::new()),
+            departed: Mutex::new(HashMap::new()),
             next_epoch: AtomicU64::new(0),
         };
         let id = "tui_deadbeef";
@@ -374,6 +428,7 @@ mod tests {
         let registry = TuiRegistry {
             signing_key: Some(vec![0xAB; 32]),
             connected: Mutex::new(HashMap::new()),
+            departed: Mutex::new(HashMap::new()),
             next_epoch: AtomicU64::new(0),
         };
         let sig = registry.sign("tui_aaaaaaaa").unwrap();
@@ -406,6 +461,7 @@ mod tests {
             connected_at: Utc::now(),
             peer_label: "test".to_string(),
             transport: "unix".to_string(),
+            remote: false,
             env: HashMap::new(),
         });
         assert_eq!(registry.list().len(), 1);
@@ -421,6 +477,7 @@ mod tests {
             connected_at: Utc::now(),
             peer_label: peer_label.to_string(),
             transport: "wss".to_string(),
+            remote: true,
             env: HashMap::new(),
         }
     }
@@ -501,6 +558,54 @@ mod tests {
     fn unregister_unknown_is_noop() {
         let registry = TuiRegistry::new_unsigned();
         registry.unregister("tui_nonexistent", 0); // must not panic
+        assert_eq!(registry.departure("tui_nonexistent"), None);
+    }
+
+    #[test]
+    fn removing_the_live_registration_records_its_departure() {
+        let registry = TuiRegistry::new_unsigned();
+        let epoch = registry.register(entry("tui_gone", "wss:198.51.100.7:40000"));
+        assert_eq!(registry.departure("tui_gone"), None, "still connected");
+
+        let before = Instant::now();
+        registry.unregister("tui_gone", epoch);
+        let departure = registry.departure("tui_gone").expect("departure recorded");
+        assert!(departure.remote);
+        assert!(departure.at >= before);
+    }
+
+    #[test]
+    fn a_superseded_teardown_records_no_departure_and_a_reconnect_clears_one() {
+        let registry = TuiRegistry::new_unsigned();
+        let first = registry.register(entry("tui_flap", "wss:198.51.100.7:40000"));
+        let second = registry.register(entry("tui_flap", "wss:198.51.100.7:40001"));
+
+        registry.unregister("tui_flap", first);
+        assert_eq!(
+            registry.departure("tui_flap"),
+            None,
+            "the successor is still connected"
+        );
+
+        registry.unregister("tui_flap", second);
+        assert!(registry.departure("tui_flap").is_some());
+
+        registry.register(entry("tui_flap", "wss:198.51.100.7:40002"));
+        assert_eq!(registry.departure("tui_flap"), None, "reconnected");
+    }
+
+    #[test]
+    fn retain_departures_forgets_only_the_rejected_identities() {
+        let registry = TuiRegistry::new_unsigned();
+        for id in ["tui_keep", "tui_drop"] {
+            let epoch = registry.register(entry(id, "wss:198.51.100.7:40000"));
+            registry.unregister(id, epoch);
+        }
+
+        registry.retain_departures(|id, _| id == "tui_keep");
+
+        assert!(registry.departure("tui_keep").is_some());
+        assert_eq!(registry.departure("tui_drop"), None);
     }
 
     #[test]
@@ -512,6 +617,7 @@ mod tests {
             connected_at: Utc::now(),
             peer_label: "test".to_string(),
             transport: "unix".to_string(),
+            remote: false,
             env: HashMap::new(),
         });
         // generate_unique should return something different
@@ -533,6 +639,7 @@ mod tests {
             connected_at: Utc::now(),
             peer_label: "test".to_string(),
             transport: "unix".to_string(),
+            remote: false,
             env,
         });
 
@@ -558,6 +665,7 @@ mod tests {
             connected_at: Utc::now(),
             peer_label: "test".to_string(),
             transport: "unix".to_string(),
+            remote: false,
             env: HashMap::new(),
         });
 
@@ -576,6 +684,7 @@ mod tests {
             connected_at: Utc::now(),
             peer_label: "test".to_string(),
             transport: "unix".to_string(),
+            remote: false,
             env,
         });
         assert_eq!(registry.list().len(), 1);
@@ -598,6 +707,7 @@ mod tests {
             connected_at: Utc::now(),
             peer_label: "test".to_string(),
             transport: "unix".to_string(),
+            remote: false,
             env,
         };
         let cloned = entry.clone();
@@ -619,6 +729,7 @@ mod tests {
             connected_at: Utc::now(),
             peer_label: "test".to_string(),
             transport: "unix".to_string(),
+            remote: false,
             env,
         });
 
@@ -651,6 +762,7 @@ mod tests {
             connected_at: Utc::now(),
             peer_label: "test".to_string(),
             transport: "unix".to_string(),
+            remote: false,
             env,
         });
         assert!(
@@ -675,6 +787,7 @@ mod tests {
             connected_at: Utc::now(),
             peer_label: "first".to_string(),
             transport: "unix".to_string(),
+            remote: false,
             env: HashMap::from([("SENTINEL_SOCK".to_string(), "/tmp/first.sock".to_string())]),
         });
         let epoch_second = registry.register(TuiEntry {
@@ -682,6 +795,7 @@ mod tests {
             connected_at: Utc::now(),
             peer_label: "second".to_string(),
             transport: "unix".to_string(),
+            remote: false,
             env: HashMap::from([("OTHER_SOCK".to_string(), "/tmp/second.sock".to_string())]),
         });
 

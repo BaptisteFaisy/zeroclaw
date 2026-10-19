@@ -303,6 +303,16 @@ type CancelTokenEntry = (u64, Option<u64>, tokio_util::sync::CancellationToken);
 #[cfg(test)]
 type RehydrateSeedPause = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
 
+/// A live session owned by a TUI identity: what deciding whether to retire it
+/// as orphaned needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedSession {
+    pub id: String,
+    pub generation: u64,
+    pub owner_tui_id: String,
+    pub last_active: Instant,
+}
+
 pub struct SessionStore {
     sessions: Mutex<HashMap<String, RpcSession>>,
     #[cfg(test)]
@@ -1767,6 +1777,34 @@ impl SessionStore {
     ) -> R {
         let sessions = self.sessions.lock().await;
         read(&sessions)
+    }
+
+    /// Every live session that has an owning TUI identity.
+    pub async fn owned_sessions(&self) -> Vec<OwnedSession> {
+        self.sessions
+            .lock()
+            .await
+            .iter()
+            .filter_map(|(id, session)| Self::owned(id, session))
+            .collect()
+    }
+
+    /// The live session `id`, if it has an owning TUI identity.
+    pub async fn owned_session(&self, id: &str) -> Option<OwnedSession> {
+        self.sessions
+            .lock()
+            .await
+            .get(id)
+            .and_then(|session| Self::owned(id, session))
+    }
+
+    fn owned(id: &str, session: &RpcSession) -> Option<OwnedSession> {
+        session.owner_tui_id.as_ref().map(|owner| OwnedSession {
+            id: id.to_string(),
+            generation: session.generation,
+            owner_tui_id: owner.clone(),
+            last_active: session.last_active,
+        })
     }
 
     pub async fn list_ids_for_owner(&self, owner_tui_id: &str) -> Vec<String> {

@@ -2785,9 +2785,40 @@ impl RpcDispatcher {
         Some((self.tui_id.as_deref()?, self.tui_epoch?))
     }
 
+    /// The registry entry `initialize` records for this connection.
+    fn tui_entry(
+        &self,
+        tui_id: String,
+        env: std::collections::HashMap<String, String>,
+    ) -> super::tui_identity::TuiEntry {
+        super::tui_identity::TuiEntry {
+            tui_id,
+            connected_at: chrono::Utc::now(),
+            transport: self
+                .peer_label
+                .split_once(':')
+                .map_or("unknown", |(proto, _)| proto)
+                .to_string(),
+            remote: self.transport_kind != crate::rpc::transport::TransportKind::Local,
+            peer_label: self.peer_label.clone(),
+            env,
+        }
+    }
+
     #[cfg(test)]
     pub fn set_tui_id_for_test(&mut self, tui_id: Option<String>) {
         self.tui_id = tui_id;
+    }
+
+    /// Register `tui_id` for this connection as `initialize` does.
+    #[cfg(test)]
+    pub fn register_tui_for_test(&mut self, tui_id: &str) {
+        let epoch = self
+            .ctx
+            .tui_registry
+            .register(self.tui_entry(tui_id.to_string(), Default::default()));
+        self.tui_id = Some(tui_id.to_string());
+        self.tui_epoch = Some(epoch);
     }
 
     #[cfg(test)]
@@ -3834,17 +3865,7 @@ impl RpcDispatcher {
         let tui_epoch = self
             .ctx
             .tui_registry
-            .register(super::tui_identity::TuiEntry {
-                tui_id: tui_id.clone(),
-                connected_at: chrono::Utc::now(),
-                transport: self
-                    .peer_label
-                    .split_once(':')
-                    .map_or("unknown", |(proto, _)| proto)
-                    .to_string(),
-                peer_label: self.peer_label.clone(),
-                env,
-            });
+            .register(self.tui_entry(tui_id.clone(), env));
         self.tui_id = Some(tui_id.clone());
         self.tui_epoch = Some(tui_epoch);
 
@@ -19677,6 +19698,7 @@ mod tests {
                 connected_at: chrono::Utc::now(),
                 peer_label: tui_id.to_string(),
                 transport: "unix".to_string(),
+                remote: false,
                 env: std::collections::HashMap::from([(var.to_string(), value.to_string())]),
             });
         dispatcher.set_tui_registration_for_test(Some((tui_id.to_string(), epoch)));
@@ -19884,6 +19906,7 @@ mod tests {
                 connected_at: chrono::Utc::now(),
                 peer_label: "tui_reuse0001".to_string(),
                 transport: "unix".to_string(),
+                remote: false,
                 env: std::collections::HashMap::new(),
             });
         client.set_tui_registration_for_test(Some(("tui_reuse0001".to_string(), epoch)));
@@ -19957,6 +19980,7 @@ mod tests {
                 connected_at: chrono::Utc::now(),
                 peer_label: "tui_empty0001".to_string(),
                 transport: "unix".to_string(),
+                remote: false,
                 env: std::collections::HashMap::new(),
             });
         client.set_tui_registration_for_test(Some(("tui_empty0001".to_string(), epoch)));
@@ -48066,5 +48090,219 @@ mod tests {
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(calls, 1);
         assert!(holds_prompt, "the journal records a prompt that runs");
+    }
+
+    /// Remote sessions whose client is gone for good are closed, so they stop
+    /// holding the daemon's live session map until a restart.
+    mod orphaned_session_retirement {
+        use super::*;
+        use crate::rpc::context::RpcContext;
+        use crate::rpc::orphans::{retire_orphaned_sessions, spawn_orphan_retirement};
+        use crate::rpc::session::SessionStore;
+        use crate::rpc::transport::TransportKind;
+        use crate::security::auth_provider::Credential;
+        use serde_json::json;
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        /// The default `wss.orphaned_session_timeout_secs`.
+        const TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+        fn context(
+            timeout_secs: Option<u64>,
+        ) -> (tempfile::TempDir, Arc<SessionStore>, Arc<RpcContext>) {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = make_acp_test_config(&tmp);
+            if let Some(secs) = timeout_secs {
+                config.wss.orphaned_session_timeout_secs = secs;
+            }
+            // The daemon's own values (daemon/mod.rs).
+            let queue = Arc::new(SessionActorQueue::new(32, 30, 600));
+            let sessions = Arc::new(SessionStore::new(64, queue));
+            let ctx = RpcContext::minimal(config, Arc::clone(&sessions));
+            (tmp, sessions, ctx)
+        }
+
+        /// A WSS client that has completed `initialize` as `tui_id`.
+        fn remote(ctx: &Arc<RpcContext>, tui_id: &str) -> RpcDispatcher {
+            let (tx, _rx) = tokio::sync::mpsc::channel(64);
+            let mut client = RpcDispatcher::new_with_access_policy(
+                Arc::clone(ctx),
+                tx,
+                format!("wss:198.51.100.7:{tui_id}"),
+                RpcAccessPolicy::RemoteSessionOwner,
+                None,
+            )
+            .with_transport(TransportKind::Wss, Credential::None);
+            client.set_authenticated_for_test();
+            client.register_tui_for_test(tui_id);
+            client
+        }
+
+        /// A local-socket client that has completed `initialize` as `tui_id`.
+        fn local(ctx: &Arc<RpcContext>, tui_id: &str) -> RpcDispatcher {
+            let (tx, _rx) = tokio::sync::mpsc::channel(64);
+            let mut client = RpcDispatcher::new(Arc::clone(ctx), tx, format!("unix:{tui_id}"));
+            client.set_authenticated_for_test();
+            client.register_tui_for_test(tui_id);
+            client
+        }
+
+        /// What a transport does when its peer goes away.
+        async fn disconnect(ctx: &RpcContext, client: &mut RpcDispatcher) {
+            client.shutdown().await;
+            let (tui_id, epoch) = client
+                .tui_registration()
+                .map(|(id, epoch)| (id.to_string(), epoch))
+                .expect("the client registered at initialize");
+            ctx.tui_registry.unregister(&tui_id, epoch);
+        }
+
+        async fn open(client: &RpcDispatcher) -> String {
+            let opened = client
+                .handle_session_new_for_test(
+                    &json!({ "agent_alias": "test-agent", "chat_mode": "chat" }),
+                )
+                .await
+                .expect("session/new");
+            opened["session_id"].as_str().unwrap().to_string()
+        }
+
+        #[tokio::test]
+        async fn disconnected_remote_sessions_are_retired_and_free_the_live_map() {
+            let (_tmp, sessions, ctx) = context(None);
+            for n in 0..64 {
+                let mut client = remote(&ctx, &format!("tui_{n}"));
+                open(&client).await;
+                disconnect(&ctx, &mut client).await;
+            }
+            assert_eq!(sessions.list_ids().await.len(), 64);
+
+            // Within the timeout nothing is closed, and the full map refuses
+            // everyone.
+            assert!(
+                retire_orphaned_sessions(&ctx, Instant::now())
+                    .await
+                    .is_empty()
+            );
+            let refused = remote(&ctx, "tui_early")
+                .handle_session_new_for_test(
+                    &json!({ "agent_alias": "test-agent", "chat_mode": "chat" }),
+                )
+                .await
+                .expect_err("the live map is full");
+            assert!(refused.message.contains("limit"), "{refused:?}");
+
+            // Once their clients have been gone for the timeout, every one of
+            // them is closed and their departures are forgotten.
+            let retired = retire_orphaned_sessions(&ctx, Instant::now() + TIMEOUT).await;
+            assert_eq!(retired.len(), 64);
+            assert!(sessions.list_ids().await.is_empty());
+            for n in 0..64 {
+                assert_eq!(ctx.tui_registry.departure(&format!("tui_{n}")), None);
+            }
+
+            // Remote and local clients can open sessions again.
+            open(&remote(&ctx, "tui_later")).await;
+            open(&local(&ctx, "tui_local")).await;
+        }
+
+        #[tokio::test]
+        async fn retirement_closes_only_idle_sessions_of_remote_clients_that_stayed_away() {
+            let (_tmp, sessions, ctx) = context(None);
+
+            let mut orphan = remote(&ctx, "tui_orphan");
+            let orphaned = open(&orphan).await;
+            disconnect(&ctx, &mut orphan).await;
+
+            let connected = remote(&ctx, "tui_connected");
+            let kept_connected = open(&connected).await;
+
+            let mut local_client = local(&ctx, "tui_local");
+            let kept_local = open(&local_client).await;
+            disconnect(&ctx, &mut local_client).await;
+
+            let mut returning = remote(&ctx, "tui_returning");
+            let kept_returning = open(&returning).await;
+            disconnect(&ctx, &mut returning).await;
+            let _returned = remote(&ctx, "tui_returning");
+
+            let mut turning = remote(&ctx, "tui_turning");
+            let kept_turning = open(&turning).await;
+            disconnect(&ctx, &mut turning).await;
+            sessions
+                .register_cancel_token(&kept_turning, tokio_util::sync::CancellationToken::new());
+
+            let mut asking = remote(&ctx, "tui_asking");
+            let kept_asking = open(&asking).await;
+            disconnect(&ctx, &mut asking).await;
+            let (approval_tx, _approval_rx) = tokio::sync::oneshot::channel();
+            ctx.approval_pending
+                .insert("approval-1".to_string(), kept_asking.clone(), approval_tx);
+
+            // Used after its client left (by a local operator, say): idle for
+            // less than the timeout when the check runs.
+            let mut used = remote(&ctx, "tui_used");
+            let kept_used = open(&used).await;
+            disconnect(&ctx, &mut used).await;
+            let left = ctx.tui_registry.departure("tui_used").unwrap().at;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            sessions.touch(&kept_used).await;
+
+            let retired =
+                retire_orphaned_sessions(&ctx, left + TIMEOUT + Duration::from_millis(10)).await;
+
+            assert_eq!(retired, vec![orphaned.clone()]);
+            let live = sessions.list_ids().await;
+            assert!(!live.contains(&orphaned));
+            for kept in [
+                &kept_connected,
+                &kept_local,
+                &kept_returning,
+                &kept_turning,
+                &kept_asking,
+                &kept_used,
+            ] {
+                assert!(live.contains(kept), "{kept} was closed");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_zero_timeout_keeps_orphaned_sessions_open() {
+            let (_tmp, sessions, ctx) = context(Some(0));
+            let mut client = remote(&ctx, "tui_orphan");
+            let session = open(&client).await;
+            disconnect(&ctx, &mut client).await;
+
+            let far_later = Instant::now() + Duration::from_secs(365 * 24 * 60 * 60);
+            assert!(retire_orphaned_sessions(&ctx, far_later).await.is_empty());
+            assert_eq!(sessions.list_ids().await, vec![session]);
+        }
+
+        #[tokio::test]
+        async fn the_retirement_task_closes_an_orphan_once_its_timeout_passes() {
+            let (_tmp, sessions, ctx) = context(Some(1));
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let task = spawn_orphan_retirement(&ctx, cancel.clone());
+
+            let mut client = remote(&ctx, "tui_orphan");
+            open(&client).await;
+            disconnect(&ctx, &mut client).await;
+
+            let closed = tokio::time::timeout(Duration::from_secs(10), async {
+                while !sessions.list_ids().await.is_empty() {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await;
+            assert!(closed.is_ok(), "the orphan is still live");
+
+            cancel.cancel();
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("the task stops when cancelled")
+                .expect("the task does not panic");
+        }
     }
 }
