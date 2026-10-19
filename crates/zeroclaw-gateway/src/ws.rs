@@ -883,15 +883,6 @@ async fn handle_socket(
         let _ = sender.send(Message::Text(frame.to_string().into())).await;
     }
 
-    // A first message that arrived after the session ended starts nothing.
-    if first_msg_fallback.is_some()
-        && let Err(code) =
-            crate::dashboard_session::session_admits_now(&mut session_watch, &state).await
-    {
-        close_with(&mut sender, &mut receiver, code, "dashboard session ended").await;
-        return;
-    }
-
     // Process the first message if it was not a connect frame
     if let Some(ref text) = first_msg_fallback {
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
