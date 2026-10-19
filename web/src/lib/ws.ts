@@ -1,5 +1,5 @@
 import type { ApprovalDecision, WsMessage } from '../types/api';
-import { getToken } from './auth';
+import { AUTH_EVENTS, getToken } from './auth';
 import { apiOrigin, basePath } from './basePath';
 import { isTauri } from './tauri';
 
@@ -29,11 +29,19 @@ export interface WebSocketClientOptions {
 const DEFAULT_RECONNECT_DELAY = 1000;
 const MAX_RECONNECT_DELAY = 30000;
 
+/** The gateway closed a signed-in session's socket: the session expired or was signed out. */
+export const WS_CLOSE_SESSION_ENDED = 4401;
+/** The gateway closed a signed-in session's socket: its access was removed. */
+export const WS_CLOSE_ACCESS_LOST = 4403;
+
 export class WebSocketClient {
   private ws: WebSocket | null = null;
   private currentDelay: number;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private intentionallyClosed = false;
+  // Stopped by a session close code. Reconnecting would only be refused, so
+  // the socket waits for the auth layer to report a usable session again.
+  private haltedForAuth = false;
 
   public onMessage: WsMessageHandler | null = null;
   public onOpen: WsOpenHandler | null = null;
@@ -68,7 +76,9 @@ export class WebSocketClient {
   /** Open the WebSocket connection. */
   connect(): void {
     this.intentionallyClosed = false;
+    this.haltedForAuth = false;
     this.clearReconnectTimer();
+    window.addEventListener(AUTH_EVENTS.resumed, this.handleAuthResumed);
 
     const token = getToken();
     const params = new URLSearchParams();
@@ -97,6 +107,15 @@ export class WebSocketClient {
 
     this.ws.onclose = (ev: CloseEvent) => {
       this.onClose?.(ev);
+      if (ev.code === WS_CLOSE_SESSION_ENDED || ev.code === WS_CLOSE_ACCESS_LOST) {
+        this.haltedForAuth = true;
+        window.dispatchEvent(
+          new Event(
+            ev.code === WS_CLOSE_SESSION_ENDED ? AUTH_EVENTS.reauth : AUTH_EVENTS.accessLost,
+          ),
+        );
+        return;
+      }
       this.scheduleReconnect();
     };
 
@@ -129,7 +148,9 @@ export class WebSocketClient {
   /** Close the connection without auto-reconnecting. */
   disconnect(): void {
     this.intentionallyClosed = true;
+    this.haltedForAuth = false;
     this.clearReconnectTimer();
+    window.removeEventListener(AUTH_EVENTS.resumed, this.handleAuthResumed);
     if (this.ws) {
       this.ws.close();
       this.ws = null;
@@ -144,6 +165,12 @@ export class WebSocketClient {
   // ---------------------------------------------------------------------------
   // Reconnection logic
   // ---------------------------------------------------------------------------
+
+  private readonly handleAuthResumed = (): void => {
+    if (!this.haltedForAuth || this.intentionallyClosed) return;
+    this.currentDelay = this.reconnectDelay;
+    this.connect();
+  };
 
   private scheduleReconnect(): void {
     if (this.intentionallyClosed || !this.autoReconnect) return;
