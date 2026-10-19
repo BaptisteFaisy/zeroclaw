@@ -290,8 +290,12 @@ where
 }
 
 /// Close a socket with `code`, waiting briefly for the peer's close.
-pub(crate) async fn close_with<S, R>(sender: &mut S, receiver: &mut R, code: u16, reason: &'static str)
-where
+pub(crate) async fn close_with<S, R>(
+    sender: &mut S,
+    receiver: &mut R,
+    code: u16,
+    reason: &'static str,
+) where
     S: futures_util::Sink<Message> + Unpin,
     R: futures_util::Stream<Item = Result<Message, axum::Error>> + Unpin,
 {
@@ -1236,10 +1240,8 @@ async fn acquire_turn_permit(
     state: &AppState,
     session_key: &str,
     session_watch: &mut Option<crate::dashboard_session::SessionWatch>,
-) -> Result<
-    Result<crate::session_queue::SessionGuard, crate::session_queue::SessionQueueError>,
-    u16,
-> {
+) -> Result<Result<crate::session_queue::SessionGuard, crate::session_queue::SessionQueueError>, u16>
+{
     let acquired = tokio::select! {
         biased;
         code = crate::dashboard_session::session_lost(&mut *session_watch, state) => {
@@ -3787,7 +3789,9 @@ data: {{\"type\":\"message_stop\"}}\n\n"
 
     async fn send_raw(client: &mut WsClient, frame: serde_json::Value) {
         // The server may already be closing; a failed send is not the point.
-        let _ = client.send(ClientMessage::Text(frame.to_string().into())).await;
+        let _ = client
+            .send(ClientMessage::Text(frame.to_string().into()))
+            .await;
     }
 
     #[test]
@@ -3805,7 +3809,9 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         let session_id = "signin-signout-mid-turn";
         let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
         let (mut client, _) = fixture.connect_signed_in(session_id, &cookie).await;
-        fixture.start_parked_turn(&mut client, "hold this turn").await;
+        fixture
+            .start_parked_turn(&mut client, "hold this turn")
+            .await;
         assert!(fixture.has_live_turn(&session_key), "the turn is in flight");
 
         let status = crate::dashboard_session::test_support::sign_out_over_http(
@@ -3821,15 +3827,22 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             serde_json::json!({"type": "approval_response", "request_id": "r-1", "decision": "approve"}),
         )
         .await;
-        send_raw(&mut client, serde_json::json!({"type": "message", "content": "steer after sign-out"}))
-            .await;
+        send_raw(
+            &mut client,
+            serde_json::json!({"type": "message", "content": "steer after sign-out"}),
+        )
+        .await;
 
         let (code, _) = crate::dashboard_session::test_support::until_closed(
             &mut client,
             Duration::from_secs(5),
         )
         .await;
-        assert_eq!(code, Some(4401), "the socket closes as soon as the session ends");
+        assert_eq!(
+            code,
+            Some(4401),
+            "the socket closes as soon as the session ends"
+        );
         assert!(
             fixture.has_live_turn(&session_key),
             "closing the socket does not cancel the admitted turn"
@@ -3837,7 +3850,10 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         fixture.release_next();
         fixture.wait_for_turn_to_settle(&session_key).await;
         let followed_up = fixture.request_seen.try_recv().is_ok();
-        assert!(!followed_up, "nothing sent after sign-out reached the model");
+        assert!(
+            !followed_up,
+            "nothing sent after sign-out reached the model"
+        );
         fixture.shutdown();
     }
 
@@ -3856,14 +3872,20 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         let session_id = "signin-expiry-mid-turn";
         let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
         let (mut client, _) = fixture.connect_signed_in(session_id, &cookie).await;
-        fixture.start_parked_turn(&mut client, "hold this turn").await;
+        fixture
+            .start_parked_turn(&mut client, "hold this turn")
+            .await;
 
         let (code, _) = crate::dashboard_session::test_support::until_closed(
             &mut client,
             Duration::from_secs(8),
         )
         .await;
-        assert_eq!(code, Some(4401), "the socket closes when the session expires, mid-turn");
+        assert_eq!(
+            code,
+            Some(4401),
+            "the socket closes when the session expires, mid-turn"
+        );
         assert!(fixture.has_live_turn(&session_key));
         fixture.release_next();
         fixture.wait_for_turn_to_settle(&session_key).await;
@@ -3887,21 +3909,33 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         let session_id = "signin-admin-removed-mid-turn";
         let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
         let (mut client, _) = fixture.connect_signed_in(session_id, &cookie).await;
-        fixture.start_parked_turn(&mut client, "hold this turn").await;
+        fixture
+            .start_parked_turn(&mut client, "hold this turn")
+            .await;
 
         fixture.revoke_admin();
-        send_raw(&mut client, serde_json::json!({"type": "message", "content": "steer after revocation"}))
-            .await;
+        send_raw(
+            &mut client,
+            serde_json::json!({"type": "message", "content": "steer after revocation"}),
+        )
+        .await;
         let (code, _) = crate::dashboard_session::test_support::until_closed(
             &mut client,
             Duration::from_secs(5),
         )
         .await;
-        assert_eq!(code, Some(4403), "the socket closes once its account loses the access it needs");
+        assert_eq!(
+            code,
+            Some(4403),
+            "the socket closes once its account loses the access it needs"
+        );
         fixture.release_next();
         fixture.wait_for_turn_to_settle(&session_key).await;
         let followed_up = fixture.request_seen.try_recv().is_ok();
-        assert!(!followed_up, "the steering sent after revocation never reached the model");
+        assert!(
+            !followed_up,
+            "the steering sent after revocation never reached the model"
+        );
         fixture.shutdown();
     }
 
@@ -3975,7 +4009,9 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         let session_id = "signin-approval-after-signout";
         let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
         let (mut client, _) = fixture.connect_signed_in(session_id, &cookie).await;
-        fixture.start_parked_turn(&mut client, "read the note").await;
+        fixture
+            .start_parked_turn(&mut client, "read the note")
+            .await;
         fixture.release_next();
         let prompt = next_frame_of(&mut client, "approval_request").await;
         let request_id = prompt["request_id"]
@@ -3995,14 +4031,21 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             serde_json::json!({"type": "approval_response", "request_id": request_id, "decision": "approve"}),
         )
         .await;
-        send_raw(&mut client, serde_json::json!({"type": "message", "content": "steer after sign-out"}))
-            .await;
+        send_raw(
+            &mut client,
+            serde_json::json!({"type": "message", "content": "steer after sign-out"}),
+        )
+        .await;
         let (code, _) = crate::dashboard_session::test_support::until_closed(
             &mut client,
             Duration::from_secs(5),
         )
         .await;
-        assert_eq!(code, Some(4401), "the socket closes as soon as the session ends");
+        assert_eq!(
+            code,
+            Some(4401),
+            "the socket closes as soon as the session ends"
+        );
 
         // The turn runs on unattended, and its prompt resolves as a refusal.
         let follow_up = fixture.next_provider_request().await.to_string();
@@ -4036,7 +4079,9 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         // A first viewer's turn holds the session's permit and runs on after
         // the viewer leaves.
         let (mut first, _) = fixture.connect_signed_in(session_id, &cookie).await;
-        fixture.start_parked_turn(&mut first, "hold the permit").await;
+        fixture
+            .start_parked_turn(&mut first, "hold the permit")
+            .await;
         disconnect_viewer(first).await;
         // A second socket's message, sent while still signed in, waits for it.
         let (mut second, _) = fixture.connect_signed_in(session_id, &cookie).await;

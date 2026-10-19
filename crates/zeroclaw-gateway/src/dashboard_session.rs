@@ -37,10 +37,10 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
-use zeroize::Zeroizing;
 use zeroclaw_api::grants::ResolvedGrants;
 use zeroclaw_api::principal::{ActorKind, Principal};
 use zeroclaw_runtime::rpc::auth::{ConnectionAuth, RpcInboundAuth};
+use zeroize::Zeroizing;
 
 use crate::AppState;
 use crate::principal_gate::GatewayInboundAuth;
@@ -1290,8 +1290,9 @@ pub(crate) mod test_support {
     use zeroclaw_api::grants::{Resource, Verb};
     use zeroclaw_config::schema::{Config, OidcConfig, OidcValidation, PermissionProfileConfig};
 
-    pub(crate) type WsClient =
-        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+    pub(crate) type WsClient = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
 
     /// An identity provider with discovery, an authorization endpoint the
     /// test never visits, and an introspection endpoint that vouches for any
@@ -2863,7 +2864,9 @@ mod tests {
 
         let (code, texts) = test_support::until_closed(&mut socket, Duration::from_secs(3)).await;
         assert!(
-            !texts.iter().any(|text| text.contains("published after the reload")),
+            !texts
+                .iter()
+                .any(|text| text.contains("published after the reload")),
             "a frame published after the reload reached the old socket: {texts:?}"
         );
         assert!(code.is_some(), "the old generation's socket stays open");
@@ -2885,12 +2888,18 @@ mod tests {
         let fixture = fixture(sign_in_config(&server.uri()));
         let new = new_session(verified_auth(&fixture).await, &fixture.auth.inbound, 3600);
         let staged = std::any::type_name_of_val(&new.bearer);
-        assert!(staged.contains("Zeroizing"), "a staged sign-in holds the token as {staged}");
+        assert!(
+            staged.contains("Zeroizing"),
+            "a staged sign-in holds the token as {staged}"
+        );
         fixture.auth.sessions.insert(new, unix_now()).unwrap();
         let sessions = fixture.auth.sessions.sessions.lock();
         let held = sessions.values().next().expect("the session is stored");
         let stored = std::any::type_name_of_val(&held.bearer);
-        assert!(stored.contains("Zeroizing"), "a stored session holds the token as {stored}");
+        assert!(
+            stored.contains("Zeroizing"),
+            "a stored session holds the token as {stored}"
+        );
     }
 
     /// Nothing but time passes: no request, no sign-in. An expired session
@@ -2906,7 +2915,11 @@ mod tests {
             .sessions
             .insert(new_session(auth, &fixture.auth.inbound, 0), unix_now())
             .unwrap();
-        assert_eq!(fixture.auth.sessions.len(), 1, "nothing has checked the store yet");
+        assert_eq!(
+            fixture.auth.sessions.len(),
+            1,
+            "nothing has checked the store yet"
+        );
         tokio::time::pause();
         tokio::time::advance(Duration::from_secs(61)).await;
         for _ in 0..20 {
@@ -2915,5 +2928,4 @@ mod tests {
         assert_eq!(fixture.auth.sessions.len(), 0, "the idle sweep removed it");
         assert!(view.ended.is_cancelled(), "and told its sockets");
     }
-
 }
