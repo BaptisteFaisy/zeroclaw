@@ -78,10 +78,10 @@ const session: OidcSession = {
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 25));
 
-function countEvents(): Record<"unauthorized" | "reauth" | "accessLost", number> & {
+function countEvents(): Record<"unauthorized" | "reauth" | "sessionEnded" | "accessLost", number> & {
   stop: () => void;
 } {
-  const counts = { unauthorized: 0, reauth: 0, accessLost: 0 };
+  const counts = { unauthorized: 0, reauth: 0, sessionEnded: 0, accessLost: 0 };
   const offs = (Object.keys(counts) as (keyof typeof counts)[]).map((name) => {
     const handler = () => {
       counts[name] += 1;
@@ -141,7 +141,7 @@ test("an ordinary close still reconnects", async () => {
   client.disconnect();
 });
 
-test("close 4401 asks for re-auth and does not reconnect", async () => {
+test("close 4401 asks the auth layer to check the session and does not reconnect", async () => {
   auth.setOidcSession(session);
   const events = countEvents();
   const client = newClient();
@@ -150,7 +150,9 @@ test("close 4401 asks for re-auth and does not reconnect", async () => {
   await settle();
   events.stop();
   assert.equal(FakeWebSocket.instances.length, 1);
-  assert.equal(events.reauth, 1);
+  // Not a prompt yet: an early re-auth may already hold a newer session.
+  assert.equal(events.sessionEnded, 1);
+  assert.equal(events.reauth, 0);
   assert.equal(events.accessLost, 0);
   client.disconnect();
 });
@@ -179,6 +181,33 @@ test("a stopped socket reconnects once the session is usable again", async () =>
   // A second resume while connected doesn't open another socket.
   fakeWindow.dispatchEvent(new Event(auth.AUTH_EVENTS.resumed));
   assert.equal(FakeWebSocket.instances.length, 2);
+  client.disconnect();
+});
+
+test("while a re-auth is pending, a dropped socket waits instead of retrying", async () => {
+  auth.setOidcSession(session);
+  const client = newClient();
+  client.connect();
+  auth.markReauthPending(true);
+  // A refused upgrade shows up as 1006.
+  lastSocket().serverClose(1006);
+  await settle();
+  assert.equal(FakeWebSocket.instances.length, 1);
+  fakeWindow.dispatchEvent(new Event(auth.AUTH_EVENTS.resumed));
+  assert.equal(FakeWebSocket.instances.length, 2);
+  client.disconnect();
+});
+
+test("a gateway reload (1001) reconnects", async () => {
+  auth.setOidcSession(session);
+  const events = countEvents();
+  const client = newClient();
+  client.connect();
+  lastSocket().serverClose(1001);
+  await settle();
+  events.stop();
+  assert.ok(FakeWebSocket.instances.length >= 2);
+  assert.equal(events.sessionEnded + events.accessLost + events.reauth, 0);
   client.disconnect();
 });
 
@@ -223,6 +252,22 @@ test("signed in: an expired session stops the stream and asks for re-auth", asyn
   assert.equal(events.reauth, 1);
   // Usable again: the stream reconnects.
   sseResponder = () => new Response("", { status: 503 });
+  fakeWindow.dispatchEvent(new Event(auth.AUTH_EVENTS.resumed));
+  await settle();
+  client.disconnect();
+  assert.ok(sseRequests.length >= 2);
+});
+
+test("signed in: while a re-auth is pending, an ended stream waits for the resume", async () => {
+  auth.setOidcSession(session);
+  auth.markReauthPending(true);
+  // The stream opens and ends at once (the gateway ended the session's stream).
+  sseResponder = () => new Response("", { status: 200 });
+  const client = new SSEClient({ reconnectDelay: 1 });
+  client.connect();
+  await settle();
+  assert.equal(sseRequests.length, 1);
+  auth.setOidcSession(session);
   fakeWindow.dispatchEvent(new Event(auth.AUTH_EVENTS.resumed));
   await settle();
   client.disconnect();

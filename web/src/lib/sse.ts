@@ -1,5 +1,5 @@
 import type { SSEEvent } from '../types/api';
-import { AUTH_EVENTS, getAuthMode, getToken } from './auth';
+import { AUTH_EVENTS, getAuthMode, getToken, isReauthPending } from './auth';
 import { failureReason } from './authSession';
 import { apiOrigin, basePath } from './basePath';
 
@@ -206,6 +206,11 @@ export class SSEClient {
 
   private scheduleReconnect(): void {
     if (this.intentionallyClosed || !this.autoReconnect) return;
+    // Waiting for a new sign-in: resume on `AUTH_EVENTS.resumed` instead.
+    if (isReauthPending()) {
+      this.haltedForAuth = true;
+      return;
+    }
 
     this.reconnectTimer = setTimeout(() => {
       this.currentDelay = Math.min(this.currentDelay * 2, this.maxReconnectDelay);

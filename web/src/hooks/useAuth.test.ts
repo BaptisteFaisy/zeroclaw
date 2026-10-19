@@ -46,7 +46,35 @@ const fakeWindow = Object.assign(new EventTarget(), {
   },
 });
 const fakeDocument = Object.assign(new EventTarget(), { visibilityState: "visible" });
-Object.assign(globalThis, { window: fakeWindow, document: fakeDocument, localStorage: storage });
+
+class FakeWebSocket {
+  static readonly OPEN = 1;
+  static instances: FakeWebSocket[] = [];
+  readyState = 0;
+  onopen: (() => void) | null = null;
+  onclose: ((ev: { code: number }) => void) | null = null;
+  onmessage: ((ev: { data: string }) => void) | null = null;
+  onerror: (() => void) | null = null;
+  constructor(readonly url: string) {
+    FakeWebSocket.instances.push(this);
+  }
+  send(): void {}
+  close(): void {
+    this.serverClose(1000);
+  }
+  serverClose(code: number): void {
+    if (this.readyState === 3) return;
+    this.readyState = 3;
+    this.onclose?.({ code });
+  }
+}
+
+Object.assign(globalThis, {
+  window: fakeWindow,
+  document: fakeDocument,
+  localStorage: storage,
+  WebSocket: FakeWebSocket,
+});
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT =
   true;
 
@@ -81,6 +109,7 @@ globalThis.fetch = async (input, init) => {
 
 const auth = await import("../lib/auth.ts");
 const { AuthProvider, useAuth } = await import("./useAuth.ts");
+const { WebSocketClient } = await import("../lib/ws.ts");
 
 function session(overrides: Partial<OidcSession> = {}): OidcSession {
   return {
@@ -132,6 +161,7 @@ async function broadcast(message: { type: string }): Promise<void> {
 }
 
 beforeEach(() => {
+  FakeWebSocket.instances = [];
   storage.clear();
   auth.setOidcSession(null);
   requests = [];
@@ -352,3 +382,54 @@ test("sign-in from the screen returns to the current page", async () => {
   });
   assert.deepEqual(assigned, ["/auth/sign-in/corp?return=%2Fagent%2Fmain"]);
 });
+
+// ---------------------------------------------------------------------------
+// A socket opened under a session that a re-auth later replaced
+// ---------------------------------------------------------------------------
+
+test("early re-auth: the old session's 4401 moves chat to the new session without a prompt", async () => {
+  // Signed in, two minutes from expiry, with a chat socket open on that session.
+  await mountSignedIn(session({ expires_at: Math.floor(Date.now() / 1000) + 60 }));
+  assert.equal(state().expiryWarning, true);
+  const chat = new WebSocketClient({ agentAlias: "main", sessionId: "s1", reconnectDelay: 1 });
+  chat.connect();
+  assert.equal(FakeWebSocket.instances.length, 1);
+
+  // Re-authenticate as the same account before the original expires.
+  sessionResponse = () =>
+    json(200, session({ csrf_token: "csrf-2", expires_at: Math.floor(Date.now() / 1000) + 3600 }));
+  await broadcast({ type: "signed-in" });
+  assert.equal(state().session?.csrf_token, "csrf-2");
+  assert.equal(state().expiryWarning, false);
+  // The live socket stays put until its own session ends.
+  assert.equal(FakeWebSocket.instances.length, 1);
+
+  // The original session expires: the gateway closes its socket with 4401.
+  await act(async () => {
+    FakeWebSocket.instances[0]!.serverClose(4401);
+  });
+  await act(settle);
+  assert.equal(state().reauthRequired, false);
+  assert.equal(state().isAuthenticated, true);
+  // The chat reconnected, on the cookie of the replacement session.
+  assert.equal(FakeWebSocket.instances.length, 2);
+  chat.disconnect();
+});
+
+test("plain expiry: the socket's 4401 with no newer session asks for re-auth", async () => {
+  await mountSignedIn();
+  const chat = new WebSocketClient({ agentAlias: "main", sessionId: "s1", reconnectDelay: 1 });
+  chat.connect();
+  sessionResponse = () => json(401, { error: "expired", reason: "session_expired" });
+  await act(async () => {
+    FakeWebSocket.instances[0]!.serverClose(4401);
+  });
+  await act(settle);
+  assert.equal(state().reauthRequired, true);
+  assert.equal(state().isAuthenticated, true);
+  assert.equal(FakeWebSocket.instances.length, 1);
+  // While the prompt is up, sockets and streams don't retry on a timer.
+  assert.equal(auth.isReauthPending(), true);
+  chat.disconnect();
+});
+
