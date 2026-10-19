@@ -538,6 +538,11 @@ Turning it on needs:
 - HTTPS (`[gateway.tls]`, or a reverse proxy with
   `trust_forwarded_headers`). Sign-in is refused over plain HTTP unless
   the browser runs on the gateway's own machine.
+- Behind a reverse proxy, the browser's `Host` passed through unchanged
+  (for example `proxy_set_header Host $host;` in nginx). The callback URI
+  and the dashboard's own origin are both taken from it, so a proxy that
+  rewrites `Host` to an internal name breaks sign-in and gets every
+  signed-in change refused as coming from another origin.
 - An identity provider client that uses Authorization Code with PKCE
   (S256), with `<dashboard origin><path_prefix>/oidc/callback` as a
   redirect URI (the same URI as the browser enrollment relay above).
@@ -583,14 +588,18 @@ What a signed-in account can do follows its permission profile:
   the dashboard hides them. Use zerocode for that account's own chat
   sessions.
 
-Sign-out ends the session in this ZeroClaw; it does not sign the user
-out of the identity provider. When a session ends (sign-out, expiry, or a
+Sign-out ends the session in this ZeroClaw and drops its cookie, also
+when the session had already ended; it does not sign the user out of the
+identity provider. When a session ends (sign-out, expiry, or a
 check it fails) or loses the access a page needs, that page's sockets and
 event streams close at once. A chat turn already running finishes
 unattended, as when a viewer leaves, and a tool approval it was waiting
 on is refused; nothing the closed socket sent afterwards is acted on. A
 reload also closes the sockets a session opened, and the dashboard
-reconnects them under the new configuration.
+reconnects them under the new configuration. A request that still reaches
+the gateway generation being replaced, over a connection that stayed
+open, is answered `503` with `"reason": "gateway_restarting"`, and the
+dashboard retries it.
 
 Sessions are held in memory, and a session's token is wiped when the
 session ends. Expired sessions are swept every minute even when no
@@ -614,8 +623,8 @@ Things to know before turning it on:
   is sent the session cookie. Use HTTPS, or sign in only from a browser
   you don't use for other local development servers.
 - Taking a provider off `gateway.dashboard_sign_in.oidc`, or emptying it,
-  ends the sessions it issued; offering it again does not bring them
-  back. If the `[oidc.<alias>]` entry is pointed at another issuer or
+  ends the sessions it issued: at the next request, and within a minute
+  if none arrives. Offering it again does not bring them back. If the `[oidc.<alias>]` entry is pointed at another issuer or
   client, its sessions end as well, without their tokens being sent to
   the new provider.
 - With introspection, an identity provider that cannot be reached when a
