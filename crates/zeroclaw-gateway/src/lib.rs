@@ -2930,7 +2930,8 @@ pub async fn run_gateway_with_plugin_webhooks(
                                 }
                             };
                             let io = hyper_util::rt::TokioIo::new(tls_stream);
-                            serve_until_stopped!(builder.serve_connection(io, hyper_svc))
+                            // With upgrades, as over plain HTTP: WebSockets work over TLS too.
+                            serve_until_stopped!(builder.serve_connection_with_upgrades(io, hyper_svc))
                         }
                         None => {
                             let io = hyper_util::rt::TokioIo::new(tcp_stream);
@@ -8676,6 +8677,46 @@ path = "{trigger_path}"
             next_shutdown.send(true).unwrap();
             let _ = tokio::time::timeout(std::time::Duration::from_secs(2), next).await;
         }
+    }
+
+    /// The native TLS listener serves WebSocket upgrades, as plain HTTP
+    /// does: a socket opened over TLS completes its upgrade, gets its
+    /// route's first frame, and stays open.
+    #[tokio::test]
+    async fn a_websocket_over_native_tls_stays_open() {
+        use futures_util::StreamExt;
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (cert_path, key_path, connector) = drain_test_tls(tmp.path());
+        let (addr, shutdown_tx, server) = start_drain_test_gateway_with(
+            &tmp.path().join("tls-ws"),
+            0,
+            Some((cert_path.as_path(), key_path.as_path())),
+            None,
+        )
+        .await;
+        let tls = drain_test_tls_connect(&connector, addr).await;
+        let url = format!("ws://localhost:{}/ws/canvas/tls-upgrade", addr.port());
+        let (mut socket, response) = tokio_tungstenite::client_async(url, tls)
+            .await
+            .expect("the upgrade completes");
+        assert_eq!(response.status(), 101);
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .expect("a first frame in time")
+            .expect("the upgraded TLS socket is still open")
+            .expect("a frame, not an error");
+        let text = first.into_text().expect("a text frame").to_string();
+        assert!(text.contains(r#""type":"connected""#), "{text}");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), socket.next())
+                .await
+                .is_err(),
+            "the upgraded TLS socket closed on its own"
+        );
+        drop(socket);
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server).await;
     }
 
     #[tokio::test]
