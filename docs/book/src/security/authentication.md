@@ -553,7 +553,9 @@ binds it to that browser with a short-lived cookie, so a sign-in started
 elsewhere cannot be finished there. The ID token is required and
 validated as evidence of the sign-in (issuer, audience, authorized
 party, expiry, nonce) and then discarded. The access token is verified by
-the provider exactly as an RPC bearer is, and a service client is never
+the provider exactly as an RPC bearer is, and the account is the one it
+resolves to; the ID token's subject is not compared with it, since both
+come from the same back-channel exchange. A service client is never
 given a dashboard session. The token then stays in the gateway's memory:
 the browser holds only an opaque `HttpOnly`, `SameSite=Strict` session
 cookie (`Secure` over HTTPS), and no token reaches browser storage or
@@ -581,11 +583,20 @@ What a signed-in account can do follows its permission profile:
   the dashboard hides them. Use zerocode for that account's own chat
   sessions.
 
-Sign-out ends the session in this ZeroClaw and closes the dashboard's
-chat socket and event stream; it does not sign the user out of the
-identity provider. Sessions are held in memory: a daemon restart signs
-everyone out, while a reload keeps them and verifies each one again
-against the new configuration before its next use. At most 256 sessions
+Sign-out ends the session in this ZeroClaw; it does not sign the user
+out of the identity provider. When a session ends (sign-out, expiry, or a
+check it fails) or loses the access a page needs, that page's sockets and
+event streams close at once. A chat turn already running finishes
+unattended, as when a viewer leaves, and a tool approval it was waiting
+on is refused; nothing the closed socket sent afterwards is acted on. A
+reload also closes the sockets a session opened, and the dashboard
+reconnects them under the new configuration.
+
+Sessions are held in memory, and a session's token is wiped when the
+session ends. Expired sessions are swept every minute even when no
+request arrives. A daemon restart signs everyone out, while a reload
+keeps sessions and verifies each one again against the new configuration
+before its next use. At most 256 sessions
 are held at once, eight per account; at the cap a new sign-in is refused
 rather than signing somebody else out.
 
