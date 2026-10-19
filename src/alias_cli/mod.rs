@@ -1169,4 +1169,64 @@ mod tests {
             "deleting the final configured agent must still purge its durable memory rows"
         );
     }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn agent_delete_precheck_refuses_an_agent_with_a_live_acp_session() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let config = Config {
+            config_path: temp.path().join("config.toml"),
+            data_dir: temp.path().join("data"),
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        zeroclaw_infra::acp_session_store::AcpSessionStore::new(&config.data_dir)
+            .unwrap()
+            .create_session("live-session", "busy", "/ws/busy", None)
+            .unwrap();
+
+        let refusal = agent_delete_precheck(&config, "busy")
+            .expect_err("a live ACP session must block deleting its agent");
+        assert!(refusal.to_string().contains("busy"), "{refusal}");
+        agent_delete_precheck(&config, "idle")
+            .expect("an agent with no live ACP session may be deleted");
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[tokio::test]
+    async fn agent_delete_removes_the_agents_acp_sessions() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut config = Config {
+            config_path: temp.path().join("config.toml"),
+            data_dir: temp.path().join("data"),
+            ..Config::default()
+        };
+        config.agents.insert(
+            "victim".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let store =
+            zeroclaw_infra::acp_session_store::AcpSessionStore::new(&config.data_dir).unwrap();
+        store
+            .create_session("ended-session", "victim", "/ws/victim", None)
+            .unwrap();
+        store.mark_session_killed("ended-session").unwrap();
+        store
+            .create_session("other-session", "bystander", "/ws/bystander", None)
+            .unwrap();
+
+        let workspace = config.agent_workspace_dir("victim");
+        let handles = build_owned_state_handles(&config).unwrap();
+        apply_delete(&mut config, &AliasKind::Agent, "victim").unwrap();
+        agent_delete_owned_state(&config, "victim", &workspace, handles)
+            .await
+            .unwrap();
+
+        assert!(
+            store.list_sessions_by_agent("victim").unwrap().is_empty(),
+            "deleting an agent must remove its ACP session rows"
+        );
+        assert_eq!(store.list_sessions_by_agent("bystander").unwrap().len(), 1);
+    }
 }
