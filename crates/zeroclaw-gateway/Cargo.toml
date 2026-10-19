@@ -90,6 +90,8 @@ rand = "0.10"
 libc = "0.2"
 
 [dev-dependencies]
+# A plain HTTP/2 (h2c) client for the connection-drain tests.
+h2 = "0.4"
 zeroclaw-config = { workspace = true, features = ["test-helpers"] }
 rcgen = "0.13"
 tempfile = "3.26"
