@@ -3614,7 +3614,10 @@ mod tests {
                         == Some(gw2_basic.as_str())
                 })
                 .count();
-            assert_eq!(sent_as_gw2, 0, "{repoint}: A's token was sent as another client");
+            assert_eq!(
+                sent_as_gw2, 0,
+                "{repoint}: A's token was sent as another client"
+            );
         }
     }
 
