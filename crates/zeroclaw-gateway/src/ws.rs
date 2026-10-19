@@ -3198,6 +3198,37 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         )
     }
 
+    type ScriptedTails = Arc<parking_lot::Mutex<std::collections::HashMap<usize, String>>>;
+
+    /// A reply that ends the head's empty text block and calls `tool` with
+    /// `input`.
+    fn tool_call_stream_tail(tool: &str, input: &serde_json::Value) -> String {
+        let start = serde_json::json!({
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": {"type": "tool_use", "id": "toolu_fixture", "name": tool, "input": {}},
+        });
+        let delta = serde_json::json!({
+            "type": "content_block_delta",
+            "index": 1,
+            "delta": {"type": "input_json_delta", "partial_json": input.to_string()},
+        });
+        format!(
+            "event: content_block_stop\n\
+data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
+event: content_block_start\n\
+data: {start}\n\n\
+event: content_block_delta\n\
+data: {delta}\n\n\
+event: content_block_stop\n\
+data: {{\"type\":\"content_block_stop\",\"index\":1}}\n\n\
+event: message_delta\n\
+data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n\
+event: message_stop\n\
+data: {{\"type\":\"message_stop\"}}\n\n"
+        )
+    }
+
     type WsClient = tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >;
@@ -3215,6 +3246,9 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         /// How many parked completions may finish; the n-th request finishes
         /// once this reaches n.
         released: tokio::sync::watch::Sender<usize>,
+        /// Replies scripted for particular requests (1-based), sent in place
+        /// of the parked text reply once that request is released.
+        scripted_tails: ScriptedTails,
         servers: Vec<tokio::task::JoinHandle<()>>,
         /// Present when the gateway serves dashboard sign-in.
         signed_in: Option<SignedInParts>,
@@ -3232,26 +3266,44 @@ data: {{\"type\":\"message_stop\"}}\n\n"
 
     impl ParkedTurnFixture {
         async fn spawn() -> Self {
-            Self::spawn_with(None).await
+            Self::spawn_with(None, |_| {}).await
         }
 
         /// The same gateway with dashboard sign-in offering `corp` at
         /// `issuer`, under the session layer, with `/auth/sign-out` served.
         async fn spawn_signed_in(issuer: &str) -> Self {
-            Self::spawn_with(Some(issuer)).await
+            Self::spawn_with(Some(issuer), |_| {}).await
         }
 
-        async fn spawn_with(sign_in: Option<&str>) -> Self {
+        /// A signed-in fixture whose config `adjust` changes before the
+        /// gateway starts.
+        async fn spawn_signed_in_with(
+            issuer: &str,
+            adjust: impl FnOnce(&mut zeroclaw_config::schema::Config),
+        ) -> Self {
+            Self::spawn_with(Some(issuer), adjust).await
+        }
+
+        async fn spawn_with(
+            sign_in: Option<&str>,
+            adjust: impl FnOnce(&mut zeroclaw_config::schema::Config),
+        ) -> Self {
             let (request_seen_tx, request_seen) =
                 tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
             let (released, released_rx) = tokio::sync::watch::channel(0usize);
             let arrivals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let scripted_tails = ScriptedTails::default();
+            let mock_tails = Arc::clone(&scripted_tails);
             let mock_app = Router::new().route(
                 "/v1/messages",
                 post(move |Json(request): Json<serde_json::Value>| {
                     let request_seen_tx = request_seen_tx.clone();
                     let mut released_rx = released_rx.clone();
                     let index = arrivals.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    let tail_text = mock_tails
+                        .lock()
+                        .remove(&index)
+                        .unwrap_or_else(parked_stream_tail);
                     async move {
                         assert_eq!(
                             request["stream"].as_bool(),
@@ -3266,7 +3318,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                         });
                         let tail = futures_util::stream::once(async move {
                             let _ = released_rx.wait_for(|released| *released >= index).await;
-                            Ok::<_, std::io::Error>(axum::body::Bytes::from(parked_stream_tail()))
+                            Ok::<_, std::io::Error>(axum::body::Bytes::from(tail_text))
                         });
                         (
                             [(header::CONTENT_TYPE, "text/event-stream")],
@@ -3332,6 +3384,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             if let Some(issuer) = sign_in {
                 crate::dashboard_session::test_support::add_sign_in(&mut config, issuer);
             }
+            adjust(&mut config);
 
             let backend = zeroclaw_infra::make_session_backend(&workspace, "sqlite")
                 .expect("sqlite session backend");
@@ -3358,6 +3411,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                     gateway_addr,
                     request_seen,
                     released,
+                    scripted_tails: Arc::clone(&scripted_tails),
                     servers: vec![mock_server, gateway_server],
                     signed_in: None,
                     _tmp: tmp,
@@ -3406,6 +3460,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                 gateway_addr,
                 request_seen,
                 released,
+                scripted_tails: Arc::clone(&scripted_tails),
                 servers: vec![mock_server, gateway_server],
                 signed_in: Some(SignedInParts {
                     dashboard,
@@ -3459,6 +3514,14 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             let session_start = next_text_frame(&mut client).await;
             assert_eq!(session_start["type"], "session_start");
             (client, session_start)
+        }
+
+        /// Answer the `index`-th provider request (1-based) with a call to
+        /// `tool`, instead of the parked text reply.
+        fn script_tool_call(&self, index: usize, tool: &str, input: serde_json::Value) {
+            self.scripted_tails
+                .lock()
+                .insert(index, tool_call_stream_tail(tool, &input));
         }
 
         /// Publish the same policy with the `admins` group no longer mapped.
@@ -3622,6 +3685,16 @@ data: {{\"type\":\"message_stop\"}}\n\n"
     // acted on. The admitted turn itself is not cancelled; it finishes
     // unattended, as when a viewer detaches.
 
+    /// Read frames until one of type `kind` arrives.
+    async fn next_frame_of(client: &mut WsClient, kind: &str) -> serde_json::Value {
+        loop {
+            let frame = next_text_frame(client).await;
+            if frame["type"] == kind {
+                break frame;
+            }
+        }
+    }
+
     async fn send_raw(client: &mut WsClient, frame: serde_json::Value) {
         // The server may already be closing; a failed send is not the point.
         let _ = client.send(ClientMessage::Text(frame.to_string().into())).await;
@@ -3780,6 +3853,129 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             .await
             .is_ok();
         assert!(!started, "a message buffered after sign-out started a turn");
+        fixture.shutdown();
+    }
+
+    /// What the fixture file holds: it reaches the model only if a file-read
+    /// approval was honored.
+    const APPROVED_READ: &str = "contents only an honored approval reveals";
+
+    #[test]
+    fn an_approval_sent_after_sign_out_resolves_nothing() {
+        run_ws_regression(
+            "ws-signin-approval-after-signout",
+            an_approval_sent_after_sign_out_resolves_nothing_inner,
+        );
+    }
+
+    async fn an_approval_sent_after_sign_out_resolves_nothing_inner() {
+        let idp = crate::dashboard_session::test_support::idp(&["admins"], "gw").await;
+        // Every file read asks first, and the turn's first reply reads one.
+        let mut fixture = ParkedTurnFixture::spawn_signed_in_with(&idp.uri(), |config| {
+            config
+                .risk_profiles
+                .get_mut("fixture")
+                .expect("the fixture's risk profile")
+                .always_ask = vec!["file_read".to_string()];
+            std::fs::write(config.data_dir.join("note.txt"), APPROVED_READ).expect("fixture file");
+        })
+        .await;
+        fixture.script_tool_call(1, "file_read", serde_json::json!({"path": "note.txt"}));
+        let (cookie, csrf) = fixture.sign_in(3600).await;
+        let session_id = "signin-approval-after-signout";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        let (mut client, _) = fixture.connect_signed_in(session_id, &cookie).await;
+        fixture.start_parked_turn(&mut client, "read the note").await;
+        fixture.release_next();
+        let prompt = next_frame_of(&mut client, "approval_request").await;
+        let request_id = prompt["request_id"]
+            .as_str()
+            .expect("the prompt names its request")
+            .to_string();
+
+        let status = crate::dashboard_session::test_support::sign_out_over_http(
+            fixture.gateway_addr,
+            &cookie,
+            &csrf,
+        )
+        .await;
+        assert_eq!(status, 204, "sign-out succeeds");
+        send_raw(
+            &mut client,
+            serde_json::json!({"type": "approval_response", "request_id": request_id, "decision": "approve"}),
+        )
+        .await;
+        send_raw(&mut client, serde_json::json!({"type": "message", "content": "steer after sign-out"}))
+            .await;
+        let (code, _) = crate::dashboard_session::test_support::until_closed(
+            &mut client,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(code, Some(4401), "the socket closes as soon as the session ends");
+
+        // The turn runs on unattended, and its prompt resolves as a refusal.
+        let follow_up = fixture.next_provider_request().await.to_string();
+        fixture.release_next();
+        fixture.wait_for_turn_to_settle(&session_key).await;
+        assert!(
+            !follow_up.contains(APPROVED_READ),
+            "an approval sent after sign-out was honored"
+        );
+        assert!(
+            !follow_up.contains("steer after sign-out"),
+            "steering sent after sign-out reached the model"
+        );
+        fixture.shutdown();
+    }
+
+    #[test]
+    fn a_message_waiting_for_the_session_permit_starts_no_turn_after_sign_out() {
+        run_ws_regression(
+            "ws-signin-permit-wait-after-signout",
+            a_message_waiting_for_the_session_permit_starts_no_turn_after_sign_out_inner,
+        );
+    }
+
+    async fn a_message_waiting_for_the_session_permit_starts_no_turn_after_sign_out_inner() {
+        let idp = crate::dashboard_session::test_support::idp(&["admins"], "gw").await;
+        let mut fixture = ParkedTurnFixture::spawn_signed_in(&idp.uri()).await;
+        let (cookie, csrf) = fixture.sign_in(3600).await;
+        let session_id = "signin-permit-wait";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        // A first viewer's turn holds the session's permit and runs on after
+        // the viewer leaves.
+        let (mut first, _) = fixture.connect_signed_in(session_id, &cookie).await;
+        fixture.start_parked_turn(&mut first, "hold the permit").await;
+        disconnect_viewer(first).await;
+        // A second socket's message, sent while still signed in, waits for it.
+        let (mut second, _) = fixture.connect_signed_in(session_id, &cookie).await;
+        send_chat(&mut second, "queued before sign-out").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let status = crate::dashboard_session::test_support::sign_out_over_http(
+            fixture.gateway_addr,
+            &cookie,
+            &csrf,
+        )
+        .await;
+        assert_eq!(status, 204, "sign-out succeeds");
+        let (code, _) = crate::dashboard_session::test_support::until_closed(
+            &mut second,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(
+            code,
+            Some(4401),
+            "a socket waiting for the permit closes when the session ends"
+        );
+        fixture.release_next();
+        fixture.wait_for_turn_to_settle(&session_key).await;
+        let started = tokio::time::timeout(Duration::from_millis(500), fixture.request_seen.recv())
+            .await
+            .is_ok();
+        assert!(!started, "the queued message started a turn after sign-out");
         fixture.shutdown();
     }
 
