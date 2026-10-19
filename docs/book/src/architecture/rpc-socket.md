@@ -79,10 +79,10 @@ its sessions that:
 - has no approval pending.
 
 Closing one works as `session/close` does: the session leaves the live map,
-and its transcript is kept. A chat session's history must already be in its
-store, or be added after what is stored. Stored messages are never rewritten,
-and a session whose history differs from its store, or can't be stored, stays
-live. The daemon logs each one it closes.
+and its transcript is kept. Retirement never writes a transcript: a chat
+session is closed only when its store already holds all of its history. A
+session whose store lacks part of it (a failed save, say), differs from it, or
+can't be read stays live. The daemon logs each one it closes.
 
 After that, the transcript is in the store but out of a remote client's reach.
 Over WSS a client reaches only live sessions its own identity owns, so it
