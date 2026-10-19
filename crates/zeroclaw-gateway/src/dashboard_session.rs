@@ -451,12 +451,6 @@ impl SessionRejection {
         }
     }
 
-    /// Whether the browser should drop the cookie: only once the session
-    /// itself is gone, never for a request that merely arrived wrongly.
-    fn clears_cookie(self) -> bool {
-        matches!(self, Self::Expired | Self::Invalid)
-    }
-
     pub(crate) fn body(self) -> (StatusCode, Json<serde_json::Value>) {
         (
             self.status(),
@@ -1256,17 +1250,15 @@ pub async fn layer(
             }
         }
     };
-    let clears = matches!(caller, DashboardCaller::Rejected(r) if r.clears_cookie());
     if let DashboardCaller::Session(session) = &caller {
         request.extensions_mut().insert(Arc::clone(session));
     }
     request.extensions_mut().insert(caller.clone());
-    let clear_values = clears.then(|| scope.clear_session_cookies());
-    let mut response = DASHBOARD_CALLER.scope(caller, next.run(request)).await;
-    for value in clear_values.into_iter().flatten() {
-        response.headers_mut().append(header::SET_COOKIE, value);
-    }
-    response
+    // A cookie whose session ended is left in place, not cleared: it names
+    // nothing and holds no token, and keeping it lets the browser's other
+    // tabs and later requests hear why ("expired") instead of the answer for
+    // no credential at all. Sign-out clears it; a new sign-in replaces it.
+    DASHBOARD_CALLER.scope(caller, next.run(request)).await
 }
 
 /// A rejected session's answer as a full response, for routes that answer
