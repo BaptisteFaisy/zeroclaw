@@ -1686,19 +1686,45 @@ mod tests {
         assert_eq!(exchanges, 0);
     }
 
+    /// A service client is refused a dashboard session even when the
+    /// policy maps it to a profile, so the refusal is the actor check's,
+    /// not the resolver's.
     #[tokio::test]
-    async fn service_and_unmapped_identities_get_no_session() {
-        for (groups, client) in [(&["admins"][..], "svc"), (&["nobody"][..], "gw")] {
-            let server = idp(groups, client).await;
-            let fixture = fixture(sign_in_config(&server.uri()));
-            let started = start(&fixture, "/auth/sign-in/corp").await;
-            mount_token(&server, &started.nonce, true).await;
-            let response =
-                send(&fixture.router, callback(&started, Some(&started.binding))).await;
-            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{client} {groups:?}");
-            assert!(cookie_from(&response, SESSION_COOKIE).is_none());
-            assert_eq!(fixture.auth.sessions.len(), 0);
-        }
+    async fn a_service_principal_gets_no_session_even_with_a_mapped_profile() {
+        let server = idp(&["admins"], "svc").await;
+        let mut config = sign_in_config(&server.uri());
+        config
+            .oidc
+            .get_mut("corp")
+            .unwrap()
+            .service_profile_map
+            .insert("svc".into(), "admin".into());
+        let fixture = fixture(config);
+        let service = fixture
+            .auth
+            .inbound
+            .authenticate_scoped("at-svc", "oidc.corp")
+            .await
+            .expect("the policy maps the service client");
+        assert_eq!(service.principal.actor, ActorKind::Service);
+        let started = start(&fixture, "/auth/sign-in/corp").await;
+        mount_token(&server, &started.nonce, true).await;
+        let response = send(&fixture.router, callback(&started, Some(&started.binding))).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(cookie_from(&response, SESSION_COOKIE).is_none());
+        assert_eq!(fixture.auth.sessions.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_unmapped_identity_gets_no_session() {
+        let server = idp(&["nobody"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let started = start(&fixture, "/auth/sign-in/corp").await;
+        mount_token(&server, &started.nonce, true).await;
+        let response = send(&fixture.router, callback(&started, Some(&started.binding))).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(cookie_from(&response, SESSION_COOKIE).is_none());
+        assert_eq!(fixture.auth.sessions.len(), 0);
     }
 
     #[tokio::test]
