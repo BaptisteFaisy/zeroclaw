@@ -3811,4 +3811,50 @@ mod tests {
         );
         drop(watch);
     }
+
+    /// An event stream whose body the transport stopped polling still lets
+    /// go of its session the moment the session ends: nothing of it waits
+    /// for the body to be polled again.
+    #[tokio::test]
+    async fn a_suspended_event_stream_lets_go_of_its_ended_session() {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let (cookie, session) = fixture
+            .auth
+            .sign_in("corp", pin_for(&fixture, "corp"), "at-alice".into(), 3600)
+            .await
+            .expect("alice signs in");
+        let baseline = Arc::strong_count(&fixture.auth);
+        let response = send(
+            &fixture.router,
+            request(
+                "GET",
+                "/api/events",
+                loopback(),
+                &[("cookie", &cookie_for(&cookie))],
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "the stream opens");
+        // The body is held and never polled again, as when the transport
+        // waits for room to write.
+        let body = response.into_body();
+        assert!(
+            Arc::strong_count(&fixture.auth) > baseline,
+            "the open stream watches its session"
+        );
+        assert!(fixture.auth.end(&session));
+        let released = tokio::time::timeout(Duration::from_secs(2), async {
+            while Arc::strong_count(&fixture.auth) > baseline {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .is_ok();
+        assert!(
+            released,
+            "a suspended event stream kept its ended session's watch"
+        );
+        drop(body);
+    }
 }
