@@ -8333,6 +8333,73 @@ path = "{trigger_path}"
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), next).await;
     }
 
+    /// A stopped gateway lets go of its port as soon as it stops accepting,
+    /// as `axum::serve` does, so a fresh connection is refused rather than
+    /// left in a backlog nothing serves, even while the drain still holds a
+    /// response in flight. The next gateway then takes the port. Over plain
+    /// HTTP and TLS.
+    #[tokio::test]
+    async fn a_stopped_gateway_releases_its_port_before_its_drain_ends() {
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (cert_path, key_path, connector) = drain_test_tls(tmp.path());
+        for over_tls in [false, true] {
+            let certs = over_tls.then_some((cert_path.as_path(), key_path.as_path()));
+            let tls = over_tls.then_some(&connector);
+            let label = if over_tls { "tls" } else { "plain" };
+            let (addr, shutdown_tx, server) = start_drain_test_gateway_with(
+                &tmp.path().join(format!("{label}-first")),
+                0,
+                certs,
+                None,
+            )
+            .await;
+            let mut streaming = drain_test_connect(addr, tls).await;
+            let head = drain_test_request(&mut streaming, "/api/events").await;
+            assert!(head.starts_with("HTTP/1.1 200"), "{label}: {head}");
+
+            shutdown_tx.send(true).unwrap();
+            let released = tokio::time::timeout(std::time::Duration::from_millis(150), async {
+                loop {
+                    match tokio::net::TcpStream::connect(addr).await {
+                        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => break,
+                        _ => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+                    }
+                }
+            })
+            .await;
+            assert!(
+                released.is_ok(),
+                "{label}: the stopped gateway still held its port while it drained"
+            );
+            assert!(
+                !server.is_finished(),
+                "{label}: the drain still holds the event stream"
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(2), server)
+                .await
+                .expect("the gateway returns")
+                .expect("the gateway task does not panic")
+                .expect("the gateway stops cleanly");
+
+            let (_, next_shutdown, next) = start_drain_test_gateway_with(
+                &tmp.path().join(format!("{label}-next")),
+                addr.port(),
+                certs,
+                None,
+            )
+            .await;
+            let mut fresh = drain_test_connect(addr, tls).await;
+            let head = drain_test_request(&mut fresh, "/health").await;
+            assert!(
+                head.starts_with("HTTP/1.1 200"),
+                "{label}: the next gateway serves: {head}"
+            );
+            next_shutdown.send(true).unwrap();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), next).await;
+        }
+    }
+
     #[tokio::test]
     async fn run_gateway_starts_with_mismatched_provider_api_key() {
         // `run_gateway` binds the process-global pricing config handle.
