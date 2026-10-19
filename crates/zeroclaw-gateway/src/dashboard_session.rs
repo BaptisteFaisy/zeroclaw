@@ -3397,6 +3397,14 @@ mod tests {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "{path} was admitted by a stopped generation"
             );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CONNECTION)
+                    .and_then(|value| value.to_str().ok()),
+                Some("close"),
+                "{path}: the client is told to reconnect, not to reuse this connection"
+            );
             assert_eq!(json(response).await["reason"], "gateway_restarting");
         }
     }
