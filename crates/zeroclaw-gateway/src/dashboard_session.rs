@@ -3489,7 +3489,10 @@ mod tests {
         watch.stopping = stopping;
         stop.send_replace(true);
         drop(stop);
-        assert!(auth.is_retired(), "a closed channel read as a live generation");
+        assert!(
+            auth.is_retired(),
+            "a closed channel read as a live generation"
+        );
         assert_eq!(
             watch.known_lost(),
             Some(WS_CLOSE_GOING_AWAY),
