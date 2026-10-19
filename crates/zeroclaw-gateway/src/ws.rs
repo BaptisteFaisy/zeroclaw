@@ -4070,6 +4070,43 @@ data: {{\"type\":\"message_stop\"}}\n\n"
     }
 
     #[test]
+    fn a_message_after_the_account_loses_admin_between_turns_starts_no_turn() {
+        run_ws_regression(
+            "ws-signin-admin-removed-between-turns",
+            a_message_after_the_account_loses_admin_between_turns_starts_no_turn_inner,
+        );
+    }
+
+    async fn a_message_after_the_account_loses_admin_between_turns_starts_no_turn_inner() {
+        // Still signed in afterwards (`ops`), so the socket must close for the
+        // lost access (4403), not for an ended session.
+        let idp = crate::dashboard_session::test_support::idp(&["admins", "ops"], "gw").await;
+        let mut fixture = ParkedTurnFixture::spawn_signed_in(&idp.uri()).await;
+        let (cookie, _) = fixture.sign_in(3600).await;
+        // One socket past its connect frame, one whose message is its first.
+        let (mut connected, _) = fixture.connect_signed_in("signin-revoked-connected", &cookie).await;
+        send_raw(&mut connected, serde_json::json!({"type": "connect"})).await;
+        assert_eq!(next_frame_of(&mut connected, "connected").await["type"], "connected");
+        let (mut fresh, _) = fixture.connect_signed_in("signin-revoked-fresh", &cookie).await;
+
+        fixture.revoke_admin();
+        for client in [&mut connected, &mut fresh] {
+            send_chat(client, "sent after the account lost admin").await;
+            let (code, _) = crate::dashboard_session::test_support::until_closed(
+                client,
+                Duration::from_secs(5),
+            )
+            .await;
+            assert_eq!(code, Some(4403), "the socket closes for the access it lost");
+        }
+        let started = tokio::time::timeout(Duration::from_millis(500), fixture.request_seen.recv())
+            .await
+            .is_ok();
+        assert!(!started, "a message sent after the account lost admin started a turn");
+        fixture.shutdown();
+    }
+
+    #[test]
     fn websocket_client_disconnect_mid_turn_lets_the_turn_finish_and_persist() {
         run_ws_regression(
             "ws-detach-survives",
