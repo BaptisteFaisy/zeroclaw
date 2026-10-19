@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { createElement } from "react";
+import React, { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { act, create, type ReactTestRenderer } from "react-test-renderer";
 import type { OidcMethod } from "../../lib/authSession.ts";
@@ -17,7 +17,8 @@ const fakeWindow = Object.assign(new EventTarget(), {
     search: "",
   },
 });
-Object.assign(globalThis, { window: fakeWindow });
+// The jiti CLI compiles JSX with the classic runtime, which needs React in scope.
+Object.assign(globalThis, { window: fakeWindow, React });
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT =
   true;
 // The pairing dialog asks for a pairing code on mount; this gateway has none.

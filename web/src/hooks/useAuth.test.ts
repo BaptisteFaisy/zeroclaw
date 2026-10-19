@@ -96,7 +96,7 @@ function session(overrides: Partial<OidcSession> = {}): OidcSession {
   };
 }
 
-const settle = () => new Promise((resolve) => setTimeout(resolve, 30));
+const settle = () => new Promise<void>((resolve) => setTimeout(resolve, 30));
 
 let latest: AuthState | null = null;
 function Probe() {
