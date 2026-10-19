@@ -3497,6 +3497,127 @@ mod tests {
             .count()
     }
 
+    /// Publish `config` as the live configuration and as the accepted policy.
+    async fn publish_both(state: &AppState, rpc: &RpcInboundAuth, config: &Config) {
+        let commit = state
+            .config_authority
+            .begin_config_commit()
+            .await
+            .expect("config commit");
+        commit
+            .publish(commit.next_revision().expect("revision"), config.clone())
+            .expect("publish");
+        rpc.publish_accepted(config, rpc.accepted_revision() + 1)
+            .unwrap();
+    }
+
+    /// The sign-in callback names its provider (the pin) and exchanges the
+    /// code from one reading of the configuration, so A's token never goes
+    /// out pinned to B however publications interleave. Here the alias is
+    /// repointed to B before the callback, back to A between naming the
+    /// provider and building the exchange client, and to B again while A
+    /// answers the exchange. Another issuer, then another client.
+    #[tokio::test]
+    async fn a_sign_in_callback_never_pins_a_token_to_another_provider() {
+        let gw2_basic = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("gw2:s3cret")
+        );
+        for repoint in ["issuer", "client"] {
+            let a = idp(&["admins"], "gw").await;
+            let b = idp(&["admins"], "gw").await;
+            let config_a = sign_in_config(&a.uri());
+            let mut config_b = config_a.clone();
+            let corp = config_b.oidc.get_mut("corp").unwrap();
+            if repoint == "issuer" {
+                corp.issuer = b.uri();
+            } else {
+                corp.client_id = "gw2".into();
+                corp.interactive_clients = vec!["gw2".into()];
+            }
+            let pairing = Arc::new(PairingGuard::new(
+                true,
+                &config_a.gateway.paired_tokens,
+                PairingCodePolicy::default(),
+            ));
+            let rpc =
+                Arc::new(RpcInboundAuth::from_config(&config_a, Arc::clone(&pairing)).unwrap());
+            let inbound = Arc::new(GatewayInboundAuth::from_shared(Arc::clone(&rpc)));
+            let fixture = fixture_with(
+                config_a.clone(),
+                pairing,
+                inbound,
+                Arc::new(DashboardSessions::default()),
+            );
+            let started = start(&fixture, "/auth/sign-in/corp?return=/chat").await;
+            let issuer = a.uri();
+            Mock::given(http_method("POST"))
+                .and(http_path("/token"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({
+                            "access_token": "at-alice",
+                            "token_type": "Bearer",
+                            "expires_in": 600,
+                            "id_token": id_token(serde_json::json!({
+                                "iss": issuer,
+                                "aud": "gw",
+                                "sub": "alice",
+                                "exp": unix_now() + 600,
+                                "nonce": started.nonce,
+                            })),
+                        }))
+                        .set_delay(Duration::from_millis(600)),
+                )
+                .mount(&a)
+                .await;
+
+            publish_both(&fixture.state, &rpc, &config_b).await;
+            let (state, publisher, restored) =
+                (fixture.state.clone(), Arc::clone(&rpc), config_a.clone());
+            *crate::api_oidc::BEFORE_EXCHANGE_CLIENT.lock() = Some((
+                started.state.clone(),
+                Box::pin(async move { publish_both(&state, &publisher, &restored).await }),
+            ));
+            let (state, publisher, repointed) =
+                (fixture.state.clone(), Arc::clone(&rpc), config_b.clone());
+            let (response, ()) = tokio::join!(
+                send(&fixture.router, callback(&started, Some(&started.binding))),
+                async move {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    publish_both(&state, &publisher, &repointed).await;
+                }
+            );
+            assert!(
+                !set_cookies(&response)
+                    .iter()
+                    .any(|c| c.starts_with(SESSION_COOKIE)),
+                "{repoint}: the callback signed somebody in"
+            );
+            assert_eq!(
+                token_requests(&b).await,
+                0,
+                "{repoint}: A's token was sent to another issuer"
+            );
+            let sent_as_gw2 = a
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|request| request.url.path() == "/introspect")
+                .filter(|request| String::from_utf8_lossy(&request.body).contains("at-alice"))
+                .filter(|request| {
+                    request
+                        .headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        == Some(gw2_basic.as_str())
+                })
+                .count();
+            assert_eq!(sent_as_gw2, 0, "{repoint}: A's token was sent as another client");
+        }
+    }
+
     /// A sign-in whose provider was repointed before its token was verified
     /// (the pin it carries no longer matches the accepted policy) is
     /// refused, and its token is sent to no provider.

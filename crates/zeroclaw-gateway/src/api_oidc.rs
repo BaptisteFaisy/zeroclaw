@@ -393,6 +393,31 @@ fn error_json(status: StatusCode, message: &str) -> Response {
     (status, Json(serde_json::json!({ "error": message }))).into_response()
 }
 
+/// Test seam: a step a test installs for one flow (by its `state`), run in
+/// the callback just before the code-exchange client is built, so a test can
+/// publish configuration exactly there.
+#[cfg(test)]
+pub(crate) type CallbackStep = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+#[cfg(test)]
+pub(crate) static BEFORE_EXCHANGE_CLIENT: parking_lot::Mutex<Option<(String, CallbackStep)>> =
+    parking_lot::Mutex::new(None);
+
+#[cfg(test)]
+async fn before_exchange_client(flow_state: &str) {
+    let step = {
+        let mut slot = BEFORE_EXCHANGE_CLIENT.lock();
+        if slot.as_ref().is_some_and(|(state, _)| state == flow_state) {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some((_, step)) = step {
+        step.await;
+    }
+}
+
 /// Build the enrollment client for a configured alias.
 fn enrollment_for(state: &AppState, alias: &str) -> Result<Enrollment, Box<Response>> {
     let entry = {
@@ -1164,6 +1189,8 @@ async fn handle_pkce_callback(
             Some((dashboard, provider, lifetime_secs))
         }
     };
+    #[cfg(test)]
+    before_exchange_client(&pending.flow.state).await;
     let enrollment = match enrollment_for(&state, &pending.alias) {
         Ok(enrollment) => enrollment,
         // The alias was removed while the flow was in flight: fail closed.
