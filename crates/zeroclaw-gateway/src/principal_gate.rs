@@ -156,6 +156,21 @@ impl GatewayInboundAuth {
             .await
     }
 
+    /// [`Self::authenticate_scoped`] for a bearer bound to the provider as
+    /// it was configured when the bearer was issued: refused before it is
+    /// sent if the accepted policy's provider by that name is another one
+    /// now. See [`RpcInboundAuth::authenticate_bound`].
+    pub(crate) async fn authenticate_bound(
+        &self,
+        token: &str,
+        provider: &str,
+        binding: &zeroclaw_runtime::rpc::auth::OidcBinding,
+    ) -> Result<ConnectionAuth, AuthDenied> {
+        self.inner
+            .authenticate_bound(TransportKind::Wss, token, provider, binding)
+            .await
+    }
+
     /// Verify a native pairing bearer (the pre-existing gateway
     /// credential) into a shared-operator principal.
     async fn authenticate_native(&self, token: &str) -> Result<ConnectionAuth, AuthDenied> {

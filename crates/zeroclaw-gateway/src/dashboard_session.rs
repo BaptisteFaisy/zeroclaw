@@ -112,6 +112,15 @@ impl ProviderPin {
             client_id: config.effective_client_id().to_string(),
         }
     }
+
+    /// The same pin, for the runtime to check its tokens against before
+    /// sending them.
+    fn binding(&self) -> zeroclaw_runtime::rpc::auth::OidcBinding {
+        zeroclaw_runtime::rpc::auth::OidcBinding {
+            issuer: self.issuer.clone(),
+            client_id: self.client_id.clone(),
+        }
+    }
 }
 
 /// One signed-in browser.
@@ -647,7 +656,7 @@ impl DashboardAuth {
         let selection = format!("oidc.{alias}");
         let auth = self
             .inbound
-            .authenticate_scoped(&access_token, &selection)
+            .authenticate_bound(&access_token, &selection, &provider.binding())
             .await
             .map_err(|_| SignInRefusal::Denied)?;
         if auth.principal.actor == ActorKind::Service {
@@ -728,7 +737,7 @@ impl DashboardAuth {
             .revalidate_by
             .is_some_and(|deadline| deadline <= now);
         let auth = if due || !self.inbound.is_authority(&authority) {
-            match self.reverify(&key, &alias, &bearer, &auth).await {
+            match self.reverify(&key, &alias, &pinned, &bearer, &auth).await {
                 Some(fresh) => fresh,
                 None => return DashboardCaller::Rejected(SessionRejection::Expired),
             }
@@ -740,7 +749,7 @@ impl DashboardAuth {
             // The accepted policy can move between a resolution and its
             // check; that is no reason to sign somebody out. Verify once
             // more with the token held, then fail closed.
-            Err(_) => match self.reverify(&key, &alias, &bearer, &auth).await {
+            Err(_) => match self.reverify(&key, &alias, &pinned, &bearer, &auth).await {
                 Some(fresh) => match self.inbound.current_grants(&fresh) {
                     Ok(grants) => grants,
                     Err(denied) => {
@@ -787,23 +796,32 @@ impl DashboardAuth {
 
     /// Verify the held token again against the current authority and keep
     /// the result. A refusal, or a token that now names another principal,
-    /// ends the session.
+    /// ends the session. The token only ever goes to the provider it was
+    /// issued by (`pinned`), checked against the policy that would send it.
     async fn reverify(
         &self,
         key: &[u8; 32],
         alias: &str,
+        pinned: &ProviderPin,
         bearer: &str,
         previous: &ConnectionAuth,
     ) -> Option<ConnectionAuth> {
         let provider = format!("oidc.{alias}");
+        let binding = pinned.binding();
         let published = self.inbound.generation();
-        let mut verified = self.inbound.authenticate_scoped(bearer, &provider).await;
+        let mut verified = self
+            .inbound
+            .authenticate_bound(bearer, &provider, &binding)
+            .await;
         // A policy published during the identity provider's round trip fails
         // the verification closed, as it should; that is no reason to sign
         // somebody out. Verify once more with the token held, as the grants
         // check does, then fail closed.
         if verified.is_err() && self.inbound.generation() != published {
-            verified = self.inbound.authenticate_scoped(bearer, &provider).await;
+            verified = self
+                .inbound
+                .authenticate_bound(bearer, &provider, &binding)
+                .await;
         }
         let refusal = match verified {
             Ok(fresh)
