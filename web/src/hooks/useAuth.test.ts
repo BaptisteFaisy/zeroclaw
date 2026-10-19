@@ -470,11 +470,15 @@ test("a session check that meets a gateway reload resumes instead of prompting",
 test("sign-out that meets a gateway reload still signs out", async () => {
   await mountSignedIn();
   restartingOnce = new Set(["/auth/sign-out"]);
+  const before = requests.length;
   await act(async () => {
     await state().signOut();
   });
   await act(settle);
-  assert.equal(requests.filter((r) => r.url.endsWith("/auth/sign-out")).length, 2);
+  // Sent again as it was: the refusal is not taken for a stale CSRF token.
+  const during = requests.slice(before);
+  assert.equal(during.filter((r) => r.url.endsWith("/auth/sign-out")).length, 2);
+  assert.equal(during.filter((r) => r.url.endsWith("/api/auth/session")).length, 0);
   assert.equal(state().isAuthenticated, false);
   assert.deepEqual(state().signOutNotice, { kind: "signed-out", provider: "corp" });
 });
