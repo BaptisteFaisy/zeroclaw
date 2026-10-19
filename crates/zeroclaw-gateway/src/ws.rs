@@ -4169,7 +4169,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         fixture.shutdown();
     }
 
-    // ── Review round 2: a check that outlasts its session ─────────────
+    // ── Dashboard sign-in: a check that outlasts its session ──────────
 
     #[derive(Clone, Copy, Debug)]
     enum SlowCheckEnd {

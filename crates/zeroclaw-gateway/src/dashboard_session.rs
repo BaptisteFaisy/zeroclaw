@@ -3042,7 +3042,7 @@ mod tests {
         ProviderPin::of(&fixture.state.config.read().oidc[alias])
     }
 
-    // ── Review round 1 (findings 2 and 3) ─────────────────────────────
+    // ── Generations, token custody and the idle sweep ─────────────────
 
     fn pairing_for(config: &Config) -> Arc<PairingGuard> {
         Arc::new(PairingGuard::new(
@@ -3168,7 +3168,7 @@ mod tests {
         assert!(view.ended.is_cancelled(), "and told its sockets");
     }
 
-    // ── Review round 2 ────────────────────────────────────────────────
+    // ── Checks that outlast their session, late watches, sign-out ─────
 
     fn inbound_for(config: &Config) -> Arc<GatewayInboundAuth> {
         Arc::new(
