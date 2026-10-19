@@ -7217,7 +7217,10 @@ path = "{trigger_path}"
             })
             .await
             .is_ok();
-            assert!(closed, "the stopped gateway kept its {name} TLS connection open");
+            assert!(
+                closed,
+                "the stopped gateway kept its {name} TLS connection open"
+            );
         }
         tokio::time::timeout(std::time::Duration::from_secs(10), server)
             .await

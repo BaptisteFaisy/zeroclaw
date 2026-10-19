@@ -2189,8 +2189,13 @@ async fn process_chat_message(
                     Sent::SessionLost(code) => {
                         detach_mid_turn(session_key, &turn_id, pending_approvals);
                         *session = None;
-                        close_with(&mut *sender, &mut *receiver, code, "dashboard session ended")
-                            .await;
+                        close_with(
+                            &mut *sender,
+                            &mut *receiver,
+                            code,
+                            "dashboard session ended",
+                        )
+                        .await;
                         client_gone = true;
                     }
                 }

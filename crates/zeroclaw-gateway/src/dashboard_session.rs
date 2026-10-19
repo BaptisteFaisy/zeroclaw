@@ -617,8 +617,7 @@ impl DashboardAuth {
         if !state.config.read().gateway.dashboard_sign_in.enabled() {
             self.sessions.end_all();
         }
-        self._sweeper =
-            SweeperGuard::start(&self.sessions, state.config.clone(), stopping.clone());
+        self._sweeper = SweeperGuard::start(&self.sessions, state.config.clone(), stopping.clone());
         self.stopping = Some(stopping);
         self
     }
@@ -3819,7 +3818,11 @@ mod tests {
             "the retired generation's sweep ended the new generation's session"
         );
         let (status, _) = probe(&new, &[("cookie", &cookie_for(&cookie))]).await;
-        assert_eq!(status, StatusCode::OK, "the session still admits its request");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the session still admits its request"
+        );
     }
 
     /// An ended session's recheck, with the token copy it holds, goes at
@@ -3844,8 +3847,7 @@ mod tests {
         );
         watch.recheck = tokio::time::interval(Duration::from_millis(1));
         tokio::time::sleep(test_support::UNTIL_DUE).await;
-        test_support::slow_introspection(&server, &["admins"], "gw", Duration::from_secs(30))
-            .await;
+        test_support::slow_introspection(&server, &["admins"], "gw", Duration::from_secs(30)).await;
         let held = Arc::strong_count(&session);
         let mut watch = Some(watch);
         let _ = tokio::time::timeout(
