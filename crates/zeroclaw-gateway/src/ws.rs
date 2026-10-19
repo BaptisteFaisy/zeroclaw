@@ -4142,8 +4142,15 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             .await;
 
         fixture.revoke_admin();
+        // Past its connect frame, a frame that takes no turn permit (an
+        // approval) is checked on its own; a first message, through the permit.
+        send_raw(
+            &mut connected,
+            serde_json::json!({"type": "approval_response", "request_id": "r-1", "decision": "approve"}),
+        )
+        .await;
+        send_chat(&mut fresh, "sent after the account lost admin").await;
         for client in [&mut connected, &mut fresh] {
-            send_chat(client, "sent after the account lost admin").await;
             let (code, _) = crate::dashboard_session::test_support::until_closed(
                 client,
                 Duration::from_secs(5),

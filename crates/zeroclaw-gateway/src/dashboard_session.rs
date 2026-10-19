@@ -2919,7 +2919,11 @@ mod tests {
                 .any(|text| text.contains("published after the reload")),
             "a frame published after the reload reached the old socket: {texts:?}"
         );
-        assert!(code.is_some(), "the old generation's socket stays open");
+        assert_eq!(
+            code,
+            Some(WS_CLOSE_GOING_AWAY),
+            "the old generation's socket closes for its generation's stop"
+        );
 
         let (new_addr, new_server) = test_support::serve(new.router.clone()).await;
         let reconnect = test_support::connect(new_addr, "/ws/canvas/c1", &cookie).await;
