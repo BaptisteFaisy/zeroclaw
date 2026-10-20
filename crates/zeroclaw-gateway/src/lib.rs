@@ -7378,6 +7378,9 @@ path = "{trigger_path}"
         config.gateway.require_pairing = false;
         config.memory.backend = "none".into();
         if let Some((cert_path, key_path)) = tls {
+            // The process's rustls provider, as `main.rs` installs it: with both
+            // ring and aws-lc-rs compiled in (a workspace build), rustls picks none.
+            let _ = rustls::crypto::ring::default_provider().install_default();
             config.gateway.tls = Some(zeroclaw_config::schema::GatewayTlsConfig {
                 enabled: true,
                 cert_path: cert_path.display().to_string(),
