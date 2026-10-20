@@ -66,6 +66,15 @@ expect "mixed unrelated then activation e2e" "true" \
     "web/src/pages/AgentChat.tsx" \
     "tests/plugin_channel_runtime_e2e.rs"
 
+# The plugin CLI component tests drive the real binary with plugin support, so
+# only this job runs them; a change to them alone must still run it.
+expect "plugin info CLI component test" "true" \
+    "tests/component/plugin_info_cli.rs"
+expect "plugin update CLI component test" "true" \
+    "tests/component/plugin_update_cli.rs"
+expect "unrelated component test" "false" \
+    "tests/component/skills_bundle_cli.rs"
+
 # The gateway's plugin webhook ingress must run the backend job: its handler,
 # HTTP tests, and golden scenarios compile only under the gateway's
 # `plugins-wasm` feature, which the default-feature Test job never enables.
