@@ -24,7 +24,13 @@ import {
   setToken,
   type AuthMode,
 } from "./auth";
-import { failureReason, fetchThroughRestart, refreshOidcSession } from "./authSession";
+import {
+  failureReason,
+  fetchThroughRestart,
+  NOT_AVAILABLE_REASONS,
+  refreshOidcSession,
+  type AuthFailureReason,
+} from "./authSession";
 import { apiOrigin, basePath } from "./basePath";
 
 // ---------------------------------------------------------------------------
@@ -50,11 +56,12 @@ export class SessionExpiredError extends UnauthorizedError {
 }
 
 /**
- * A 403 `operator_required`: the signed-in account can't use this endpoint.
- * Pages show "Not available for your account".
+ * A 403 `operator_required`, `not_permitted` or `agent_not_allowed`: the
+ * signed-in account can't use this endpoint, operation or agent. Pages show
+ * "Not available for your account".
  */
 export class OperatorRequiredError extends Error {
-  constructor() {
+  constructor(public readonly reason: AuthFailureReason = "operator_required") {
     super("Not available for your account");
     this.name = "OperatorRequiredError";
   }
@@ -251,8 +258,8 @@ async function apiFetchOnce<T>(
 
   if (result.status === 403 && mode === "oidc") {
     const reason = failureReason(result.text);
-    if (reason === "operator_required") {
-      throw new OperatorRequiredError();
+    if (reason && NOT_AVAILABLE_REASONS.has(reason)) {
+      throw new OperatorRequiredError(reason);
     }
     if (reason === "csrf" && !csrfRetried && (await recoverFromCsrfRefusal())) {
       return apiFetchOnce<T>(path, options, true);
@@ -2273,6 +2280,34 @@ export function abortSession(id: string): Promise<{ status: string }> {
   return apiFetch<{ status: string }>(
     `/api/sessions/${encodeURIComponent(id)}/abort`,
     { method: "POST" },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Agents a signed-in account may chat with
+// ---------------------------------------------------------------------------
+
+export interface AvailableAgent {
+  alias: string;
+  enabled: boolean;
+}
+
+/**
+ * `GET /api/agents/available`: the agents this account may chat with, narrowed
+ * to its grants. The agent pages of an account without the operator dashboard
+ * use this instead of the config-based agent list.
+ */
+export function getAvailableAgents(): Promise<AvailableAgent[]> {
+  return apiFetch<{ agents?: unknown }>("/api/agents/available").then((body) =>
+    Array.isArray(body.agents)
+      ? body.agents.flatMap((entry: unknown): AvailableAgent[] => {
+          if (!entry || typeof entry !== "object") return [];
+          const { alias, enabled } = entry as { alias?: unknown; enabled?: unknown };
+          return typeof alias === "string" && alias
+            ? [{ alias, enabled: enabled !== false }]
+            : [];
+        })
+      : [],
   );
 }
 
