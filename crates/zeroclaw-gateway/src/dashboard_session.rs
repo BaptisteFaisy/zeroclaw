@@ -145,6 +145,8 @@ struct Session {
     /// Cancelled on sign-out, expiry or revocation, so long-lived sockets
     /// the session opened can close.
     ended: CancellationToken,
+    /// The chats the session has open on the core.
+    core: Arc<crate::dashboard_core::CoreBinding>,
 }
 
 impl std::fmt::Debug for Session {
@@ -328,6 +330,7 @@ impl DashboardSessions {
             created: now,
             hard_expiry: now.saturating_add(lifetime_secs),
             ended: CancellationToken::new(),
+            core: Arc::default(),
         };
         let view = Arc::new(SessionAuth::from_session(key, &session, None));
         sessions.insert(key, session);
@@ -631,6 +634,15 @@ impl DashboardAuth {
         self
     }
 
+    /// The stop signal of the generation this state is bound to, for a task
+    /// that must end with it. `None` for a state bound to no generation
+    /// ([`DashboardAuth::new`] alone, in unit tests): treat it as none. The
+    /// clone keeps the unseen version, so a stop sent before the call is
+    /// still seen.
+    pub(crate) fn generation_stopping(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
+        self.stopping.clone()
+    }
+
     /// Whether this state's generation was told to stop. A closed channel
     /// counts: once its sender is gone the generation is over.
     pub(crate) fn is_retired(&self) -> bool {
@@ -857,6 +869,35 @@ impl DashboardAuth {
     /// End the session behind `session` (sign-out).
     pub(crate) fn end(&self, session: &SessionAuth) -> bool {
         self.sessions.remove_key(&session.key)
+    }
+
+    /// The token `session` signed in with and the provider it was issued
+    /// by, for its chats' core connections to present, bound to that
+    /// provider, and nothing else. The copy is wiped when dropped like the
+    /// stored one. `None` once the session has ended.
+    pub(crate) fn core_credential(
+        &self,
+        session: &SessionAuth,
+    ) -> Option<crate::dashboard_core::CoreCredential> {
+        self.sessions.sessions.lock().get(&session.key).map(|held| {
+            crate::dashboard_core::CoreCredential {
+                bearer: held.bearer.clone(),
+                pin: held.provider.binding(),
+            }
+        })
+    }
+
+    /// The chats `session` has open on the core. `None` once the session
+    /// has ended.
+    pub(crate) fn core_binding(
+        &self,
+        session: &SessionAuth,
+    ) -> Option<Arc<crate::dashboard_core::CoreBinding>> {
+        self.sessions
+            .sessions
+            .lock()
+            .get(&session.key)
+            .map(|held| Arc::clone(&held.core))
     }
 }
 
