@@ -17,7 +17,8 @@
 # `zeroclaw` test targets. The root binary's plugin modules are listed for the
 # same reason: `mod plugins` and the plugin registry only compile under
 # `plugins-wasm`, so the default-feature Test job cannot run their tests and
-# this job is where they run. `src/main.rs` holds the plugin CLI itself.
+# this job is where they run. `src/main.rs` holds the plugin CLI itself, and
+# the plugin CLI component tests that drive it run only in this job too.
 # The gateway's `/plugin/{path}` ingress is listed for the same reason: its
 # handler and HTTP tests compile only under the gateway's `plugins-wasm`
 # feature, so this job is the only required one that runs them and the plugin
@@ -46,6 +47,7 @@ while IFS= read -r path; do
         tests/channel_websocket_e2e.rs|\
         tests/plugin_channel_runtime_e2e.rs|\
         tests/channel_egress_e2e.rs|\
+        tests/component/plugin_info_cli.rs|tests/component/plugin_update_cli.rs|\
         crates/zeroclaw-gateway/src/plugin_webhook*|\
         crates/zeroclaw-gateway/src/lib.rs|\
         crates/zeroclaw-gateway/Cargo.toml|\
