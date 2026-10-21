@@ -52,6 +52,7 @@ jobs:
           with open(".cargo/audit.toml", "rb") as policy_file:
               ignored = tomllib.load(policy_file).get("advisories", {}).get("ignore", [])
           if "RUSTSEC-2026-0382" in ignored:
+              subprocess.run(["cargo", "fetch", "--locked"], check=True)
               subprocess.run(
                   [sys.executable, "scripts/ci/webpki_advisory_scope.py"], check=True
               )
