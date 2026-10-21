@@ -10645,9 +10645,13 @@ impl RpcDispatcher {
                             };
                             if let Err(error) = persisted {
                                 // Nothing was published, so the live config
-                                // still names `from` and abandoning drops the
-                                // prepared record instead of retiring an
-                                // alias that is still configured.
+                                // still names `from`, but the save may have
+                                // landed before the publication failed.
+                                // Abandoning checks the config file: it keeps
+                                // the record, marked committed, when the save
+                                // wrote the rename there, and drops it only
+                                // when the file still has `from` or lacks
+                                // `to`.
                                 recovery::abandon(&before, armed).await;
                                 return Err(error);
                             }
@@ -36014,6 +36018,86 @@ mod tests {
             let live = dispatcher.ctx.config.read().clone();
             assert!(live.agents.contains_key("converge_to"));
             assert!(!live.agents.contains_key("converge_from"));
+        });
+    }
+
+    #[test]
+    fn config_map_key_rename_keeps_its_record_when_publication_fails_after_the_save() {
+        use zeroclaw_config::agent_recovery_journal::{
+            AgentRecoveryJournal, RecoveryPhase, retired_alias,
+        };
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_stack_size(4 * 1024 * 1024)
+            .enable_all()
+            .build()
+            .expect("four-megabyte-stack Tokio runtime");
+
+        runtime.block_on(async {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = make_secret_test_config(&tmp);
+            config.create_map_key("agents", "landed_from").unwrap();
+            config.save().await.unwrap();
+            let config_path = config.config_path.clone();
+            let save_gate =
+                zeroclaw_config::schema::test_post_replace_pause_gate::arm(config_path.clone());
+            let dispatcher = make_config_set_test_dispatcher(config);
+            let handle = dispatcher.spawn_handle();
+            let rename = zeroclaw_spawn::spawn!(async move {
+                let params = json!({
+                    "path": "agents",
+                    "from": "landed_from",
+                    "to": "landed_to",
+                });
+                handle.handle_config_map_key_rename(&params).await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), save_gate.wait_paused())
+                .await
+                .expect("the rename pauses after its save replaced the config file");
+            // The rename allocated its revision before saving. Another
+            // publication takes that revision now, so the rename's own
+            // publication is refused after its save has landed.
+            publish_test_config(&dispatcher.ctx, |_| {});
+            save_gate.release();
+            let error = tokio::time::timeout(std::time::Duration::from_secs(5), rename)
+                .await
+                .expect("the rename finishes")
+                .expect("the rename task joins")
+                .expect_err("a refused publication fails the rename");
+            assert!(
+                error.message.contains("Config publication failed"),
+                "{}",
+                error.message
+            );
+
+            // The live config never took the rename; the config file did.
+            let live = dispatcher.ctx.config.read().clone();
+            assert!(live.agents.contains_key("landed_from"));
+            assert!(!live.agents.contains_key("landed_to"));
+            let on_disk: toml::Table = std::fs::read_to_string(&config_path)
+                .unwrap()
+                .parse()
+                .unwrap();
+            let agents = on_disk["agents"].as_table().unwrap();
+            assert!(
+                !agents.contains_key("landed_from") && agents.contains_key("landed_to"),
+                "{agents:?}"
+            );
+
+            // So the record survives, committed: the old alias stays retired
+            // once the file is loaded again, and the rename can be finished.
+            let records = AgentRecoveryJournal::for_config(&live).load().unwrap();
+            assert_eq!(records.len(), 1, "{records:?}");
+            assert_eq!(
+                (
+                    records[0].from.as_str(),
+                    records[0].to.as_str(),
+                    records[0].phase
+                ),
+                ("landed_from", "landed_to", RecoveryPhase::Committed)
+            );
+            assert!(retired_alias(&live, "landed_from").unwrap().is_some());
         });
     }
 

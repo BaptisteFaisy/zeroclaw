@@ -65,6 +65,9 @@ const KEY_REFUSED: &str = "agents.rename_recovery.refused";
 const KEY_UNREADABLE: &str = "agents.rename_recovery.unreadable";
 const KEY_RECORD_FAILED: &str = "agents.rename_recovery.record_failed";
 const KEY_ABANDONED: &str = "agents.rename_recovery.abandoned";
+const KEY_COMMIT_LANDED_ON_DISK: &str = "agents.rename_recovery.commit_landed_on_disk";
+const KEY_ABANDON_KEPT_UNREADABLE_CONFIG: &str =
+    "agents.rename_recovery.abandon_kept_unreadable_config";
 
 /// Store handles a rename surface already holds. `None` means the surface
 /// holds no handle for that store, not that the store is unconfigured: the
@@ -483,6 +486,15 @@ pub async fn acknowledge_commit(config_after_commit: &Config, armed: Armed) {
 /// A `config` that does not prove the commit failed, one without `from` or
 /// with both aliases, keeps the record, so the rename's recovery is not
 /// lost.
+///
+/// `config` alone cannot prove it either when the surface saves the config
+/// and then publishes it: a publication that fails after the save leaves the
+/// live config without the rename while the config file already holds it. So
+/// the file at `config.config_path` decides too. A file that no longer has
+/// `from` but has `to` holds the commit: the record is kept and marked
+/// committed, which no config voids, so `from` stays retired once the file
+/// is loaded again. A file that cannot be read or parsed keeps the record as
+/// it is. Only a file that still has `from`, or lacks `to`, drops it.
 pub async fn abandon(config: &Config, armed: Armed) {
     let Armed { record, guard } = armed;
     let (from, to) = (record.from.clone(), record.to.clone());
@@ -495,17 +507,70 @@ pub async fn abandon(config: &Config, armed: Armed) {
         return;
     }
     let journal = AgentRecoveryJournal::for_config(config);
-    let alias = from.clone();
-    let removed = tokio::task::spawn_blocking(move || {
-        let removed = journal.remove(&guard, RecoveryOperation::Rename, &alias);
+    let config_path = config.config_path.clone();
+    // The file is read while the lock is still held, so no other lifecycle
+    // operation can collect the record before it is settled.
+    let settled = tokio::task::spawn_blocking(move || {
+        let on_disk = commit_on_disk(&config_path, &record.from, &record.to);
+        let written = match &on_disk {
+            CommitOnDisk::Absent => journal
+                .remove(&guard, RecoveryOperation::Rename, &record.from)
+                .map(|_| ()),
+            CommitOnDisk::Landed => journal.upsert(
+                &guard,
+                RecoveryRecord {
+                    phase: RecoveryPhase::Committed,
+                    ..record
+                },
+            ),
+            CommitOnDisk::Unknown(_) => Ok(()),
+        };
         drop(guard);
-        removed
+        (on_disk, written)
     })
     .await;
-    match removed {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => log_record_failed(&from, &to, &e.to_string()),
-        Err(e) => log_record_failed(&from, &to, &e.to_string()),
+    let (on_disk, written) = match settled {
+        Ok(settled) => settled,
+        Err(e) => {
+            log_record_failed(&from, &to, &e.to_string());
+            return;
+        }
+    };
+    match on_disk {
+        CommitOnDisk::Absent => {}
+        CommitOnDisk::Landed => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "error_key": KEY_COMMIT_LANDED_ON_DISK,
+                        "from": from,
+                        "to": to,
+                        "config_path": config.config_path.display().to_string(),
+                        "marked_committed": written.is_ok(),
+                    })),
+                "agent rename failed after its config save landed; its record is kept, so the old alias stays retired once the config is reloaded; re-run the same rename then to finish it"
+            );
+        }
+        CommitOnDisk::Unknown(detail) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "error_key": KEY_ABANDON_KEPT_UNREADABLE_CONFIG,
+                        "from": from,
+                        "to": to,
+                        "config_path": config.config_path.display().to_string(),
+                        "error": detail,
+                    })),
+                "agent rename failed and the config file could not be read to tell whether its save landed; the prepared record is kept"
+            );
+        }
+    }
+    if let Err(e) = written {
+        log_record_failed(&from, &to, &e.to_string());
     }
 }
 
@@ -991,6 +1056,47 @@ fn new_record(
         phase,
         source_workspace,
         armed_at: chrono::Utc::now().to_rfc3339(),
+    }
+}
+
+/// Whether a rename's config commit is in the config file, as [`abandon`]
+/// reads it.
+#[derive(Debug, PartialEq, Eq)]
+enum CommitOnDisk {
+    /// The `agents` table no longer has `from` and has `to`: the save landed.
+    Landed,
+    /// The file still has `from`, or lacks `to`: the save never landed.
+    Absent,
+    /// The file could not be read or parsed, so whether the save landed is
+    /// unknown. Carries why.
+    Unknown(String),
+}
+
+/// Read whether the rename of `from` to `to` landed in the config file at
+/// `path`. Only the TOML is parsed: no migration, environment override, or
+/// secret handling runs, and the aliases are looked up among the parsed keys
+/// of the `agents` table, so a quoted key matches the same as a bare one.
+/// The read is blocking file I/O.
+fn commit_on_disk(path: &Path, from: &str, to: &str) -> CommitOnDisk {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) => return CommitOnDisk::Unknown(e.to_string()),
+    };
+    let file = match text.parse::<toml::Table>() {
+        Ok(file) => file,
+        // The message alone: the full error quotes the offending line, which
+        // may hold a secret.
+        Err(e) => return CommitOnDisk::Unknown(e.message().to_string()),
+    };
+    let agents = match file.get("agents") {
+        None => return CommitOnDisk::Absent,
+        Some(toml::Value::Table(agents)) => agents,
+        Some(_) => return CommitOnDisk::Unknown("`agents` is not a table".to_string()),
+    };
+    if !agents.contains_key(from) && agents.contains_key(to) {
+        CommitOnDisk::Landed
+    } else {
+        CommitOnDisk::Absent
     }
 }
 
@@ -2138,6 +2244,20 @@ mod tests {
         let armed = arm(before, FROM, TO).await.unwrap();
         let after = committed(before);
         acknowledge_commit(&after, armed).await;
+        after
+    }
+
+    /// Save the rename of `from` to `to` over the config file `before` was
+    /// saved to, the way a surface saves it: an incremental save of the
+    /// cascade's dirty paths. Returns the config the file now holds.
+    async fn save_renamed(before: &Config, from: &str, to: &str) -> Config {
+        let mut after = before.clone();
+        let report =
+            alias_refs::rename_with_cascade(&mut after, &AliasKind::Agent, from, to).unwrap();
+        for path in &report.dirty_paths {
+            after.mark_dirty(path);
+        }
+        after.save_dirty().await.unwrap();
         after
     }
 
@@ -3799,6 +3919,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let before = fixture(&tmp, &[FROM]);
         let source = seed_workspace(&before, FROM);
+        // The config file still holds the old alias: the save never landed.
+        before.save().await.unwrap();
 
         let armed = arm(&before, FROM, TO).await.unwrap();
         // While one surface is between its arm and its commit, no other can arm.
@@ -3839,6 +3961,145 @@ mod tests {
         abandon(&after, armed).await;
         assert_eq!(records(&after).len(), 1);
         assert!(retired_alias(&after, FROM).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn abandoning_a_rename_whose_save_landed_keeps_its_record_committed() {
+        let tmp = TempDir::new().unwrap();
+        let before = fixture(&tmp, &[FROM, "owl"]);
+        let source = seed_workspace(&before, FROM);
+        before.save().await.unwrap();
+        let armed = arm(&before, FROM, TO).await.unwrap();
+        // The save lands and the publication after it fails, so the surface
+        // abandons with the config it started from, which still has the old
+        // alias and lacks the new one.
+        let after = save_renamed(&before, FROM, TO).await;
+        assert_eq!(
+            commit_on_disk(&before.config_path, FROM, TO),
+            CommitOnDisk::Landed
+        );
+        abandon(&before, armed).await;
+
+        let recorded = records(&before);
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(
+            (
+                recorded[0].from.as_str(),
+                recorded[0].to.as_str(),
+                recorded[0].phase
+            ),
+            (FROM, TO, RecoveryPhase::Committed)
+        );
+        assert_eq!(
+            recorded[0].source_workspace.as_deref(),
+            Some(source.as_path())
+        );
+        // Committed, the record is not void beside the stale config either,
+        // so another rename armed and abandoned from it leaves it alone.
+        let other = arm(&before, "owl", "wolf").await.unwrap();
+        abandon(&before, other).await;
+        assert_eq!(records(&before), recorded);
+
+        // Once the config is loaded from the file again, the old alias stays
+        // retired and re-running the same rename finishes it.
+        assert!(retired_alias(&after, FROM).unwrap().is_some());
+        assert!(matches!(
+            ensure_alias_not_retired(&after, FROM).await,
+            Err(RenameRecoveryError::AliasRetired { .. })
+        ));
+        let stores = SurfaceStores::none();
+        assert_eq!(
+            resolve(&after, FROM, TO, &stores).await.unwrap(),
+            Disposition::Resume
+        );
+        let outcome = converge(&after, FROM, TO, &stores).await.unwrap();
+        assert!(outcome.is_converged(), "{:?}", outcome.warnings());
+        assert!(outcome.report().workspace_moved);
+        assert!(!source.exists());
+        assert!(records(&after).is_empty());
+    }
+
+    #[tokio::test]
+    async fn abandoning_keeps_the_record_when_the_config_file_cannot_be_read() {
+        for case in ["missing", "a directory", "not toml", "agents not a table"] {
+            let tmp = TempDir::new().unwrap();
+            let before = fixture(&tmp, &[FROM]);
+            match case {
+                "missing" => {}
+                "a directory" => std::fs::create_dir_all(&before.config_path).unwrap(),
+                "not toml" => std::fs::write(&before.config_path, "[agents.scout\n").unwrap(),
+                _ => std::fs::write(&before.config_path, "agents = \"scout\"\n").unwrap(),
+            }
+            let armed = arm(&before, FROM, TO).await.unwrap();
+            abandon(&before, armed).await;
+
+            // Whether the save landed is unknown, so the record is kept as
+            // it was: prepared, and void while the config has the old alias
+            // and lacks the new one, so it retires nothing.
+            let recorded = records(&before);
+            assert_eq!(recorded.len(), 1, "{case}: {recorded:?}");
+            assert_eq!(recorded[0].phase, RecoveryPhase::Prepared, "{case}");
+            assert_eq!(retired_alias(&before, FROM).unwrap(), None, "{case}");
+            assert!(
+                ensure_alias_not_retired(&before, FROM).await.is_ok(),
+                "{case}"
+            );
+            assert_eq!(
+                resolve(&before, FROM, TO, &SurfaceStores::none())
+                    .await
+                    .unwrap(),
+                Disposition::Fresh,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_commit_on_disk_is_read_off_the_parsed_agent_keys() {
+        // A legacy alias that TOML accepts only as a quoted key.
+        const QUOTED: &str = "Old Agent";
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        let read = |text: &str| {
+            std::fs::write(&path, text).unwrap();
+            commit_on_disk(&path, QUOTED, MIGRATED)
+        };
+
+        for landed in [
+            "[agents.legacy_agent]\nenabled = true\n",
+            "[agents.\"legacy_agent\"]\n",
+            "[agents]\nlegacy_agent = { enabled = true }\n",
+            "agents.legacy_agent.enabled = true\n",
+            "# [agents.\"Old Agent\"]\n[agents.'legacy_agent']\n",
+        ] {
+            assert_eq!(read(landed), CommitOnDisk::Landed, "{landed}");
+        }
+        for absent in [
+            "[agents.\"Old Agent\"]\n",
+            "[agents.'Old Agent']\n[agents.legacy_agent]\n",
+            "[agents]\n\"Old Agent\" = { enabled = true }\nlegacy_agent = {}\n",
+            "[agents]\n",
+            "schema_version = 3\n# [agents.legacy_agent]\n",
+        ] {
+            assert_eq!(read(absent), CommitOnDisk::Absent, "{absent}");
+        }
+        for unknown in [
+            "[agents.\"Old Agent\"\n",
+            "agents = [\"legacy_agent\"]\n",
+            "api_key = \"sk-not-for-logs\n[agents.legacy_agent]\n",
+        ] {
+            match read(unknown) {
+                CommitOnDisk::Unknown(detail) => assert!(
+                    !detail.contains("sk-not-for-logs"),
+                    "the file's contents stay out of the detail: {detail}"
+                ),
+                other => panic!("{unknown}: {other:?}"),
+            }
+        }
+        assert!(matches!(
+            commit_on_disk(&tmp.path().join("missing.toml"), QUOTED, MIGRATED),
+            CommitOnDisk::Unknown(_)
+        ));
     }
 
     #[tokio::test]

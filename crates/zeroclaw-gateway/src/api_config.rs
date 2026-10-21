@@ -2432,9 +2432,12 @@ async fn rename_agent_cascade(
                         }
                         Err(error) => {
                             // Nothing was swapped in, so the live config
-                            // still names `from` and abandoning drops the
-                            // prepared record instead of retiring an alias
-                            // that is still configured.
+                            // still names `from`, but the save may have
+                            // landed before the publication failed.
+                            // Abandoning checks the config file: it keeps
+                            // the record, marked committed, when the save
+                            // wrote the rename there, and drops it only when
+                            // the file still has `from` or lacks `to`.
                             recovery::abandon(&before, armed).await;
                             return Err(error);
                         }
@@ -5351,16 +5354,22 @@ mod tests {
         // In-memory config was never swapped: still names `from`.
         assert!(state.config.read().agents.contains_key("from"));
         assert!(!state.config.read().agents.contains_key("to"));
-        // The commit never landed, so the rename retired nothing and left no
-        // recovery record behind.
+        // The commit never landed, so the rename retired nothing. The config
+        // path is not a readable file, so whether the save landed cannot be
+        // told and the prepared record is kept: void while the config has
+        // `from` and lacks `to`, and dropped by the next arm.
         assert_eq!(
             zeroclaw_config::agent_recovery_journal::retired_alias(&config, "from").unwrap(),
             None
         );
-        assert!(
-            !zeroclaw_config::agent_recovery_journal::AgentRecoveryJournal::for_config(&config)
-                .path()
-                .exists()
+        let records =
+            zeroclaw_config::agent_recovery_journal::AgentRecoveryJournal::for_config(&config)
+                .load()
+                .unwrap();
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(
+            records[0].phase,
+            zeroclaw_config::agent_recovery_journal::RecoveryPhase::Prepared
         );
     }
 
