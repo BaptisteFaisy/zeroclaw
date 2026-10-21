@@ -1740,9 +1740,12 @@ mod tests {
         let release =
             std::fs::read_to_string(root().join(".github/workflows/release-stable-manual.yml"))
                 .unwrap();
-        assert!(release.contains(
-            "features --selection \"${{ matrix.distribution }}\" --target \"${{ matrix.target }}\""
-        ));
+        let shared = std::fs::read_to_string(
+            root().join(".github/actions/build-release-payloads/action.yml"),
+        )
+        .unwrap();
+        assert!(shared.contains("RELEASE_TARGET: ${{ inputs.target }}"));
+        assert!(shared.contains("features --selection dist --target \"$RELEASE_TARGET\""));
         assert!(!release.contains("excluded_features"));
         // The stable release build MUST pin --no-default-features against the
         // generator's explicit per-target list, exactly like the manual workflow.
@@ -1752,8 +1755,8 @@ mod tests {
         // string checks below do NOT catch that, since the leaked feature never
         // appears as a literal in the workflow.
         assert!(
-            release.contains(
-                "$BUILD_CMD --release --locked --no-default-features --features \"${FEATURES}\" --target ${{ matrix.target }}"
+            shared.contains(
+                "$BUILD_CMD --release --locked --no-default-features --features \"${FEATURES}\" --target \"$RELEASE_TARGET\""
             ),
             "the stable release build must pin --no-default-features so target-excluded default features cannot leak back in"
         );
@@ -1783,68 +1786,264 @@ mod tests {
                 "default: dist\n        options:\n          - dist\n          - dist-broad"
             )
         );
-        assert!(
-            manual.contains(
-                "timeout-minutes: ${{ inputs.distribution == 'dist-broad' && 90 || 40 }}"
-            )
-        );
-        assert!(manual.contains("--selection \"${{ inputs.distribution }}\""));
-        assert!(manual.contains("echo \"- Binary bytes: $bytes\""));
-        assert!(manual.contains("echo \"- Resolved features: \\`$FEATURES\\`\""));
-        assert!(manual.contains("echo \"- SHA-256: $sha256\""));
+        for (document, job, emit) in [
+            (&release, "  build:\n", "false"),
+            (&manual, "  stable-gnu-build:\n", "true"),
+        ] {
+            let caller = job_block(job_block(document, job), "      - name: Build release\n");
+            assert!(caller.contains("uses: ./.github/actions/build-release-payloads"));
+            for binding in [
+                "target: ${{ matrix.target }}",
+                "linker_env: ${{ matrix.linker_env || '' }}",
+                "linker: ${{ matrix.linker || '' }}",
+                "use_cross: ${{ matrix.use_cross || 'false' }}",
+            ] {
+                assert!(
+                    caller.contains(binding),
+                    "missing shared-recipe binding: {binding}"
+                );
+            }
+            assert!(caller.contains(&format!("emit_features: '{emit}'")));
+            assert!(!caller.contains("run:") && !caller.contains("shell:"));
+        }
+        let normal = job_block(&manual, "  build:\n");
+        assert!(normal.contains(
+            "\n    timeout-minutes: ${{ (matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-apple-darwin') && 180 || 90 }}\n"
+        ));
+        assert!(normal.contains("--selection \"${{ inputs.distribution }}\""));
+        assert!(normal.contains("echo \"- Binary bytes: $bytes\""));
+        assert!(normal.contains("echo \"- Resolved features: \\`$FEATURES\\`\""));
+        assert!(normal.contains("echo \"- SHA-256: $sha256\""));
         for target in ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"] {
-            assert!(manual.contains(&format!(
+            assert!(normal.contains(&format!(
                 "- os: ubuntu-latest\n            target: {target}\n            use_cross: true"
             )));
         }
-        assert!(manual.contains(cross_install));
-        assert!(!manual.contains("cargo install cross"));
-        assert!(manual.contains(
-            "if [ \"${{ matrix.use_cross || 'false' }}\" = \"true\" ]; then\n              echo \"BUILD_CMD=cross build\""
+        assert!(normal.contains(cross_install));
+        assert!(!normal.contains("cargo install cross"));
+        assert!(normal.contains(
+            "if [ \"${{ matrix.use_cross || 'false' }}\" = \"true\" ]; then\n              echo \"BUILD_CMD=cross build${dist_build_jobs}\""
         ));
-        assert!(manual.contains("echo \"BUILD_CMD=cargo build\""));
-        assert!(manual.contains(
+        assert!(normal.contains("echo \"BUILD_CMD=cargo build${dist_build_jobs}\""));
+        assert!(normal.contains(
             "prefix-key: ${{ matrix.os }}-${{ matrix.target }}\n          cache-targets: false\n          save-if: ${{ github.ref == 'refs/heads/master' }}"
         ));
-        assert!(manual.contains(
+        assert!(normal.contains(
             "$BUILD_CMD --release --locked --no-default-features --features \"${FEATURES}\" --target ${{ matrix.target }}"
         ));
-        assert!(manual.contains(
+        assert!(normal.contains(
             "run: $BUILD_CMD --release --locked -p zerocode --target ${{ matrix.target }}"
         ));
-        assert!(manual.contains(
+        assert!(normal.contains(
             "run: $BUILD_CMD --release --locked -p zerorelay --target ${{ matrix.target }}"
         ));
         assert_eq!(
-            manual
+            normal
                 .matches("if: matrix.target != 'aarch64-linux-android'")
                 .count(),
             4,
             "the ZeroCode and ZeroRelay builds and uploads must all skip Android"
         );
-        assert!(!manual.contains("excluded_features"));
+        assert!(!normal.contains("excluded_features"));
 
-        let target_env = manual.find("- name: Configure target environment").unwrap();
-        let release_step = manual.find("- name: Build release").unwrap();
-        let zeroclaw_upload = manual
+        let target_env = normal.find("- name: Configure target environment").unwrap();
+        let release_step = normal.find("- name: Build release").unwrap();
+        let zeroclaw_upload = normal
             .find("name: zeroclaw-manual-${{ inputs.distribution }}-${{ matrix.target }}")
             .unwrap();
-        let companion = manual.find("- name: Build ZeroCode companion").unwrap();
+        let companion = normal.find("- name: Build ZeroCode companion").unwrap();
         assert!(
             target_env < release_step
                 && release_step < zeroclaw_upload
                 && zeroclaw_upload < companion
         );
         assert!(
-            manual[target_env..release_step]
+            normal[target_env..release_step]
                 .contains("echo \"${{ matrix.linker_env }}=${{ matrix.linker }}\"")
         );
-        assert!(manual[target_env..release_step].contains(">> \"$GITHUB_ENV\""));
-        assert!(!manual[release_step..companion].contains("matrix.linker_env"));
+        assert!(normal[target_env..release_step].contains(">> \"$GITHUB_ENV\""));
+        assert!(!normal[release_step..companion].contains("matrix.linker_env"));
+
+        let stable_build = job_block(&release, "  build:\n");
+        assert_eq!(
+            stable_build
+                .matches("run: bash scripts/ci/package_release_archive.sh")
+                .count(),
+            2,
+            "both Stable platform steps must consume the one shared archive writer"
+        );
+        assert!(!stable_build.contains("mkdir -p staging/web"));
+        let manual_build = job_block(&manual, "  build:\n");
+        assert!(manual_build.contains("BINARY_SIZE_HARD_LIMIT: \"83886080\""));
+        assert!(
+            manual_build.contains(
+                "bash scripts/ci/package_release_archive.sh \"$target\" \"$main\" \"$ext\" \"$RUNNER_OS\""
+            )
+        );
+        assert!(
+            manual_build
+                .contains("--web-dist web/dist --source \"$GITHUB_SHA\" --target \"$target\"")
+        );
+        assert!(manual_build.contains("--output archive-evidence/input-manifest.json"));
+        assert!(
+            manual_build.contains("--run \"$GITHUB_RUN_ID\" --attempt \"$GITHUB_RUN_ATTEMPT\"")
+        );
+        assert!(manual_build.contains("if [ \"$target\" != aarch64-linux-android ]; then"));
+        let native_smoke = job_block(&manual, "  plugin-smoke:\n");
+        assert!(native_smoke.contains("if: inputs.distribution != 'dist'"));
+        assert!(
+            native_smoke
+                .contains("name: zeroclaw-manual-${{ inputs.distribution }}-${{ matrix.target }}")
+        );
+        assert!(native_smoke.contains("name: zeroclaw-manual-archive-dist-${{ matrix.target }}"));
+        assert!(
+            native_smoke
+                .contains("--expected-source \"$GITHUB_SHA\" --expected-target \"$target\"")
+        );
+        assert!(native_smoke.contains(
+            "--expected-run \"$GITHUB_RUN_ID\" --expected-attempt \"$GITHUB_RUN_ATTEMPT\""
+        ));
+        assert!(native_smoke.contains("archive_args=(--archive \"$SMOKE_ARCHIVE\")"));
+        assert!(native_smoke.contains("SMOKE_ARCHIVE: ${{ steps.archive.outputs.archive }}"));
+        assert!(native_smoke.contains("${archive_args[@]+\"${archive_args[@]}\"}"));
+        assert!(
+            native_smoke.find("Run scripted provider tests").unwrap()
+                < native_smoke
+                    .find("Run the plugin smoke against the built binary")
+                    .unwrap()
+        );
 
         for feature in exclusions.values().flatten() {
             assert!(!release.contains(feature));
             assert!(!manual.contains(feature));
+            assert!(!shared.contains(feature));
+        }
+    }
+
+    /// One job's YAML block: from its header line to the next line at the
+    /// same or a shallower indent.
+    fn job_block<'a>(document: &'a str, header: &str) -> &'a str {
+        let header_indent = header.len() - header.trim_start().len();
+        let start = document
+            .match_indices(header)
+            .find_map(|(offset, _)| {
+                (offset == 0 || document.as_bytes().get(offset - 1) == Some(&b'\n'))
+                    .then_some(offset)
+            })
+            .unwrap_or_else(|| panic!("workflow is missing YAML block: {header}"));
+        let remainder = &document[start + header.len()..];
+        let mut offset = 0;
+        for line in remainder.split_inclusive('\n') {
+            let trimmed = line.trim();
+            let indent = line.len() - line.trim_start().len();
+            if !trimmed.is_empty() && !trimmed.starts_with('#') && indent <= header_indent {
+                return &remainder[..offset];
+            }
+            offset += line.len();
+        }
+        remainder
+    }
+
+    #[test]
+    fn workflow_job_block_retains_outdented_comments_until_the_next_job() {
+        let release =
+            std::fs::read_to_string(root().join(".github/workflows/release-stable-manual.yml"))
+                .unwrap();
+        assert!(release.contains("\n# >>> end generated:release-distributions <<<\n"));
+        let build = job_block(&release, "  build:\n");
+        assert!(build.contains("uses: ./.github/actions/build-release-payloads"));
+        assert_eq!(matrix_targets(build).len(), 10);
+        assert!(!build.contains("  build-desktop:\n"));
+        let annotated = release.replacen(
+            "\n  build-desktop:\n",
+            "\n# comment before the next real job\n  build-desktop:\n",
+            1,
+        );
+        assert_ne!(annotated, release);
+        let retained = job_block(&annotated, "  build:\n");
+        assert!(retained.contains("# comment before the next real job"));
+        assert_eq!(matrix_targets(retained), matrix_targets(build));
+        assert!(retained.contains("uses: ./.github/actions/build-release-payloads"));
+        assert!(!retained.contains("  build-desktop:\n"));
+    }
+
+    /// The `target:` entries of one job's matrix, whether an entry starts
+    /// with the target or lists it after another field.
+    fn matrix_targets(job: &str) -> Vec<String> {
+        job_block(job_block(job, "    strategy:\n"), "      matrix:\n")
+            .lines()
+            .map(|line| line.trim())
+            .map(|line| line.strip_prefix("- ").unwrap_or(line))
+            .filter_map(|line| line.strip_prefix("target: "))
+            .filter(|target| !target.trim_start().starts_with('['))
+            .map(|target| target.trim().to_owned())
+            .collect()
+    }
+
+    /// A release target carries a plugin backend exactly when the stable
+    /// release executes a plugin from that target's archive. A target cannot
+    /// claim plugin support without that proof, and a smoke leg cannot be
+    /// dropped while the artifact still carries the host. The manual
+    /// cross-platform workflow rehearses the same legs.
+    #[test]
+    fn release_targets_carry_a_plugin_backend_only_with_a_smoke_leg() {
+        let release =
+            std::fs::read_to_string(root().join(".github/workflows/release-stable-manual.yml"))
+                .unwrap();
+        let manual = std::fs::read_to_string(
+            root().join(".github/workflows/cross-platform-build-manual.yml"),
+        )
+        .unwrap();
+        let build_targets = matrix_targets(job_block(&release, "  build:\n"));
+        let smoke_targets = matrix_targets(job_block(&release, "  plugin-smoke:\n"));
+        assert!(!build_targets.is_empty(), "no release build legs parsed");
+        assert!(!smoke_targets.is_empty(), "no plugin smoke legs parsed");
+        assert_eq!(
+            matrix_targets(job_block(&manual, "  plugin-smoke:\n")),
+            smoke_targets,
+            "the manual workflow must rehearse exactly the release smoke legs"
+        );
+        assert_eq!(
+            matrix_targets(job_block(&manual, "  stable-gnu-build:\n")),
+            [
+                "x86_64-unknown-linux-gnu",
+                "aarch64-unknown-linux-gnu",
+                "armv7-unknown-linux-gnueabihf",
+                "arm-unknown-linux-gnueabihf",
+            ]
+        );
+        assert_eq!(
+            matrix_targets(job_block(&manual, "  stable-gnu-plugin-smoke:\n")),
+            ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+        );
+        let release_build = job_block(&release, "  build:\n");
+        for outside in ["outside-matrix", "x86_64-unknown-linux-gnu"] {
+            let contaminated = release_build.replacen(
+                "target: ${{ matrix.target }}",
+                &format!("target: {outside}"),
+                1,
+            );
+            assert_ne!(contaminated, release_build);
+            assert_eq!(matrix_targets(&contaminated), build_targets);
+        }
+        for target in &smoke_targets {
+            assert!(
+                build_targets.contains(target),
+                "plugin smoke leg {target} has no release build leg"
+            );
+        }
+        for target in &build_targets {
+            let features =
+                resolve_feature_list_for_target(&root(), &Selection::Dist, Some(target)).unwrap();
+            let carries_backend = features
+                .iter()
+                .any(|feature| feature.starts_with("plugins-wasm"));
+            assert_eq!(
+                carries_backend,
+                smoke_targets.contains(target),
+                "{target}: a plugin backend in the distribution set ({carries_backend}) must \
+                 come with a release smoke leg, and only then"
+            );
         }
     }
 

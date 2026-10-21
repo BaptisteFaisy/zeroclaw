@@ -67,8 +67,12 @@ mod tests {
         assert!(!build.contains("dist-compat"));
         assert!(!build.contains("matrix.suffix"));
         assert!(build.contains("name: zeroclaw-${{ matrix.target }}"));
-        assert!(build.contains(
-            "features --selection \"${{ matrix.distribution }}\" --target \"${{ matrix.target }}\""
-        ));
+        assert!(build.contains("uses: ./.github/actions/build-release-payloads"));
+        assert!(build.contains("target: ${{ matrix.target }}"));
+        let recipe =
+            std::fs::read_to_string(root.join(".github/actions/build-release-payloads/action.yml"))
+                .unwrap();
+        assert!(recipe.contains("RELEASE_TARGET: ${{ inputs.target }}"));
+        assert!(recipe.contains("features --selection dist --target \"$RELEASE_TARGET\""));
     }
 }

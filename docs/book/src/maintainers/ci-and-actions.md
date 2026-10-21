@@ -203,6 +203,61 @@ Every dispatch also runs a small release-tool smoke matrix independently of the 
 
 MUSL build legs also install `cross` through `scripts/ci/install_release_tool.sh`, which downloads the exact pinned upstream release asset and verifies its SHA-256 before installing it. The required Repository Structure job tests the supported runner-to-asset mapping and the smoke workflow contract without making network calls.
 
+The default `qualification_profile: normal` retains the full matrix, the
+`dist-broad` raw-binary smoke route, the standard `dist` archive route, the
+normal cache policies, and the existing ARM64 memory lifecycle and macOS
+180-minute ceiling. Its five jobs keep `CARGO_INCREMENTAL=0` at job scope.
+The release-tool smoke validates the dispatch inputs before installing tools;
+normal product jobs retain their independent scheduling.
+
+Select `qualification_profile: stable-gnu-ubuntu22` with `distribution: dist`
+and `release_tools_only: false` for a finite, nonpublishing qualification.
+Empty, unknown, malformed, broad-distribution, or tools-only combinations are
+refused. Four GNU build rows run on Ubuntu22: x86_64, aarch64, armv7, and arm.
+They call the same local `build-release-payloads` action as Stable, with its
+existing linker and ARMv6 bindings, Rust1.98, locked release profile, explicit
+canonical features, ordinary Cargo jobs, three payloads per row, 90-minute
+ceiling, and inclusive 83,886,080-byte main-binary cap. Only the qualifier
+enables the action's features output; its manifest consumes that single
+resolution. Stable leaves the evidence switch off.
+
+Separate web and fixture producers use the existing entrypoints and Stable
+toolchain setup. These three build roles call the pinned Swatinem action
+directly with the original `web`, `plugin-smoke-packages`, and `build` shared
+keys. The fixture prefix and each Ubuntu22 target prefix match Stable, and
+default target restoration remains enabled. Every qualifier cache uses
+`save-if: false`, even on master. These roles omit the workflow/job
+`CARGO_INCREMENTAL` declaration, matching Stable. The pinned cache action
+exports `CARGO_INCREMENTAL=0` before constructing its cache configuration
+and leaves that value in subsequent steps. Producer receipts require and
+record the effective string `"0"`; completeness checks the same value.
+The action-exported value is retained. The normal web cache policy is unchanged.
+Action logs must supply the actual primary key, restore keys, hit, and cache
+source before cache parity can be accepted. These inputs guarantee neither a
+warm cache nor a later Stable build duration.
+
+The two native consumers run x86 GNU on Ubuntu22 and ARM64 GNU on Ubuntu24-arm,
+with 30-minute ceilings. Each verifies and extracts its same-run archive,
+runs the full verbose scripted-provider suite within five minutes, and
+unconditionally invokes the archive-aware plugin smoke. There is no raw
+fallback. The selected completeness job runs even after an upstream failure
+and rejects every missing, skipped, failed, or cancelled role. It checks four
+archives with the unchanged verifier, twelve input hashes and their saved
+ELF, compiler/sysroot and resource observations, and two native evidence
+carriers. Source commit, tree, run, attempt, profile, web and fixture hashes
+bind the receipts to one dispatch.
+
+Before accepting this route, retain the actual cache receipts, interpret all
+twelve ABI observations, and inspect each native carrier's named thirteen
+provider tests and eighteen archive controls. A successful job or carrier
+inventory alone does not replace those results or maintainer review. Missing
+or uninterpretable evidence holds acceptance; it does not authorize an
+automatic budget, resource, feature, or ABI-policy change. Ubuntu24 ARM64
+execution is not Ubuntu22 ARM64 runtime proof. ARM32, companion execution,
+Darwin, MUSL, Android, Windows, Stable's full matrix, and release
+readiness require their own evidence. A source change alone proves none of
+these runtime results.
+
 ### Cross-Platform Clippy (`cross-platform-clippy.yml`)
 
 Manual and weekly scheduled advisory lint coverage on macOS aarch64 and Windows x86_64 targets. It mirrors the required PR lint command with `--target` set for each platform, but intentionally does not run on PRs and is not part of `CI Required Gate`.
@@ -217,6 +272,22 @@ Downloadable assets use GitHub-hosted Build Level 2 attestations. Offline
 bundles and trusted-root material ship inside one verification archive, and
 both SBOM formats are checksummed and attested before the release is created.
 Cosign remains limited to GHCR image signing.
+
+Every 64-bit archive except the experimental Android one carries the WASM
+plugin host, and a dispatched release proves it before the GitHub Release and
+its own image pushes: `plugin-smoke-packages` builds the fixture plugin
+packages once on Linux, and `plugin-smoke` downloads each archive on a runner
+of its own platform and runs `scripts/ci/plugin_artifact_smoke.sh` against the
+packaged binary (the same script the `check-plugin-backends` smoke leg runs on
+pull requests). `publish` and `docker` wait for every leg. An xtask test keeps
+the leg list equal to the registry's per-target plugin policy, so a target
+cannot carry the host without a leg or lose its leg while it still carries the
+host. The build legs fail any binary over the 80 MiB cap set on the size
+check step. The manual Cross-Platform Build workflow rehearses the same legs
+against the binaries it builds, so a distribution change is measured and proven
+from one dispatch before a release runs. A release started by a tag push also
+triggers Docker Publish on its own `v*` tag trigger, and that run does not wait
+for the smoke.
 
 See the [Release Runbook](./release-runbook.md) for the full procedure.
 
