@@ -760,7 +760,7 @@ jobs:
     needs: [master-debounce]
     if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 20
+    timeout-minutes: ${{ matrix.timeout-minutes || 20 }}
     strategy:
       fail-fast: false
       matrix:
@@ -777,6 +777,9 @@ jobs:
             features: plugins-wasm-cranelift
             suite: runtime
             cache-key: plugins-cranelift-runtime
+            # Six serial test steps. Warm-cache runs reached 18-20 minutes
+            # and hit the shared 20-minute limit (#10558).
+            timeout-minutes: 30
           - name: plugins pulley backend
             features: plugins-wasm-pulley
             suite: check
