@@ -258,6 +258,7 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     curl \
     vim-tiny \
+    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge '20250419+deb13u1' \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /zeroclaw-data /zeroclaw-data

@@ -1,3 +1,5 @@
+//! Dependency-version regression lock: it tests rustls-webpki, not zeroclaw-tls code.
+//!
 //! Public issuer fixtures captured on 2026-10-20 from the incident response
 //! at https://emudhra.we-have-a-problem.com/. The leaf uses the neutral
 //! host.invalid name and was signed offline with the disclosed weak scalar.

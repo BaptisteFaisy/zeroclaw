@@ -1,6 +1,11 @@
 #!/bin/sh
-# Remove the incident roots, including the AAA cross-sign route, from a PEM
-# bundle. Fingerprints: https://emudhra.we-have-a-problem.com/roots.json
+# Remove the incident roots from a PEM bundle. Fingerprints:
+# https://emudhra.we-have-a-problem.com/roots.json
+# A PEM bundle cannot distrust the compromised intermediates by key, so the
+# roots they chain to are removed. That includes Sectigo's AAA Certificate
+# Services, which cross-signed them. Debian's fix (DSA-6572-1, DLA-4845-1)
+# removes the same AAA and emSign ECC G3 roots. Mozilla had already dropped
+# AAA, so the pinned StageX input lacks it; the entry keeps later pins aligned.
 # The caller supplies input and output paths; no host trust store is modified.
 set -eu
 
