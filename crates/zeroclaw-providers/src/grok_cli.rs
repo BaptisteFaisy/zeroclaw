@@ -2163,7 +2163,18 @@ if [ "${1-}" = --warm-up ]; then exit 0; fi
 
         fn fake_grok(temp: &TempDir, body: &str) -> PathBuf {
             let path = temp.path().join("fake-grok");
-            std::fs::write(&path, format!("{FAKE_GROK_PROLOGUE}{body}")).expect("write fake Grok");
+            // Under `cargo test` these tests are threads of one process, and a sibling thread
+            // that forks while this process holds the script open for writing gives its child a
+            // copy of that descriptor until the child execs. On Linux, exec of a file that is
+            // open for writing fails with ETXTBSY. Writing from a child process means this
+            // process never holds the descriptor, so no fork can copy it.
+            let written = std::process::Command::new("/bin/sh")
+                .args(["-c", r#"printf '%s' "$1" > "$2""#, "sh"])
+                .arg(format!("{FAKE_GROK_PROLOGUE}{body}"))
+                .arg(&path)
+                .status()
+                .expect("write fake Grok");
+            assert!(written.success(), "writing fake Grok failed: {written}");
             let mut permissions = std::fs::metadata(&path)
                 .expect("fake Grok metadata")
                 .permissions();
