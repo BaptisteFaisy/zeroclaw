@@ -57,32 +57,10 @@ There are two kinds of ignored advisory:
 
 ### 1. Real CVE / vulnerability (must be remediated)
 
-These ignores cover vulnerability-class advisories, which are errors
-when an affected locked package is not ignored. They are **temporary**
-and must be removed when their affected dependency is repaired or removed.
+These ignores mark advisories with an exploitable bug. They are
+**temporary** and must be removed when a fix lands.
 
-The live `rustls-webpki` vulnerability exceptions are
-`RUSTSEC-2026-0049`, `-0098`, `-0099`, `-0104`, and `-0382`. The
-0.102.8 copy remains through `rumqttc` 0.25.1; these are not
-unmaintained-crate notices. The `-0382` exception is proposed on a narrow
-reachability basis: the reviewed MQTT source uses the old error type and
-its conversion/formatting, while certificate verification follows the
-separate patched modern TLS chain. It does not claim that the old crate
-is absent, unlinked, wholly unused, or free of the reported vulnerability.
-
-For `-0382`, `scripts/ci/webpki_advisory_scope.py` must bind the reviewed
-package identities and dependency edges to the source files Cargo
-actually selects, including manifests and build inputs. A registry
-checksum in `Cargo.lock` alone does not establish that condition when
-Cargo source replacement is available. The guard must run in each
-automated audit path relying on this exception, including daily audits.
-Its test suite must reject a source-replacement negative control, and the
-certificate-path regressions must still reject both compromised issuer
-paths. Remaining vulnerability findings stay blocking. Track
-upstream repair and removal in
-[#5869](https://github.com/zeroclaw-labs/zeroclaw/issues/5869).
-
-An earlier temporary exception,
+There is currently no live entry in this category. The last one,
 `RUSTSEC-2026-0292` (`imbl-sized-chunks` double free), was waived in PR
 #11038 on 2026-09-21 and cleared four days later by the `matrix-sdk` 0.19
 bump, which resolves `imbl` 7.0.2 and with it the patched
@@ -112,8 +90,7 @@ files.
 These advisories are informational. The crate has no maintained
 successor on the dependency lines we use. They are
 **semi-permanent**; the entry stays until the underlying dependency
-is replaced (e.g. GTK3 → GTK4, rumqttc upgrade that pulls
-`rustls-webpki 0.103.x`).
+is replaced (e.g. GTK3 → GTK4).
 
 Live, deny+audit (both files):
 
@@ -133,9 +110,8 @@ Live, deny-only:
 
 ### Audit-only inventory (scope, not severity)
 
-This inventory contains both vulnerability errors and maintenance
-warnings. The vulnerability process above still applies to error-class
-entries; inclusion here does not turn them into informational notices.
+Tool scope does not determine advisory severity. This inventory includes
+informational unsoundness and maintenance notices.
 
 Live, audit-only (`cargo deny`'s resolved graph no longer pulls these
 in, but they remain in `Cargo.lock` and `cargo audit` reads the whole
@@ -144,13 +120,10 @@ dropped from `Cargo.lock` entirely, e.g. via `cargo update` or a
 dependency bump, or every locked version of it is patched/unaffected
 per the advisory):
 
-- **`rustls-webpki` (5 entries, `RUSTSEC-2026-0049`, `-0098`, `-0099`,
-  `-0104`, `-0382`)**: 0.102.x copy is in `Cargo.lock` but outside
-  `cargo deny`'s current default-feature graph. MQTT-enabled builds still
-  include the crate. These are vulnerability errors, with the scoped
-  reachability rationale and enforcement requirements under category 1.
-  Remove the exceptions and guard when the affected legacy dependency is
-  repaired or removed; #5869 owns that upstream replacement.
+- **`lru` (`RUSTSEC-2026-0253`)**: informational unsoundness in the
+  retained 0.16 Nostr cache dependency, outside the current default
+  cargo-deny graph. Track the dependency migration in #9602; remove
+  the ignore when the affected retained copy is repaired or removed.
 - **GTK3 stack (11 entries, `RUSTSEC-2024-0411..-0420`, `-0429`)**:
   `gdk`/`gtk`/`atk`-family gtk-rs bindings and `glib`. Present in
   `Cargo.lock` — `zeroclaw-desktop` (Tauri) was removed in PR #8544
@@ -217,11 +190,7 @@ unaffected by the advisory):
   locked version (0.8.6, 0.9.4, 0.10.1) is patched per the advisory,
   not because the crate left `Cargo.lock`. Remaining deny+audit live
   ignore: `rustls-pemfile`. Remaining audit-only ignores:
-  `rustls-webpki` (5) plus the 19 lockfile-stale entries above.
-- **#5869**: *Replace rumqttc's old TLS dependencies.* Owns the temporary
-  `RUSTSEC-2026-0382` audit-only exception and its enforced dependency scope.
-  A fixed upstream release must preserve MQTT functionality and repair or
-  remove the affected legacy dependency before the exception and guard are retired.
+  `lru` (1, tracked in #9602) plus the 19 lockfile-stale entries above.
 - **#9899**: *Remove the `matrix-sdk -> imbl` advisory waivers.* Closed by
   the `matrix-sdk` 0.19 bump. The resolved graph and `Cargo.lock` no longer
   contain `bitmaps` or an affected `imbl-sized-chunks`, so
@@ -244,10 +213,7 @@ Run before pushing any PR that touches `.cargo/audit.toml` or
 
 ```bash
 cargo install cargo-audit --locked    # one-time
-cargo fetch --locked                 # make the selected package inputs available
-python3 scripts/ci/webpki_advisory_scope_test.py
-python3 scripts/ci/webpki_advisory_scope.py
-cargo audit                          # full-lock advisory check
+cargo audit                          # binds the CI gate
 cargo deny check advisories          # graph-aware cross-check
 cargo fmt --all -- --check
 ```
@@ -266,14 +232,10 @@ two tools have drifted again. Open or update the tracking issue.
 
 ## Change log
 
-- 2026-10-21: Updated the active verifier to `rustls-webpki` 0.103.16 and
-  refreshed bundled and container roots for the emudhra compromise. Added
-  the `RUSTSEC-2026-0382` audit-only exception for rumqttc's legacy
-  error-type dependency, requiring selected-source provenance as well as
-  registry identity and dependency-edge checks. Classified the exception
-  as a temporary vulnerability exception based on reviewed reachability,
-  not an informational warning. No Wasmtime advisory is waived; those
-  dependency fixes remain separate.
+- 2026-10-21: Refreshed container CA stores and added compromised-issuer
+  regressions. After #11924 removed the legacy MQTT verifier and its
+  four ignores, removed its stale inventory here. Distinguished audit
+  tool scope from advisory severity.
 - 2026-09-23: Bumped `matrix-sdk` 0.18 to 0.19 (with `rusqlite` 0.37 to
   0.40 and the OpenTelemetry stack 0.32 to 0.33, both forced by that bump)
   and removed every waiver it clears: `RUSTSEC-2026-0247` (`bitmaps`),

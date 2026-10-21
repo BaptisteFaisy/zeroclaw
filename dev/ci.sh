@@ -18,10 +18,6 @@ run_in_ci() {
   "${compose_cmd[@]}" run --rm local-ci bash -c "$cmd"
 }
 
-run_audit_in_ci() {
-  run_in_ci "cargo fetch --locked && python3 scripts/ci/webpki_advisory_scope.py && cargo audit"
-}
-
 run_firmware_protocol_gate() {
   run_in_ci "./scripts/ci/firmware_protocol_gate.sh"
 }
@@ -136,7 +132,7 @@ case "$1" in
     ;;
 
   audit)
-    run_audit_in_ci
+    run_in_ci "cargo audit"
     ;;
 
   deny)
@@ -145,7 +141,7 @@ case "$1" in
 
   security)
     run_in_ci "cargo deny check licenses sources"
-    run_audit_in_ci
+    run_in_ci "cargo audit"
     ;;
 
   docker-smoke)
@@ -165,7 +161,7 @@ case "$1" in
     run_in_ci "bash tests/manual/test_dockerignore.sh"
     run_in_ci "cargo build --release --locked --verbose"
     run_in_ci "cargo deny check licenses sources"
-    run_audit_in_ci
+    run_in_ci "cargo audit"
     build_smoke_image
     docker run --rm zeroclaw-local-smoke:latest --version
     ;;
