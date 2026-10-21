@@ -96,6 +96,8 @@ update:
 
 # Run cargo audit to check for security vulnerabilities
 audit:
+    cargo fetch --locked
+    python3 scripts/ci/webpki_advisory_scope.py
     cargo audit
 
 # Run cargo deny checks

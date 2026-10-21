@@ -91,7 +91,7 @@
     {
       "label": "Security: Audit",
       "type": "shell",
-      "command": "cargo audit --version >/dev/null 2>&1 || cargo install cargo-audit && cargo audit",
+      "command": "cargo audit --version >/dev/null 2>&1 || cargo install cargo-audit && cargo fetch --locked && python3 scripts/ci/webpki_advisory_scope.py && cargo audit",
       "problemMatcher": []
     },
     {
