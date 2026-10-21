@@ -43,7 +43,20 @@ jobs:
         run: |
           {
             scan_exit_code=0
-            printf 'cargo-deny (resolved dependency graph)\n'
+            printf 'Scoped advisory policy\n'
+            python3 - <<'PY' || scan_exit_code=1
+          import subprocess
+          import sys
+          import tomllib
+
+          with open(".cargo/audit.toml", "rb") as policy_file:
+              ignored = tomllib.load(policy_file).get("advisories", {}).get("ignore", [])
+          if "RUSTSEC-2026-0382" in ignored:
+              subprocess.run(
+                  [sys.executable, "scripts/ci/webpki_advisory_scope.py"], check=True
+              )
+          PY
+            printf '\ncargo-deny (resolved dependency graph)\n'
             cargo deny check advisories || scan_exit_code=1
             printf '\ncargo-audit (full Cargo.lock)\n'
             cargo audit || scan_exit_code=1
