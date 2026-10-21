@@ -14,6 +14,9 @@ name: Docker Publish
 # as a dry run of the release legs. To rebuild one variant of a published
 # release with this workflow, dispatch from master with `release_ref` set to the
 # tag and `stems` naming the variant; other pinned tags are left untouched.
+# Floating tags (`<stem>` and the relay's `latest`) move on a tag push and on
+# the release call. A dispatch leaves them alone unless `floating` is set, so a
+# rebuild of an older release cannot move them back to that release.
 
 on:
   push:
@@ -27,6 +30,11 @@ on:
         type: string
       push:
         description: "Push and sign the images"
+        required: false
+        type: boolean
+        default: true
+      floating:
+        description: "Also move the floating tags (<stem>, relay latest)"
         required: false
         type: boolean
         default: true
@@ -45,9 +53,18 @@ on:
         required: false
         type: boolean
         default: false
+      floating:
+        description: "Also move the floating tags (<stem>, relay latest); only for the newest release"
+        required: false
+        type: boolean
+        default: false
 
+# A dry run gets a group of its own, so it can neither queue behind a publish
+# nor, as the newer pending entry, cancel a pending one. Publishes of the same
+# release ref stay serialized; the tag push and the release call name the same
+# release the same way.
 concurrency:
-  group: docker-publish-${{ github.ref }}
+  group: ${{ (inputs.push || github.event_name == 'push') && format('docker-publish-{0}', inputs.release_ref || github.ref_name) || format('docker-publish-dry-run-{0}', github.run_id) }}
   cancel-in-progress: false
 
 permissions:
@@ -78,11 +95,23 @@ jobs:
           # consumes. yq ships on ubuntu-latest runners.
           include="$(yq -o=json -I=0 '.tags' dev/ci/docker-tags.toml)"
           if [ -n "${STEMS}" ]; then
-            include="$(jq -c --arg stems "${STEMS}" \
-              '($stems | split(",") | map(gsub("^\\s+|\\s+$"; ""))) as $want
-               | map(select(.stem as $s | $want | index($s)))' <<< "${include}")"
+            want="$(jq -cn --arg stems "${STEMS}" \
+              '$stems | split(",") | map(gsub("^\\s+|\\s+$"; "") | select(. != ""))')"
+            # Fail on any unknown name, not only when all are unknown, so a
+            # typo can't drop a variant from a green run. The names are
+            # JSON-quoted and % escaped to keep user input on one line.
+            unknown="$(jq -r --argjson want "${want}" \
+              'map(.stem) as $known
+               | [$want[] | select(. as $w | $known | index($w) | not) | @json]
+               | join(", ") | gsub("%"; "%25")' <<< "${include}")"
+            if [ -n "${unknown}" ]; then
+              echo "::error title=Unknown stem::No docker-tags.toml stem named ${unknown}"
+              exit 1
+            fi
+            include="$(jq -c --argjson want "${want}" \
+              'map(select(.stem as $s | $want | index($s)))' <<< "${include}")"
             if [ "${include}" = "[]" ]; then
-              echo "::error title=Unknown stem::No docker-tags.toml stem matches '${STEMS}'"
+              echo "::error title=Unknown stem::stems lists no stem name"
               exit 1
             fi
           fi
@@ -132,12 +161,24 @@ jobs:
       # docker-image-pr.yml fails with ResourceExhausted. Add the bounded swap
       # the release workflow gives its Linux ARM64 build, and let BuildKit run
       # one step at a time so the amd64 and arm64 links never overlap.
+      # The helper comes from this workflow's own revision, because a
+      # release_ref can predate it. It goes to RUNNER_TEMP, outside the build
+      # context, so the image source stays exactly release_ref.
+      - name: Fetch the build memory helper
+        id: memory_helper
+        if: contains(matrix.platforms, 'linux/arm64')
+        shell: bash
+        run: |
+          git fetch --no-tags --depth=1 origin "${GITHUB_WORKFLOW_SHA}"
+          git show "${GITHUB_WORKFLOW_SHA}:scripts/ci/dist_runner_memory.sh" \
+            > "${RUNNER_TEMP}/dist_runner_memory.sh"
+
       - name: Prepare bounded build memory
         id: dist_memory
         if: contains(matrix.platforms, 'linux/arm64')
         timeout-minutes: 5
         shell: bash
-        run: bash scripts/ci/dist_runner_memory.sh prepare
+        run: bash "${RUNNER_TEMP}/dist_runner_memory.sh" prepare
 
       - name: Set up Buildx (one step at a time)
         if: contains(matrix.platforms, 'linux/arm64')
@@ -165,9 +206,11 @@ jobs:
           build-args: |
             ZEROCLAW_CARGO_FLAGS=${{ matrix.flags }}
             ZEROCLAW_BUILD_ID=${{ steps.srcsha.outputs.sha }}
+          # The floating tag moves only on a tag push, the release call, or a
+          # dispatch with `floating` set; an empty line adds no tag.
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ matrix.pinned_tag }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ matrix.floating_tag }}
+            ${{ (inputs.floating || github.event_name == 'push') && format('{0}/{1}:{2}', env.REGISTRY, env.IMAGE, matrix.floating_tag) || '' }}
 
       - name: Sign container image (keyless / Rekor)
         if: ${{ inputs.push || github.event_name == 'push' }}
@@ -183,13 +226,13 @@ jobs:
             "${{ env.REGISTRY }}/${{ env.IMAGE }}@${DIGEST}"
 
       - name: Report and release owned build memory
-        if: always() && contains(matrix.platforms, 'linux/arm64')
+        if: always() && contains(matrix.platforms, 'linux/arm64') && steps.memory_helper.outcome == 'success'
         timeout-minutes: 5
         shell: bash
         env:
           ZC_DIST_SWAP_FILE: ${{ steps.dist_memory.outputs.swap_file }}
           ZC_DIST_SWAP_IDENTITY: ${{ steps.dist_memory.outputs.swap_identity }}
-        run: bash scripts/ci/dist_runner_memory.sh cleanup
+        run: bash "${RUNNER_TEMP}/dist_runner_memory.sh" cleanup
 
   # The nominated relay (zerorelay) ships as its OWN distroless image from
   # apps/zerorelay/Dockerfile (it holds no keys and is deployed independently of
@@ -261,7 +304,7 @@ jobs:
             ZEROCLAW_BUILD_ID=${{ steps.srcsha.outputs.sha }}
           tags: |
             ${{ steps.tags.outputs.pinned }}
-            ${{ steps.tags.outputs.floating }}
+            ${{ (inputs.floating || github.event_name == 'push') && steps.tags.outputs.floating || '' }}
 
       - name: Sign relay container image (keyless / Rekor)
         if: ${{ inputs.push || github.event_name == 'push' }}
