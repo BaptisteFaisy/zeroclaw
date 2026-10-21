@@ -104,6 +104,23 @@ mod tests {
         crate::agent::turn::collect_callable_tool_names(&tools, None)
     }
 
+    /// A member that only exists in builds with the external tools cannot be
+    /// registered while that feature is off. The `tools-external` test build
+    /// still checks it; a default build only has to leave it out.
+    fn compiled_out(tool: &str) -> bool {
+        !cfg!(feature = "tools-external")
+            && zeroclaw_config::builtin_tools::EXTERNAL_TOOL_NAMES.contains(&tool)
+    }
+
+    /// The members of one group that this build can register.
+    fn registrable_members(tools: &[&'static str]) -> Vec<&'static str> {
+        tools
+            .iter()
+            .copied()
+            .filter(|tool| !compiled_out(tool))
+            .collect()
+    }
+
     #[test]
     fn every_group_member_is_a_registered_tool_name() {
         let registered = registered_tool_names();
@@ -111,9 +128,12 @@ mod tests {
         for (aliases, tools) in GROUPS {
             assert!(!tools.is_empty(), "scope group {aliases:?} has no members");
             for tool in *tools {
+                if compiled_out(tool) {
+                    continue;
+                }
                 assert!(
                     registered.iter().any(|name| name == tool),
-                    "scope group {aliases:?} lists `{tool}`, which the test registry did not register: fix the name, or switch on its config gate in registered_tool_names()"
+                    "scope group {aliases:?} lists `{tool}`, which the test registry did not register: fix the name, or switch on its config gate in registered_tool_names(); a member behind the tools-external feature must be listed in EXTERNAL_TOOL_NAMES"
                 );
             }
         }
@@ -125,7 +145,10 @@ mod tests {
 
         for (aliases, tools) in GROUPS {
             assert!(!tools.is_empty(), "scope group {aliases:?} has no members");
-            let mut expected: Vec<String> = tools.iter().map(|tool| (*tool).to_string()).collect();
+            let mut expected: Vec<String> = registrable_members(tools)
+                .into_iter()
+                .map(str::to_string)
+                .collect();
             expected.sort();
 
             for alias in *aliases {
@@ -149,7 +172,7 @@ mod tests {
 
         for (aliases, tools) in GROUPS {
             assert!(!tools.is_empty(), "scope group {aliases:?} has no members");
-            let mut expected: Vec<&str> = tools.to_vec();
+            let mut expected = registrable_members(tools);
             expected.sort_unstable();
 
             for alias in *aliases {
