@@ -37,19 +37,17 @@ tool blocks the PR. What actually fails each tool differs by category:
   advisories are reported as allowed warnings and exit 0.
 - **`cargo deny check advisories`**: vulnerability *and* unmaintained advisories for crates in the resolved graph are errors (exit 1). That is why the live unmaintained exceptions for `rustls-pemfile` and `anymap2` remain in `deny.toml`. A stale graph-ignore instead emits `advisory-not-detected`, which is a warning (exit 0); it is never triggered by removing an entry from `.cargo/audit.toml`.
 
-An audit-only ignore covers a crate `cargo deny`'s resolved graph does
-not pull in, so it affects only `cargo audit`: removing it while the
-crate stays locked re-reports the advisory as an allowed warning (exit
-0), not a CI failure. Keeping it is therefore accepted full-lock noise
-control, not a hard-gate bypass; dropping it does not break the
-gate.
+An audit-only ignore is needed by `cargo audit` but not by `cargo deny`
+under its configured graph. That describes tool scope, not advisory
+severity. Removing an ignore for an affected vulnerability makes the
+configured `cargo audit` fail (exit 1). An unmaintained or informational
+finding is instead an allowed warning under the bare invocation.
 
-The difference between the tools is **scope**, not severity:
-`cargo audit` reports every advisory touching the lockfile, while
-`cargo deny` only reports advisories for crates in the resolved
-workspace graph. Use the narrower `cargo deny` result to confirm an
-advisory is not actually pulled in; keep the audit-only entry while
-the crate remains locked.
+The tools' graph scopes also do not prove runtime reachability. A crate
+outside the default graph can be included by another feature or target.
+Each vulnerability exception needs an explicit exposure rationale,
+tracking, and removal condition; a clean default-graph scan is not
+sufficient justification by itself.
 
 ---
 
@@ -59,12 +57,34 @@ There are two kinds of ignored advisory:
 
 ### 1. Real CVE / vulnerability (must be remediated)
 
-These ignores mark advisories with an exploitable bug. They are
-**temporary** and must be removed when a fix lands.
+These ignores cover vulnerability-class advisories, which are errors
+when an affected locked package is not ignored. They are **temporary**
+and must be removed when their affected dependency is repaired or removed.
 
-There is currently no live entry in this category. The last one,
-`RUSTSEC-2026-0292` (`imbl-sized-chunks` double free), was waived in
-PR #11038 on 2026-09-21 and cleared four days later by the `matrix-sdk` 0.19
+The live `rustls-webpki` vulnerability exceptions are
+`RUSTSEC-2026-0049`, `-0098`, `-0099`, `-0104`, and `-0382`. The
+0.102.8 copy remains through `rumqttc` 0.25.1; these are not
+unmaintained-crate notices. The `-0382` exception is proposed on a narrow
+reachability basis: the reviewed MQTT source uses the old error type and
+its conversion/formatting, while certificate verification follows the
+separate patched modern TLS chain. It does not claim that the old crate
+is absent, unlinked, wholly unused, or free of the reported vulnerability.
+
+For `-0382`, `scripts/ci/webpki_advisory_scope.py` must bind the reviewed
+package identities and dependency edges to the source files Cargo
+actually selects, including manifests and build inputs. A registry
+checksum in `Cargo.lock` alone does not establish that condition when
+Cargo source replacement is available. The guard must run in each
+automated audit path relying on this exception, including daily audits.
+Its test suite must reject a source-replacement negative control, and the
+certificate-path regressions must still reject both compromised issuer
+paths. Remaining vulnerability findings stay blocking. Track
+upstream repair and removal in
+[#5869](https://github.com/zeroclaw-labs/zeroclaw/issues/5869).
+
+An earlier temporary exception,
+`RUSTSEC-2026-0292` (`imbl-sized-chunks` double free), was waived in PR
+#11038 on 2026-09-21 and cleared four days later by the `matrix-sdk` 0.19
 bump, which resolves `imbl` 7.0.2 and with it the patched
 `imbl-sized-chunks` 0.2; the waiver came out of both tool files in the
 same change.
@@ -111,9 +131,15 @@ Live, deny-only:
 
 - **`anymap2` (`RUSTSEC-2026-0319`)**: unmaintained; `matrix-sdk 0.19.1` still depends on it, with no replacement SDK release available. The advisory recommends `anymap3`. Only `deny.toml` needs an exception because the configured `cargo audit` invocation treats this maintenance advisory as an allowed warning. Remove the exception once the resolved dependency graph no longer includes an affected `anymap2`. Tracking #11429.
 
+### Audit-only inventory (scope, not severity)
+
+This inventory contains both vulnerability errors and maintenance
+warnings. The vulnerability process above still applies to error-class
+entries; inclusion here does not turn them into informational notices.
+
 Live, audit-only (`cargo deny`'s resolved graph no longer pulls these
 in, but they remain in `Cargo.lock` and `cargo audit` reads the whole
-lockfile; remove from `audit.toml` only once the crate is either
+lockfile — remove from `audit.toml` only once the crate is either
 dropped from `Cargo.lock` entirely, e.g. via `cargo update` or a
 dependency bump, or every locked version of it is patched/unaffected
 per the advisory):
@@ -121,23 +147,14 @@ per the advisory):
 - **`rustls-webpki` (5 entries, `RUSTSEC-2026-0049`, `-0098`, `-0099`,
   `-0104`, `-0382`)**: 0.102.x copy is in `Cargo.lock` but outside
   `cargo deny`'s current default-feature graph. MQTT-enabled builds still
-  include the crate; `cargo audit` reports it from the full lockfile.
-  The `-0382` exception is limited to the reviewed registry copies of
-  `rumqttc` 0.25.1 and `rustls-webpki` 0.102.8. In that MQTT source the
-  legacy crate supplies only `webpki::Error`; the TLS connector uses
-  `tokio-rustls` and the patched `rustls-webpki` 0.103.16 verifier.
-  `scripts/ci/webpki_advisory_scope.py` runs before the audit in CI and
-  rejects changed package identities, additional legacy parents, or changed
-  active verifier edges. The TLS regressions also require both compromised
-  intermediate paths to fail with a distrust error. This exception does not
-  permit the old verifier to authenticate certificates. Track upstream
-  replacement in [#5869](https://github.com/zeroclaw-labs/zeroclaw/issues/5869);
-  remove the exception and its scope guard when the upstream MQTT dependency
-  stops retaining the old crate.
+  include the crate. These are vulnerability errors, with the scoped
+  reachability rationale and enforcement requirements under category 1.
+  Remove the exceptions and guard when the affected legacy dependency is
+  repaired or removed; #5869 owns that upstream replacement.
 - **GTK3 stack (11 entries, `RUSTSEC-2024-0411..-0420`, `-0429`)**:
   `gdk`/`gtk`/`atk`-family gtk-rs bindings and `glib`. Present in
-  `Cargo.lock`; `zeroclaw-desktop` (Tauri) was removed in PR #8544
-  and reintroduced in PR #8565, but not needed by `cargo deny`'s
+  `Cargo.lock` — `zeroclaw-desktop` (Tauri) was removed in PR #8544
+  and reintroduced in PR #8565 — but not needed by `cargo deny`'s
   current default-target resolved graph (`cargo deny check bans` and
   `check advisories` both pass clean without these ignores). Do not
   assume this means the crates are gone from the tree; re-check with
@@ -154,13 +171,13 @@ per the advisory):
 - **`instant` (`RUSTSEC-2024-0384`)**: informational-only unmaintained
   advisory. Same drift; tracking #8519.
 
-Resolved (safe to drop from both files: either the crate is gone
+Resolved (safe to drop from both files — either the crate is gone
 from `Cargo.lock` entirely, or every locked version is patched /
 unaffected by the advisory):
 
 - **`rand` (`RUSTSEC-2026-0097`)**: re-entrancy unsoundness in a
   custom global logger. `Cargo.lock` still resolves `rand` 0.8.6,
-  0.9.4, and 0.10.1; the crate is not absent, but the
+  0.9.4, and 0.10.1 — the crate is not absent — but the
   [advisory](https://rustsec.org/advisories/RUSTSEC-2026-0097.html)
   marks all three of those versions as patched, so no locked copy is
   affected and the ignore is no longer needed.
@@ -173,16 +190,15 @@ unaffected by the advisory):
   unmaintained warnings and unlikely to be resolved in the next
   release cycle.
 - An entry drops out of `deny.toml` as soon as `cargo deny`'s resolved
-  graph no longer needs it; that is a graph fact, not a lockfile fact,
+  graph no longer needs it — that is a graph fact, not a lockfile fact,
   and it can change on the next dependency bump or feature change
   without the crate leaving `Cargo.lock`. It only drops out of
   `audit.toml` once the crate is either gone from `Cargo.lock`
   entirely or every locked version of it is patched/unaffected per the
   advisory. Removing an audit-only entry while a still-affected
-  version remains resolvable makes `cargo audit` report the advisory
-  again as an allowed warning (it does not fail CI; `cargo audit`
-  exits 0 on warnings under the configured invocation), but it drops
-  the accepted full-lock noise control this document records. Always
+  version remains locked reports the finding again: vulnerability
+  advisories fail the audit, while maintenance/informational findings
+  remain allowed warnings under the configured bare invocation. Always
   check `Cargo.lock` and the advisory's patched-version range directly,
   not just `cargo deny`'s last result.
 
@@ -204,8 +220,8 @@ unaffected by the advisory):
   `rustls-webpki` (5) plus the 19 lockfile-stale entries above.
 - **#5869**: *Replace rumqttc's old TLS dependencies.* Owns the temporary
   `RUSTSEC-2026-0382` audit-only exception and its enforced dependency scope.
-  A fixed upstream release must preserve MQTT functionality and remove the
-  obsolete verifier dependency before the exception and guard are retired.
+  A fixed upstream release must preserve MQTT functionality and repair or
+  remove the affected legacy dependency before the exception and guard are retired.
 - **#9899**: *Remove the `matrix-sdk -> imbl` advisory waivers.* Closed by
   the `matrix-sdk` 0.19 bump. The resolved graph and `Cargo.lock` no longer
   contain `bitmaps` or an affected `imbl-sized-chunks`, so
@@ -228,7 +244,10 @@ Run before pushing any PR that touches `.cargo/audit.toml` or
 
 ```bash
 cargo install cargo-audit --locked    # one-time
-cargo audit                          # binds the CI gate
+cargo fetch --locked                 # make the selected package inputs available
+python3 scripts/ci/webpki_advisory_scope_test.py
+python3 scripts/ci/webpki_advisory_scope.py
+cargo audit                          # full-lock advisory check
 cargo deny check advisories          # graph-aware cross-check
 cargo fmt --all -- --check
 ```
@@ -250,8 +269,10 @@ two tools have drifted again. Open or update the tracking issue.
 - 2026-10-21: Updated the active verifier to `rustls-webpki` 0.103.16 and
   refreshed bundled and container roots for the emudhra compromise. Added
   the `RUSTSEC-2026-0382` audit-only exception for rumqttc's legacy
-  error-type dependency, with registry identity and dependency-edge checks
-  in CI and offline mutation tests. No Wasmtime advisory is waived; those
+  error-type dependency, requiring selected-source provenance as well as
+  registry identity and dependency-edge checks. Classified the exception
+  as a temporary vulnerability exception based on reviewed reachability,
+  not an informational warning. No Wasmtime advisory is waived; those
   dependency fixes remain separate.
 - 2026-09-23: Bumped `matrix-sdk` 0.18 to 0.19 (with `rusqlite` 0.37 to
   0.40 and the OpenTelemetry stack 0.32 to 0.33, both forced by that bump)
@@ -279,7 +300,7 @@ two tools have drifted again. Open or update the tracking issue.
   (wasmtime `45.0.3` → `47.0.3`, clearing `RUSTSEC-2026-0222` and
   removing the waiver from both files). Removed the now-stale
   wasmtime references from the "Real CVE" category, the "Live,
-  audit-only" list, and the #8519 tracking summary above; there is
+  audit-only" list, and the #8519 tracking summary above — there is
   currently no live entry in the real-CVE category.
 - 2026-08-03: Corrected the in-file block classification in
   `.cargo/audit.toml` to match the actual file contents: `wasmtime`
@@ -290,8 +311,8 @@ two tools have drifted again. Open or update the tracking issue.
   enforcement claims per tool: under the configured invocations,
   informational/unmaintained advisories are allowed warnings in
   `cargo audit` (exit 0) but unmaintained advisories for crates in
-  `cargo deny`'s resolved graph are errors (exit 1), hence the two
-  live unmaintained denies, while `advisory-not-detected` is `cargo
+  `cargo deny`'s resolved graph are errors (exit 1) — hence the two
+  live unmaintained denies — while `advisory-not-detected` is `cargo
   deny`'s stale graph-ignore warning (exit 0). `rand`
   (`RUSTSEC-2026-0097`) was the only entry removed from
   `.cargo/audit.toml` in this PR; everything else that left `deny.toml`
@@ -299,7 +320,7 @@ two tools have drifted again. Open or update the tracking issue.
 - 2026-07-31: Corrected the 07-19 pass for `proc-macro-error2`
   (`RUSTSEC-2026-0173`): it is still in `cargo deny`'s resolved graph
   via `matrix-sdk` dev-deps (`aquamarine`) in `zeroclaw-channels`, so it
-  is a live deny+audit ignore, not audit-only drift; removed from
+  is a live deny+audit ignore, not audit-only drift — removed from
   `deny.toml` in the 07-06/07-19 passes, it re-fails `cargo deny check`.
   Restored it in `deny.toml`. Also moved `wasmtime` (`RUSTSEC-2026-0222`)
   to audit-only: it sits behind the optional `plugins-wasmtime` feature,
@@ -310,7 +331,7 @@ two tools have drifted again. Open or update the tracking issue.
   every locked version patched/unaffected) instead of only the
   crate-absent half. Removed an inaccurate `.cargo/audit.toml` header
   claim that the 20 lockfile-stale entries each have a replacement
-  "already landed or in flight"; they are simply audit-only and
+  "already landed or in flight" — they are simply audit-only and
   tracked in #8519.
 - 2026-07-21: Corrected the `rand` rationale: `Cargo.lock` still
   resolves `rand` 0.8.6, 0.9.4, and 0.10.1, so the crate was never

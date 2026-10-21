@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     libssl-dev \
     curl \
+    python3 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy

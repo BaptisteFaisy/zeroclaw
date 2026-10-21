@@ -17,11 +17,12 @@ ignore = [
     "RUSTSEC-2026-0098",  # rustls-webpki URI name constraints; same as above
     "RUSTSEC-2026-0099",  # rustls-webpki wildcard name constraints; same as above
     "RUSTSEC-2026-0104",  # rustls-webpki CRL parsing panic; same as above
-    # Exact rumqttc 0.25.1 registry source only references legacy webpki::Error;
+    # Reviewed rumqttc 0.25.1 source uses the legacy Error/conversion/formatting;
     # its real connector uses patched rustls-webpki 0.103.16 through rustls.
-    # Security CI enforces versions, registry checksums, sole legacy parent,
-    # and the active TLS dependency edges via webpki_advisory_scope.py.
-    # Remove this exception and guard when the legacy dependency is gone.
+    # Each guarded audit binds Cargo-selected package files to verified archives
+    # and checks lock identities, sole legacy parent and active TLS edges through
+    # webpki_advisory_scope.py; locked checksum fields alone are insufficient.
+    # Remove this exception and guard when the affected legacy copy is repaired or removed.
     # Tracking: https://github.com/zeroclaw-labs/zeroclaw/issues/5869
     # Upstream fix: https://github.com/bytebeamio/rumqtt/pull/1037
     "RUSTSEC-2026-0382",

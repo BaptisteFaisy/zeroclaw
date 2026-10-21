@@ -1838,14 +1838,14 @@ jobs:
             | tar zxf - -C ~/.cargo/bin --strip-components=1
       - name: Validate scoped lru advisory exception
         run: python3 scripts/ci/lru_advisory_scope_test.py
+      - name: Lockfile integrity
+        run: cargo verify-project && cargo fetch --locked
       - name: Validate scoped MQTT webpki advisory exception
         run: |
           python3 scripts/ci/webpki_advisory_scope_test.py
           python3 scripts/ci/webpki_advisory_scope.py
       - name: Check licenses, sources, and advisories
         run: cargo deny check
-      - name: Lockfile integrity
-        run: cargo verify-project && cargo fetch --locked
 
       - name: Validate YAML workflow syntax
         run: |
