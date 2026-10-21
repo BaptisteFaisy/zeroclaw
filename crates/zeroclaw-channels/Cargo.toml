@@ -133,7 +133,7 @@ uuid = { version = "1.22", default-features = false, features = ["std", "v4"] }
 hex = "0.4"
 nanohtml2text = "0.2"
 rand = "0.10"
-webpki-roots = { version = "1.0.6", optional = true }
+webpki-roots = { version = "1.0.10", optional = true }
 
 # WhatsApp Web (optional). Registry releases from oxidezap/whatsapp-rust.
 # Moving from the old fork pin to 0.7.0 includes the upstream protobuf-codegen

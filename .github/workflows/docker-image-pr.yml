@@ -9,6 +9,9 @@ on:
       - Dockerfile.alpine
       - Dockerfile.ci
       - Containerfile
+      - dev/ci/filter-emudhra-ca-bundle.sh
+      - dev/ci/test_filter_emudhra_ca_bundle.py
+      - crates/zeroclaw-tls/tests/fixtures/emudhra/**
       - docker-compose.yml
       - docker-compose.alpine.yml
       - .dockerignore
@@ -38,13 +41,16 @@ jobs:
         with:
           fetch-depth: 2
 
+      - name: Test StageX trust-bundle filter
+        run: python3 -m unittest dev/ci/test_filter_emudhra_ca_bundle.py
+
       - name: Detect source-build inputs
         id: detect
         run: |
           changed_files=$(git diff --name-only HEAD^1 HEAD^2)
           containerfile_required=false
           if [ -z "$changed_files" ] || \
-             printf '%s\n' "$changed_files" | grep -Eq '^(Containerfile|\.github/workflows/docker-image-pr\.yml)$'; then
+             printf '%s\n' "$changed_files" | grep -Eq '^(Containerfile|dev/ci/(filter-emudhra-ca-bundle\.sh|test_filter_emudhra_ca_bundle\.py)|crates/zeroclaw-tls/tests/fixtures/emudhra/.*|\.github/workflows/docker-image-pr\.yml)$'; then
             containerfile_required=true
           fi
 
@@ -55,7 +61,7 @@ jobs:
           # the release workflow therefore gains nothing from the source
           # matrix, and on long-lived PRs that edit it for unrelated release
           # steps it reran every push.
-          source_inputs='^(Dockerfile|Dockerfile\.debian|Dockerfile\.alpine|Dockerfile\.ci|Containerfile|docker-compose\.yml|docker-compose\.alpine\.yml|\.dockerignore|dev/config\.template\.toml|\.github/workflows/docker-image-pr\.yml|scripts/ci/prepare_docker_context\.sh|scripts/ci/smoke_docker_compose\.sh)$'
+          source_inputs='^(Dockerfile|Dockerfile\.debian|Dockerfile\.alpine|Dockerfile\.ci|Containerfile|dev/ci/(filter-emudhra-ca-bundle\.sh|test_filter_emudhra_ca_bundle\.py)|crates/zeroclaw-tls/tests/fixtures/emudhra/.*|docker-compose\.yml|docker-compose\.alpine\.yml|\.dockerignore|dev/config\.template\.toml|\.github/workflows/docker-image-pr\.yml|scripts/ci/prepare_docker_context\.sh|scripts/ci/smoke_docker_compose\.sh)$'
           source_builds=true
 
           if [ -n "$changed_files" ] && \
