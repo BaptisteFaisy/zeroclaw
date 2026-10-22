@@ -1774,12 +1774,15 @@ mod tests {
     }
 
     async fn test_config(tmp: &TempDir) -> Arc<Config> {
-        let config = Config {
+        let mut config = Config {
             data_dir: tmp.path().join("data"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
         config.save().await.unwrap();
+        // This value just wrote the file; mirror load_or_init's fresh-init
+        // provenance so tests that edit a clone can save it over the seed.
+        config.loaded_from = Some(config.config_path.clone());
         Arc::new(config)
     }
 
