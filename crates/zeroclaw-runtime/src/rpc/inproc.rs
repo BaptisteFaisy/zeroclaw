@@ -365,8 +365,8 @@ impl InprocConnector {
     /// provider as it was configured when the bearer was issued: every
     /// `initialize` on it is verified against that binding, so a provider
     /// repointed or removed since then never receives the bearer. With the
-    /// client's half comes [`Served`], which resolves once the daemon is done
-    /// with the connection.
+    /// client's half comes [`Served`], which resolves once the daemon's task
+    /// for the connection has ended.
     pub async fn connect_bound(
         &self,
         binding: super::auth::OidcBinding,
@@ -442,16 +442,18 @@ impl InprocConnector {
     }
 }
 
-/// Resolves once the daemon is done with one in-process connection: its task
-/// has ended and the connection is no longer counted. A client that gives up
-/// on the connection, or drops its half, does not end the daemon's work on
-/// it: an `initialize` still verifying a bearer runs to completion first.
+/// Resolves once the daemon's task for one in-process connection has ended,
+/// or was aborted at drain. A client that gives up on the connection, or
+/// drops its half, does not end that task: an `initialize` still verifying a
+/// bearer runs to completion first. Prompt tasks the connection started hold
+/// their own share of the activity count and can outlive the task in a forced
+/// teardown; the generation's drain waits for those separately.
 #[derive(Clone)]
 #[must_use]
 pub struct Served(CancellationToken);
 
 impl Served {
-    /// Wait until the daemon is done with the connection.
+    /// Wait until the daemon's task for the connection has ended.
     pub async fn wait(&self) {
         // Cancelled only by the connection task's drop guard, when the task
         // ends or is aborted.
@@ -507,7 +509,7 @@ async fn serve(
     if let Some((tui_id, tui_epoch)) = dispatcher.tui_registration() {
         ctx.tui_registry.unregister(tui_id, tui_epoch);
     }
-    // `Served` resolves only once nothing of the connection is counted.
+    // The task's own share of the activity count is released before `Served` resolves.
     drop(dispatcher);
     drop(transport);
     drop(count_guard);
