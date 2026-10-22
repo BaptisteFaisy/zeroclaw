@@ -184,7 +184,7 @@ class DockerBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             (directory / "image.tar").write_bytes(
-                image_tar({gate.BUNDLE: bundle}).getvalue()
+                image_tar({gate.BUNDLE: bundle}).getvalue() + b"\0" * (1024 * 1024)
             )
             docker = directory / "docker"
             docker.write_text(

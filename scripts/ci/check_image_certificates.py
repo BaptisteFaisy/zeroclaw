@@ -32,7 +32,7 @@ PEM = re.compile(
 )
 # Inside the shared neutral leaf's validity interval, as in emudhra_distrust.rs.
 VERIFY_TIME = "1792584000"
-ISSUERS = (("emsign", "emsign-ecc-g3-root.pem"), ("aaa", "aaa-root.pem"))
+ISSUERS = {"emsign": "emsign-ecc-g3-root.pem", "aaa": "aaa-root.pem"}
 
 
 def run(*command):
@@ -109,7 +109,7 @@ def check_trust(bundle, roots, directory, openssl):
     # Positive controls prove that both incident chains are otherwise valid at
     # the frozen time. Expiry, hostname/signature errors, or a broken OpenSSL
     # invocation must never turn a rejection into a passing security test.
-    for issuer, root in ISSUERS:
+    for issuer, root in ISSUERS.items():
         result = verify(openssl, FIXTURES / root, leaf, issuer)
         if result.returncode:
             raise ValueError(
@@ -131,7 +131,7 @@ def check_trust(bundle, roots, directory, openssl):
     for label, data in (("bundle", bundle), ("all packaged CA files", roots)):
         trusted = directory / "trusted.pem"
         trusted.write_bytes(data)
-        for issuer, _root in ISSUERS:
+        for issuer in ISSUERS:
             result = verify(openssl, trusted, leaf, issuer)
             errors = re.findall(r"error (\d+) at \d+ depth lookup", result.stderr)
             # OpenSSL reports untrusted self-signed chain / missing issuer.
@@ -193,6 +193,10 @@ def check_image(image, platform, pull, openssl):
             ):
                 try:
                     bundle, roots = read_trust_files(export.stdout)
+                    # tarfile stops at the end marker before consuming archive
+                    # padding. Drain it so a valid export cannot hit SIGPIPE.
+                    while export.stdout.read(1024 * 1024):
+                        pass
                 finally:
                     export.stdout.close()
                 if export.wait(timeout=300):
