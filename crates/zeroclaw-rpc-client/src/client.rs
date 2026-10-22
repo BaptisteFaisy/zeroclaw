@@ -26,6 +26,8 @@ pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Outbound frames queued ahead of the writer. Matches the daemon's own
 /// per-connection writer bound so neither side buffers unboundedly.
 const WRITER_QUEUE_DEPTH: usize = 64;
+/// Match the daemon's bounded transport half-close.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 /// Notifications retained for a slow subscriber before it observes a lag.
 const NOTIFICATION_CAPACITY: usize = 256;
 /// Largest frame accepted from the daemon. Mirrors the daemon's inbound cap.
@@ -395,7 +397,10 @@ impl RpcClient {
                     break;
                 }
             }
-            let _ = write_half.shutdown().await;
+            // Wake pending calls and senders before a half-close that may
+            // stall. The reader observes the same canonical queue closure.
+            drop(writer_rx);
+            let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, write_half.shutdown()).await;
         });
         let writer_abort: AbortHandle = writer.abort_handle();
         let writer = AbortOnDrop(Some(writer));
@@ -405,7 +410,12 @@ impl RpcClient {
         let reader_notifications = notifications.clone();
         let reader = tokio::spawn(async move {
             let mut reader = BufReader::new(read_half);
-            while let Some(line) = read_frame(&mut reader).await {
+            loop {
+                let line = tokio::select! {
+                    line = read_frame(&mut reader) => line,
+                    () = reader_rpc.closed() => return,
+                };
+                let Some(line) = line else { break };
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
@@ -655,7 +665,190 @@ async fn open_local_stream(
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::pin::Pin;
+    use std::sync::atomic::AtomicBool;
+    use std::task::{Context, Poll};
     use tokio::io::DuplexStream;
+
+    /// Keeps reads open and half-close pending even after a scripted write
+    /// error, so cleanup cannot rely on peer EOF or a cooperative shutdown.
+    struct FailingWriter {
+        stream: DuplexStream,
+        fail: Arc<AtomicBool>,
+        failed: Option<tokio::sync::oneshot::Sender<()>>,
+        shutdown_polled: Arc<AtomicBool>,
+        dropped: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl AsyncRead for FailingWriter {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.stream).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for FailingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if self.fail.load(Ordering::Acquire) {
+                if let Some(failed) = self.failed.take() {
+                    let _ = failed.send(());
+                }
+                return Poll::Ready(Err(std::io::Error::other("scripted write failure")));
+            }
+            Pin::new(&mut self.stream).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.stream).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            self.shutdown_polled.store(true, Ordering::Release);
+            Poll::Pending
+        }
+    }
+
+    impl Drop for FailingWriter {
+        fn drop(&mut self) {
+            if let Some(dropped) = self.dropped.take() {
+                let _ = dropped.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn write_failure_releases_calls_and_transport_despite_stalled_shutdown() {
+        let (stream, server) = tokio::io::duplex(64 * 1024);
+        let fail = Arc::new(AtomicBool::new(false));
+        let shutdown_polled = Arc::new(AtomicBool::new(false));
+        let (failed_tx, failed_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let (pending_tx, pending_rx) = tokio::sync::oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let (read_half, mut write_half) = tokio::io::split(server);
+            let mut reader = BufReader::new(read_half);
+            let initialize: Value =
+                serde_json::from_str(&read_frame(&mut reader).await.expect("initialize frame"))
+                    .expect("initialize JSON");
+            let response = json!({
+                "jsonrpc": "2.0", "id": initialize["id"],
+                "result": {
+                    "protocol_version": RPC_PROTOCOL_VERSION, "server_version": "test",
+                    "server_pid": 7, "capabilities": [], "principal_id": "test",
+                    "commands": [],
+                },
+            });
+            write_half
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .unwrap();
+            let request: Value =
+                serde_json::from_str(&read_frame(&mut reader).await.expect("pending request"))
+                    .expect("request JSON");
+            assert_eq!(request["method"], "pending");
+            pending_tx.send(()).unwrap();
+            // Retain both halves without sending a response or EOF.
+            std::future::pending::<()>().await;
+            drop((reader, write_half));
+        });
+        let client = Arc::new(
+            RpcClient::connect_over(
+                FailingWriter {
+                    stream,
+                    fail: Arc::clone(&fail),
+                    failed: Some(failed_tx),
+                    shutdown_polled: Arc::clone(&shutdown_polled),
+                    dropped: Some(dropped_tx),
+                },
+                ConnectOptions::default(),
+            )
+            .await
+            .expect("handshake"),
+        );
+        let mut inbound = client.take_inbound_requests().unwrap();
+        let pending_client = Arc::clone(&client);
+        let mut pending = tokio::spawn(async move {
+            pending_client
+                .request_with_timeout("pending", json!({}), Duration::from_secs(30))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), pending_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        fail.store(true, Ordering::Release);
+        assert!(client.respond(json!("trigger"), Ok(Value::Null)).await);
+        tokio::time::timeout(Duration::from_secs(2), failed_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Observe all consequences while the client stays alive. More sends
+        // than the queue depth also expose an abandoned receiver retaining
+        // the queue and parking a response forever.
+        let (closed, waiting, new, responses, inbound_closed, released) = tokio::join!(
+            tokio::time::timeout(Duration::from_millis(250), client.closed()),
+            tokio::time::timeout(Duration::from_millis(250), &mut pending),
+            tokio::time::timeout(
+                Duration::from_millis(250),
+                client.request_raw("new", json!({}))
+            ),
+            tokio::time::timeout(Duration::from_millis(250), async {
+                let mut all_failed = true;
+                for n in 0..=WRITER_QUEUE_DEPTH {
+                    all_failed &= !client.respond(json!(n), Ok(Value::Null)).await;
+                }
+                all_failed
+            }),
+            tokio::time::timeout(Duration::from_millis(250), inbound.recv()),
+            tokio::time::timeout(Duration::from_secs(2), dropped_rx),
+        );
+        pending.abort();
+        peer.abort();
+        assert!(
+            closed.is_ok(),
+            "write failure must close the outbound lane: {closed:?}"
+        );
+        assert!(
+            matches!(waiting, Ok(Ok(Err(ClientError::Disconnected(_))))),
+            "pending call must disconnect: {waiting:?}"
+        );
+        assert!(
+            matches!(
+                new,
+                Ok(Err(ClientError::Rpc(_))) | Ok(Err(ClientError::Disconnected(_)))
+            ),
+            "new call must fail promptly: {new:?}"
+        );
+        assert!(
+            matches!(responses, Ok(true)),
+            "responses must fail without filling a dead queue: {responses:?}"
+        );
+        assert!(
+            matches!(inbound_closed, Ok(None)),
+            "reader must retire: {inbound_closed:?}"
+        );
+        assert!(
+            shutdown_polled.load(Ordering::Acquire),
+            "scripted shutdown must have stalled"
+        );
+        assert!(
+            matches!(released, Ok(Ok(()))),
+            "transport must be released without dropping the client: {released:?}"
+        );
+        assert_eq!(client.rpc.pending_count(), 0);
+        assert_eq!(
+            client.state(),
+            ConnectionState::Disconnected("scripted write failure".to_string())
+        );
+    }
 
     #[test]
     fn connect_options_debug_redacts_credentials_and_env_values() {
