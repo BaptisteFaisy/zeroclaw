@@ -6,9 +6,9 @@ name: Docker Publish
 # drift from the spec. Each entry produces an immutable version-pinned tag
 # (Alpine-style `<stem>-v<version>`) and a floating tag (`<stem>`).
 #
-# Images are pushed with the canonical platform matrix first, signed by digest,
-# then the pinned tag is scanned in report-only mode (exit-code: 0). Enforcement
-# flips in a follow-up after the baseline is triaged.
+# Images are pushed with the canonical platform matrix, checked for compromised
+# certificate trust by digest on every platform, then signed. Trivy remains
+# report-only (exit-code: 0) while its baseline is triaged.
 
 on:
   push:
@@ -110,6 +110,12 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ matrix.pinned_tag }}
             ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ matrix.floating_tag }}
 
+      - name: Check published image certificate rejection
+        env:
+          CERTIFICATE_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE }}@${{ steps.build-push.outputs.digest }}
+          CERTIFICATE_PLATFORMS: ${{ matrix.platforms }}
+        run: python3 scripts/ci/check_image_certificates.py "$CERTIFICATE_IMAGE" --pull --platforms "$CERTIFICATE_PLATFORMS"
+
       - name: Sign container image (keyless / Rekor)
         # Signs by digest so the signature is immutable regardless of tag mutations.
         # Consumers verify with:
@@ -131,6 +137,8 @@ jobs:
     if: github.repository == 'zeroclaw-labs/zeroclaw'
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      RELAY_PLATFORMS: linux/amd64
     permissions:
       contents: read
       packages: write
@@ -187,11 +195,17 @@ jobs:
           context: .
           file: apps/zerorelay/Dockerfile
           push: true
+          platforms: ${{ env.RELAY_PLATFORMS }}
           build-args: |
             ZEROCLAW_BUILD_ID=${{ steps.srcsha.outputs.sha }}
           tags: |
             ${{ steps.tags.outputs.pinned }}
             ${{ steps.tags.outputs.floating }}
+
+      - name: Check published relay certificate rejection
+        env:
+          CERTIFICATE_IMAGE: ${{ steps.tags.outputs.image }}@${{ steps.build-push.outputs.digest }}
+        run: python3 scripts/ci/check_image_certificates.py "$CERTIFICATE_IMAGE" --pull --platforms "$RELAY_PLATFORMS"
 
       - name: Sign relay container image (keyless / Rekor)
         env:

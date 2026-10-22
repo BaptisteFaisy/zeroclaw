@@ -480,6 +480,39 @@ gh api repos/zeroclaw-labs/zeroclaw/actions/permissions/selected-actions
 
 Any PR that adds or changes a `uses:` action source must include an allowlist impact note in its body. Avoid broad wildcard exceptions; expand the allowlist only for verified missing actions.
 
+## Container certificate regressions
+
+`docker-publish.yml` and the Docker job in `release-stable-manual.yml` run
+`scripts/ci/check_image_certificates.py` against each freshly published image
+**by digest, on every build platform, before signing**. A failed check fails the
+job and prevents its signing step. Tags have already been pushed at this point;
+this is not atomic publication or a guarantee that failed images are unavailable.
+Trivy retains its separate report-only policy.
+
+The helper exports a stopped container's final filesystem without executing its
+binaries. It checks the shipped CA bundle and the union of public certificates in
+`/etc/ssl`, `/usr/share/ca-certificates`, and `/usr/local/share/ca-certificates`.
+Both compromised emSign and AAA cross-signed paths must fail for missing trust.
+The shared `zeroclaw-tls` incident fixtures use `host.invalid` and contain no
+private keys. Verification time is fixed inside their validity period, both
+chains must first verify under their original roots, and an unaffected shipped
+anchor must still verify. Missing bundles, malformed certificates, tool errors,
+and wrong image platforms fail the check.
+
+```sh
+python3 scripts/ci/check_image_certificates_test.py
+python3 scripts/ci/check_image_certificates.py local-image:build --platforms linux/amd64
+python3 scripts/ci/check_image_certificates.py registry/image@sha256:<digest> --pull --platforms linux/amd64,linux/arm64
+```
+
+Use Python 3.9+ and OpenSSL 3 (`OPENSSL` can select its executable). The offline
+suite needs no Docker daemon. Docker PR CI additionally checks the actual
+prebuilt-context and source images, including Alpine and StageX. These tests
+exercise packaged native trust; the Rust verifier's separate
+`emudhra_distrust` tests cover distrust even when old roots are supplied. They do
+not exercise application requests, operator-mounted trust stores, or every
+possible compromised intermediate.
+
 ## Maintenance rules
 
 - Keep `CI Required Gate` deterministic and small. Adding jobs to the gate needs a clear quality argument.

@@ -17,10 +17,13 @@ on:
       - .dockerignore
       - dev/config.template.toml
       - .github/workflows/docker-image-pr.yml
+      - .github/workflows/docker-publish.yml
       - .github/workflows/release-stable-manual.yml
       - scripts/ci/prepare_docker_context.sh
       - scripts/ci/dist_runner_memory.sh
       - scripts/ci/smoke_docker_compose.sh
+      - scripts/ci/check_image_certificates.py
+      - scripts/ci/check_image_certificates_test.py
 
 concurrency:
   group: docker-image-pr-${{ github.event.pull_request.number }}
@@ -51,22 +54,22 @@ jobs:
           changed_files=$(git diff --name-only HEAD^1 HEAD^2)
           containerfile_required=false
           if [ -z "$changed_files" ] || \
-             printf '%s\n' "$changed_files" | grep -Eq '^(Containerfile|dev/ci/(filter-emudhra-ca-bundle\.sh|test_filter_emudhra_ca_bundle\.py)|crates/zeroclaw-tls/tests/fixtures/emudhra/.*|\.github/workflows/docker-image-pr\.yml)$'; then
+             printf '%s\n' "$changed_files" | grep -Eq '^(Containerfile|dev/ci/(filter-emudhra-ca-bundle\.sh|test_filter_emudhra_ca_bundle\.py)|scripts/ci/check_image_certificates(_test)?\.py|crates/zeroclaw-tls/tests/fixtures/emudhra/.*|\.github/workflows/docker-image-pr\.yml)$'; then
             containerfile_required=true
           fi
 
           # Files that the source-image matrix actually compiles or smokes.
-          # The release workflow is NOT among them: its Docker job packages
+          # Release/publish workflow files are NOT among them: the stable job packages
           # prebuilt binaries through prepare_docker_context.sh, which is what
           # the `images` job validates. A diff whose only Docker-path change is
           # the release workflow therefore gains nothing from the source
           # matrix, and on long-lived PRs that edit it for unrelated release
           # steps it reran every push.
-          source_inputs='^(Dockerfile|Dockerfile\.debian|Dockerfile\.alpine|Dockerfile\.ci|Containerfile|dev/ci/(filter-emudhra-ca-bundle\.sh|test_filter_emudhra_ca_bundle\.py)|crates/zeroclaw-tls/tests/fixtures/emudhra/.*|docker-compose\.yml|docker-compose\.alpine\.yml|\.dockerignore|dev/config\.template\.toml|\.github/workflows/docker-image-pr\.yml|scripts/ci/prepare_docker_context\.sh|scripts/ci/dist_runner_memory\.sh|scripts/ci/smoke_docker_compose\.sh)$'
+          source_inputs='^(Dockerfile|Dockerfile\.debian|Dockerfile\.alpine|Dockerfile\.ci|Containerfile|dev/ci/(filter-emudhra-ca-bundle\.sh|test_filter_emudhra_ca_bundle\.py)|crates/zeroclaw-tls/tests/fixtures/emudhra/.*|docker-compose\.yml|docker-compose\.alpine\.yml|\.dockerignore|dev/config\.template\.toml|\.github/workflows/docker-image-pr\.yml|scripts/ci/prepare_docker_context\.sh|scripts/ci/dist_runner_memory\.sh|scripts/ci/smoke_docker_compose\.sh|scripts/ci/check_image_certificates(_test)?\.py)$'
           source_builds=true
 
           if [ -n "$changed_files" ] && \
-             printf '%s\n' "$changed_files" | grep -Fxq '.github/workflows/release-stable-manual.yml' && \
+             printf '%s\n' "$changed_files" | grep -Eq '^\.github/workflows/(release-stable-manual|docker-publish)\.yml$' && \
              ! printf '%s\n' "$changed_files" | grep -Eq "$source_inputs"; then
             prebuilt_images=true
             source_builds=false
@@ -119,6 +122,9 @@ jobs:
       - name: Prepare Docker smoke context
         run: bash scripts/ci/prepare_docker_context.sh smoke docker-ctx
 
+      - name: Test image certificate gate
+        run: python3 scripts/ci/check_image_certificates_test.py
+
       - name: Cache Trivy vulnerability database
         uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
@@ -129,6 +135,9 @@ jobs:
 
       - name: Build default image
         run: docker build -f docker-ctx/Dockerfile -t zeroclaw-pr-default:smoke docker-ctx
+
+      - name: Check default image certificate rejection
+        run: python3 scripts/ci/check_image_certificates.py zeroclaw-pr-default:smoke --platforms linux/amd64
 
       # Scans the CI smoke image, not the production source Dockerfile. Trivy is
       # report-only during baseline rollout, so findings are logged but do not
@@ -144,6 +153,9 @@ jobs:
 
       - name: Build Debian compatibility image
         run: docker build -f docker-ctx/Dockerfile --build-arg VARIANT=debian -t zeroclaw-pr-debian:smoke docker-ctx
+
+      - name: Check Debian image certificate rejection
+        run: python3 scripts/ci/check_image_certificates.py zeroclaw-pr-debian:smoke --platforms linux/amd64
 
       - name: Scan Debian image with Trivy
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
@@ -193,12 +205,20 @@ jobs:
           context: .
           file: ${{ matrix.dockerfile }}
           push: false
-          load: ${{ matrix.gateway_smoke || (matrix.dockerfile == 'Dockerfile.alpine' && matrix.platform == 'linux/amd64' && !matrix.cargo_flags) }}
+          # Certificate checks read the final filesystem, including foreign
+          # architectures; no container process or emulator is started.
+          load: true
           platforms: ${{ matrix.platform }}
           tags: ${{ matrix.tag }}
           cache-from: type=gha,scope=${{ matrix.cache-scope }}
           cache-to: type=gha,scope=${{ matrix.cache-scope }},mode=max,ignore-error=true
           build-args: ${{ matrix.cargo_flags && format('ZEROCLAW_CARGO_FLAGS={0}', matrix.cargo_flags) || '' }}
+
+      - name: Check source image certificate rejection
+        env:
+          CERTIFICATE_IMAGE: ${{ matrix.tag }}
+          CERTIFICATE_PLATFORMS: ${{ matrix.platform }}
+        run: python3 scripts/ci/check_image_certificates.py "$CERTIFICATE_IMAGE" --platforms "$CERTIFICATE_PLATFORMS"
 
       - name: Verify loaded production image runs as non-root
         if: matrix.gateway_smoke || (matrix.dockerfile == 'Dockerfile.alpine' && matrix.platform == 'linux/amd64' && !matrix.cargo_flags)
