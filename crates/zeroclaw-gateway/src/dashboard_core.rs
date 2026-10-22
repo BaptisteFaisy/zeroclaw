@@ -568,27 +568,19 @@ impl Redial {
                     None => continue,
                 },
             };
-            let closing =
-                current.call::<Value>(Method::SessionClose, json!({ "session_id": core_id }));
-            match tokio::time::timeout(CLOSE_TIMEOUT, closing).await {
-                Ok(Ok(_)) => return true,
-                Ok(Err(ClientError::Rpc(error)))
-                    if error.code == SESSION_NOT_FOUND || error.code == SESSION_NOT_OWNED =>
-                {
-                    return true;
-                }
-                Ok(Err(ClientError::Rpc(error))) if error.code != AUTH_REQUIRED => {
+            match self.close_on(core_id, &current).await {
+                CloseAttempt::Closed => return true,
+                CloseAttempt::Refused(message) => {
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(json!({ "session_id": core_id, "error": error.message })),
+                            .with_attrs(json!({ "session_id": core_id, "error": message })),
                         "a dashboard conversation was refused its close; the core retires it once its client has stayed away"
                     );
                     return false;
                 }
-                // Lost, timed out, or the core wants a new handshake.
-                _ => current.shutdown(),
+                CloseAttempt::Retry => current.shutdown(),
             }
         }
         ::zeroclaw_log::record!(
@@ -600,6 +592,50 @@ impl Redial {
         );
         false
     }
+
+    /// One attempt to close `core_id` on `client`.
+    async fn close_on(&self, core_id: &str, client: &RpcClient) -> CloseAttempt {
+        let closing = client.call::<Value>(Method::SessionClose, json!({ "session_id": core_id }));
+        match tokio::time::timeout(CLOSE_TIMEOUT, closing).await {
+            Ok(Ok(_)) => CloseAttempt::Closed,
+            Ok(Err(ClientError::Rpc(error)))
+                if error.code == SESSION_NOT_FOUND || error.code == SESSION_NOT_OWNED =>
+            {
+                CloseAttempt::Closed
+            }
+            Ok(Err(ClientError::Rpc(error))) if error.code != AUTH_REQUIRED => {
+                if answered_by_core(client).await {
+                    CloseAttempt::Refused(error.message)
+                } else {
+                    CloseAttempt::Retry
+                }
+            }
+            // Lost, timed out, or the core wants a new handshake.
+            _ => CloseAttempt::Retry,
+        }
+    }
+}
+
+/// How one attempt to close a conversation came out.
+#[derive(Debug, PartialEq, Eq)]
+enum CloseAttempt {
+    /// The conversation is gone from the core.
+    Closed,
+    /// The core refused the close, with its message.
+    Refused(String),
+    /// Try again on a new connection.
+    Retry,
+}
+
+/// Whether an RPC error on `client` is the core's answer. A send that the
+/// closed writer queue refused is reported as an RPC error too, but it never
+/// reached the core: by then the connection is marked disconnected, or its
+/// outbound lane has closed.
+async fn answered_by_core(client: &RpcClient) -> bool {
+    client.state() == ConnectionState::Connected
+        && tokio::time::timeout(Duration::ZERO, client.closed())
+            .await
+            .is_err()
 }
 
 /// What closing a chat's conversation needs, owned, so it can run after the
@@ -5136,5 +5172,48 @@ mod tests {
             "{} still charged once the core answered",
             charged(&fixture.core.accounts)
         );
+    }
+
+    // ── Round-5 follow-ups ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_close_the_writer_refused_locally_is_tried_again() {
+        let fixture = Fixture::new().await;
+        let (_, session) = fixture.sign_in("alice").await;
+        let mut chat = core_caller_for(&fixture, &session)
+            .open_chat("support", None)
+            .await
+            .expect("opens");
+        let closing = chat.closing.take().expect("an open chat can be closed");
+        let core_id = chat.core_id.clone();
+
+        // The chat's connection loses its writer between the close's state
+        // check and its send: the outbound lane has closed, and the client
+        // reports the refused send as an RPC error, not as a lost connection.
+        let client = chat.bound();
+        client.shutdown();
+        tokio::time::timeout(Duration::from_secs(5), client.closed())
+            .await
+            .expect("the outbound lane closes");
+        let refused = client
+            .call::<Value>(Method::SessionClose, json!({ "session_id": core_id }))
+            .await;
+        assert!(
+            matches!(&refused, Err(ClientError::Rpc(_))),
+            "the premise: a locally refused send reads as an RPC error: {refused:?}"
+        );
+
+        // That is not the core refusing the close: it is tried again.
+        assert_eq!(
+            closing.redial.close_on(&core_id, &client).await,
+            CloseAttempt::Retry,
+            "a send the writer refused locally never reached the core"
+        );
+        assert!(
+            closing.redial.close(&core_id, Some(client)).await,
+            "the next attempt, on a new connection, closes it"
+        );
+        assert!(!fixture.store.list_ids().await.contains(&core_id));
+        drop(chat);
     }
 }
