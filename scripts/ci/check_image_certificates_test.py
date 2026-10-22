@@ -103,6 +103,19 @@ class CertificateGateTests(unittest.TestCase):
             with self.subTest(data=data), self.assertRaises(ValueError):
                 self.check_files({gate.BUNDLE: data})
 
+    def test_valid_anchor_cannot_hide_a_malformed_certificate(self):
+        invalid = b"-----BEGIN CERTIFICATE-----\nYQ==\n-----END CERTIFICATE-----\n"
+        for files in (
+            {gate.BUNDLE: CLEAN + invalid},
+            {gate.BUNDLE: invalid + CLEAN},
+            {gate.BUNDLE: CLEAN, "usr/share/ca-certificates/invalid.crt": invalid},
+        ):
+            with (
+                self.subTest(files=files),
+                self.assertRaisesRegex(ValueError, "malformed certificate"),
+            ):
+                self.check_files(files)
+
     def test_missing_bundle_cannot_follow_a_host_symlink(self):
         with self.assertRaisesRegex(ValueError, "missing or empty"):
             self.check_files({}, [(gate.BUNDLE, "/etc/ssl/cert.pem")])

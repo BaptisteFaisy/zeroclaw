@@ -131,6 +131,22 @@ def check_trust(bundle, roots, directory, openssl):
     for label, data in (("bundle", bundle), ("all packaged CA files", roots)):
         trusted = directory / "trusted.pem"
         trusted.write_bytes(data)
+        # verify can ignore a malformed certificate beside a usable anchor.
+        # Parse every certificate before accepting any trust-path rejection.
+        try:
+            run(
+                openssl,
+                "crl2pkcs7",
+                "-nocrl",
+                "-certfile",
+                str(trusted),
+                "-out",
+                os.devnull,
+            )
+        except subprocess.CalledProcessError as error:
+            raise ValueError(
+                f"{label}: malformed certificate: {error.stderr}"
+            ) from error
         for issuer in ISSUERS:
             result = verify(openssl, trusted, leaf, issuer)
             errors = re.findall(r"error (\d+) at \d+ depth lookup", result.stderr)

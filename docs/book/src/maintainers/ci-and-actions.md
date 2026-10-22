@@ -506,9 +506,11 @@ python3 scripts/ci/check_image_certificates.py registry/image@sha256:<digest> --
 ```
 
 Use Python 3.9+ and OpenSSL 3 (`OPENSSL` can select its executable). The offline
-suite needs no Docker daemon. Docker PR CI additionally checks the actual
-prebuilt-context and source images, including Alpine and StageX. These tests
-exercise packaged native trust; the Rust verifier's separate
+suite needs no Docker daemon. Docker PR CI checks the two prebuilt-context images
+and source images already loaded for smoke tests (default and Alpine AMD64).
+Checker-only changes use the offline suite and prebuilt images without selecting
+the Rust source-build matrix; all published platforms are checked at release.
+These tests exercise packaged native trust; the Rust verifier's separate
 `emudhra_distrust` tests cover distrust even when old roots are supplied. They do
 not exercise application requests, operator-mounted trust stores, or every
 possible compromised intermediate.
