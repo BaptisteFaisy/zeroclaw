@@ -125,6 +125,15 @@ pub trait TranscriptionProvider: Send + Sync + ::zeroclaw_api::attribution::Attr
     }
 }
 
+/// The Whisper `prompt` field biases recognition toward expected vocabulary;
+/// a blank value would bias it toward nothing, so it is not sent.
+fn non_empty_prompt(prompt: Option<&str>) -> Option<String> {
+    prompt
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 // ── GroqProvider ────────────────────────────────────────────────
 
 /// Groq Whisper API transcription_provider (default, backward-compatible with existing config).
@@ -134,6 +143,7 @@ pub struct GroqProvider {
     model: String,
     api_key: String,
     language: Option<String>,
+    initial_prompt: Option<String>,
 }
 
 impl GroqProvider {
@@ -155,6 +165,7 @@ impl GroqProvider {
             model: config.model.clone(),
             api_key,
             language: config.language.clone(),
+            initial_prompt: non_empty_prompt(config.initial_prompt.as_deref()),
         })
     }
 
@@ -185,6 +196,7 @@ impl GroqProvider {
                 .unwrap_or_else(|| "whisper-large-v3-turbo".to_string()),
             api_key,
             language: cfg.base.language.clone(),
+            initial_prompt: non_empty_prompt(cfg.base.initial_prompt.as_deref()),
         })
     }
 }
@@ -212,6 +224,9 @@ impl TranscriptionProvider for GroqProvider {
         if let Some(ref lang) = self.language {
             form = form.text("language", lang.clone());
         }
+        if let Some(ref prompt) = self.initial_prompt {
+            form = form.text("prompt", prompt.clone());
+        }
 
         let resp = client
             .post(&self.api_url)
@@ -235,6 +250,7 @@ pub struct OpenAiWhisperProvider {
     api_key: String,
     model: String,
     language: Option<String>,
+    initial_prompt: Option<String>,
 }
 
 impl OpenAiWhisperProvider {
@@ -256,6 +272,7 @@ impl OpenAiWhisperProvider {
             api_key,
             model: config.model.clone(),
             language: None,
+            initial_prompt: None,
         })
     }
 
@@ -286,6 +303,7 @@ impl OpenAiWhisperProvider {
                 .filter(|model| !model.trim().is_empty())
                 .unwrap_or_else(|| "whisper-1".to_string()),
             language: cfg.base.language.clone(),
+            initial_prompt: non_empty_prompt(cfg.base.initial_prompt.as_deref()),
         })
     }
 }
@@ -311,6 +329,9 @@ impl TranscriptionProvider for OpenAiWhisperProvider {
             .text("response_format", "json");
         if let Some(language) = &self.language {
             form = form.text("language", language.clone());
+        }
+        if let Some(prompt) = &self.initial_prompt {
+            form = form.text("prompt", prompt.clone());
         }
 
         let resp = client
@@ -1203,12 +1224,150 @@ impl TranscriptionManager {
         Ok(())
     }
 
+    /// The provider `transcribe` will dispatch to, or empty when unbound.
+    /// Test-only: lets channel tests assert the binding without a network
+    /// call. Gated on the two channels whose tests assert it, so no feature
+    /// shape compiles an unused method.
+    #[cfg(all(test, any(feature = "channel-slack", feature = "whatsapp-web")))]
+    pub(crate) fn bound_provider(&self) -> &str {
+        &self.agent_transcription_provider
+    }
+
     /// List registered transcription_provider names.
     pub fn available_providers(&self) -> Vec<&str> {
         self.transcription_providers
             .keys()
             .map(|k| k.as_str())
             .collect()
+    }
+}
+
+/// Bind the provider a channel's manager should dispatch to.
+///
+/// `agent_provider` is the owning agent's `transcription_provider` as the
+/// orchestrator resolved it — never a channel alias. The rules, in order:
+///
+/// 1. An explicit preference that names a registered provider wins as-is.
+/// 2. A `type.alias` preference whose exact key is not registered, but whose
+///    `type` is — a deployment with only the legacy `[transcription]` section
+///    and an agent that was written against typed aliases — binds the type
+///    key. This is the compatibility fallback one channel used to apply on
+///    its own; it now applies everywhere, and only when needed.
+/// 3. No preference and exactly one registered provider: bind it. A lone
+///    provider is unambiguous, and the alternative is a hard failure for every
+///    single-provider deployment.
+/// 4. Otherwise leave the choice unbound: with several providers a silent
+///    pick would route audio to an arbitrary vendor, and `transcribe` fails
+///    loud instead.
+#[cfg(any(
+    feature = "channel-telegram",
+    feature = "channel-discord",
+    feature = "channel-slack",
+    feature = "channel-mattermost",
+    feature = "whatsapp-web",
+    feature = "channel-lark",
+    feature = "channel-line",
+    feature = "channel-qq",
+    feature = "channel-matrix",
+    feature = "voice-wake"
+))]
+fn bind_channel_provider(
+    manager: TranscriptionManager,
+    agent_provider: &str,
+) -> TranscriptionManager {
+    let registered: Vec<String> = manager
+        .available_providers()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    if !agent_provider.is_empty() {
+        if registered.iter().any(|name| name == agent_provider) {
+            return manager.with_agent_transcription_provider(agent_provider);
+        }
+        if let Some((family, _alias)) = agent_provider.split_once('.')
+            && registered.iter().any(|name| name == family)
+        {
+            return manager.with_agent_transcription_provider(family);
+        }
+        return manager.with_agent_transcription_provider(agent_provider);
+    }
+    match registered.as_slice() {
+        [only] => manager.with_agent_transcription_provider(only.clone()),
+        _ => manager,
+    }
+}
+
+/// The one way a channel builds its transcription manager from live config.
+///
+/// Registers every configured provider — legacy `[transcription]` and typed
+/// `[providers.transcription.<type>.<alias>]` alike — and binds the provider
+/// per [`bind_channel_provider`]. Built from `Config` rather than a
+/// `TranscriptionConfig` snapshot so typed providers are visible and
+/// reloadable provider policy is never copied into a channel handle.
+///
+/// # Errors
+///
+/// Returns the manager constructor's error: transcription is enabled but no
+/// provider registered, or an invalid audio bound.
+#[cfg(any(
+    feature = "channel-telegram",
+    feature = "channel-discord",
+    feature = "channel-slack",
+    feature = "channel-mattermost",
+    feature = "whatsapp-web",
+    feature = "channel-lark",
+    feature = "channel-line",
+    feature = "channel-qq",
+    feature = "channel-matrix",
+    feature = "voice-wake"
+))]
+pub(crate) fn build_channel_transcription_manager(
+    config: &Config,
+    agent_provider: &str,
+) -> Result<TranscriptionManager> {
+    let manager =
+        TranscriptionManager::from_config_with_provider(config, agent_provider.to_string())?;
+    Ok(bind_channel_provider(manager, agent_provider))
+}
+
+/// Build a channel's manager from a `[transcription]` snapshot alone.
+///
+/// This is the compatibility and test path behind every channel's
+/// `with_transcription(config)`. It cannot see typed providers or the owning
+/// agent, so it can only bind a lone registered provider (rule 3 above). It
+/// returns `None` when transcription is disabled or the manager cannot be
+/// built; the failure is logged once here rather than in every channel, and
+/// the channel stays up without transcription.
+#[cfg(any(
+    feature = "channel-telegram",
+    feature = "channel-discord",
+    feature = "channel-slack",
+    feature = "channel-mattermost",
+    feature = "whatsapp-web",
+    feature = "channel-lark",
+    feature = "channel-line",
+    feature = "channel-qq",
+    feature = "channel-matrix",
+    feature = "voice-wake"
+))]
+pub(crate) fn manager_from_snapshot(
+    config: &TranscriptionConfig,
+) -> Option<std::sync::Arc<TranscriptionManager>> {
+    if !config.enabled {
+        return None;
+    }
+    match TranscriptionManager::new(config) {
+        Ok(manager) => Some(std::sync::Arc::new(bind_channel_provider(manager, ""))),
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"e": e.to_string()})),
+                "transcription manager init failed, voice transcription disabled"
+            );
+            None
+        }
     }
 }
 
@@ -1793,6 +1952,87 @@ mod tests {
         )
         .unwrap();
         assert_eq!(google.language_code, "en-US");
+    }
+
+    #[tokio::test]
+    async fn whisper_providers_send_initial_prompt_as_prompt_field() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "text": "ok"
+            })))
+            .mount(&server)
+            .await;
+
+        let base = |prompt: &str| zeroclaw_config::schema::TranscriptionProviderConfig {
+            api_key: Some("test-key".to_string()),
+            initial_prompt: Some(prompt.to_string()),
+            ..zeroclaw_config::schema::TranscriptionProviderConfig::default()
+        };
+
+        let mut legacy_groq = GroqProvider::from_config(
+            "groq",
+            &TranscriptionConfig {
+                api_key: Some("test-key".to_string()),
+                initial_prompt: Some("ZeroClaw".to_string()),
+                ..TranscriptionConfig::default()
+            },
+        )
+        .unwrap();
+        let mut typed_groq = GroqProvider::from_typed_config(
+            "default",
+            &zeroclaw_config::schema::GroqTranscriptionProviderConfig {
+                base: base("  Kubernetes  "),
+                model: None,
+            },
+        )
+        .unwrap();
+        let mut typed_openai = OpenAiWhisperProvider::from_typed_config(
+            "default",
+            &zeroclaw_config::schema::OpenAiTranscriptionProviderConfig {
+                base: base("PostgreSQL"),
+                model: None,
+            },
+        )
+        .unwrap();
+        let mut blank_openai = OpenAiWhisperProvider::from_typed_config(
+            "default",
+            &zeroclaw_config::schema::OpenAiTranscriptionProviderConfig {
+                base: base(" \t "),
+                model: None,
+            },
+        )
+        .unwrap();
+
+        for provider in [&mut legacy_groq, &mut typed_groq] {
+            provider.api_url = format!("{}/groq", server.uri());
+            provider.transcribe(b"audio", "voice.wav").await.unwrap();
+        }
+        for provider in [&mut typed_openai, &mut blank_openai] {
+            provider.api_url = format!("{}/openai", server.uri());
+            provider.transcribe(b"audio", "voice.wav").await.unwrap();
+        }
+
+        let requests = server.received_requests().await.unwrap();
+        let bodies: Vec<_> = requests
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        for (body, expected) in bodies.iter().zip(["ZeroClaw", "Kubernetes", "PostgreSQL"]) {
+            assert!(body.contains("name=\"prompt\""), "missing prompt: {body}");
+            assert!(
+                body.contains(&format!("\r\n\r\n{expected}\r\n")),
+                "prompt should be {expected:?}: {body}"
+            );
+        }
+        assert!(
+            !bodies[3].contains("name=\"prompt\""),
+            "a blank initial_prompt must not be sent: {}",
+            bodies[3]
+        );
     }
 
     #[test]
@@ -2660,6 +2900,102 @@ mod tests {
         assert!(
             !err.contains("no transcription_provider configured"),
             "dotted alias must resolve; got: {err}"
+        );
+    }
+}
+
+#[cfg(test)]
+#[cfg(all(
+    test,
+    any(
+        feature = "channel-telegram",
+        feature = "channel-discord",
+        feature = "channel-slack",
+        feature = "channel-mattermost",
+        feature = "whatsapp-web",
+        feature = "channel-lark",
+        feature = "channel-line",
+        feature = "channel-qq",
+        feature = "channel-matrix",
+        feature = "voice-wake"
+    )
+))]
+mod channel_builder_tests {
+    use super::*;
+
+    fn legacy_groq() -> TranscriptionConfig {
+        TranscriptionConfig {
+            enabled: true,
+            api_key: Some("k".to_string()),
+            ..TranscriptionConfig::default()
+        }
+    }
+
+    fn config_with_legacy_groq() -> Config {
+        Config {
+            transcription: legacy_groq(),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn an_explicit_registered_provider_wins() {
+        let manager = build_channel_transcription_manager(&config_with_legacy_groq(), "groq")
+            .expect("legacy groq registers");
+        assert_eq!(manager.agent_transcription_provider, "groq");
+    }
+
+    #[test]
+    fn a_typed_alias_preference_binds_the_legacy_type_when_only_the_type_is_registered() {
+        // An agent written against `groq.default` on a deployment that only has
+        // the legacy `[transcription]` section: the exact key does not exist,
+        // the type does. Binding the type is what one channel used to do by
+        // hand; every channel now gets it.
+        let manager =
+            build_channel_transcription_manager(&config_with_legacy_groq(), "groq.default")
+                .expect("legacy groq registers");
+        assert_eq!(manager.agent_transcription_provider, "groq");
+    }
+
+    #[test]
+    fn an_unregistered_preference_is_bound_verbatim_so_transcribe_fails_loud_naming_it() {
+        let manager = build_channel_transcription_manager(&config_with_legacy_groq(), "deepgram.x")
+            .expect("legacy groq registers");
+        assert_eq!(manager.agent_transcription_provider, "deepgram.x");
+    }
+
+    #[test]
+    fn no_preference_binds_the_sole_provider_and_leaves_several_unbound() {
+        let sole = build_channel_transcription_manager(&config_with_legacy_groq(), "")
+            .expect("legacy groq registers");
+        assert_eq!(sole.agent_transcription_provider, "groq");
+
+        let mut two = config_with_legacy_groq();
+        two.transcription.openai = Some(zeroclaw_config::schema::OpenAiSttConfig {
+            api_key: Some("k".to_string()),
+            ..Default::default()
+        });
+        let manager =
+            build_channel_transcription_manager(&two, "").expect("two providers register");
+        assert_eq!(manager.available_providers().len(), 2);
+        assert!(
+            manager.agent_transcription_provider.is_empty(),
+            "with several providers the choice stays unbound rather than silently picked"
+        );
+    }
+
+    #[test]
+    fn snapshot_path_gates_on_enabled_binds_the_sole_provider_and_swallows_failure() {
+        assert!(manager_from_snapshot(&TranscriptionConfig::default()).is_none());
+        let manager = manager_from_snapshot(&legacy_groq()).expect("sole provider binds");
+        assert_eq!(manager.agent_transcription_provider, "groq");
+        let enabled_but_empty = TranscriptionConfig {
+            enabled: true,
+            ..TranscriptionConfig::default()
+        };
+        assert!(
+            manager_from_snapshot(&enabled_but_empty).is_none(),
+            "a manager that cannot be built is reported once and the channel stays up"
         );
     }
 }
