@@ -9,13 +9,13 @@
 //! narrows (the agent list), it only removes. An administrator keeps the
 //! in-process chat and its history.
 //!
-//! Each socket is one conversation ([`CoreChat`]): created when the socket
+//! Each socket is one conversation (`CoreChat`): created when the socket
 //! opens, and closed when it closes, when the session ends (sign-out,
 //! expiry, revocation) or with the daemon generation. No other socket
 //! reopens it, so nothing about a conversation is shared between sockets:
 //! not its connection, not the TUI identity the core holds it under, not
-//! its approvals. A dashboard session may have [`MAX_LIVE_CONVERSATIONS`]
-//! chats open at once ([`CoreBinding`]).
+//! its approvals. A dashboard session may have `MAX_LIVE_CONVERSATIONS`
+//! chats open at once (`CoreBinding`).
 //!
 //! A conversation the core finishes creating long after its chat gave up is
 //! closed when the core's answer lands. What a chat cannot close (its token
