@@ -75,6 +75,9 @@ async fn sop_entry_tools_and_aliases_cannot_escape_principal_ceilings() {
                 }
                 let tmp = tempfile::TempDir::new().unwrap();
                 let mut config = principal_test_config(&tmp, &["*"], &["*"]);
+                // The shared fixture selects a minimal built-in set; select the
+                // entry tool so the unrestricted control arm constructs it.
+                config.tools.optional.push(target.into());
                 config
                     .permission_profiles
                     .get_mut("principal-test")
@@ -246,6 +249,12 @@ fn sop_workshop_principal_fixture(
     admin: bool,
 ) -> (RpcDispatcher, Arc<std::sync::Mutex<crate::sop::SopEngine>>) {
     let mut config = principal_test_config(tmp, tools, agents);
+    // The shared fixture selects a minimal built-in set; select the SOP tools
+    // so the admin control arm constructs them and the workshop alias target.
+    config
+        .tools
+        .optional
+        .extend(["sop_workshop", "sop_list"].map(str::to_owned));
     std::fs::create_dir_all(config.agent_workspace_dir("test-agent")).unwrap();
     config
         .permission_profiles
