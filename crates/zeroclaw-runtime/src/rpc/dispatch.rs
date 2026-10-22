@@ -8872,6 +8872,13 @@ impl RpcDispatcher {
                                 "Session not found or not owned by this principal",
                             ));
                         }
+                        // A trusted-local resume rebinds the TUI owner without a
+                        // new generation, so the remote owner is rechecked here too.
+                        if self.access_policy == RpcAccessPolicy::RemoteSessionOwner
+                            && live.is_none_or(|s| s.owner_tui_id != self.tui_id)
+                        {
+                            return Err(self.stale_session_incarnation_error());
+                        }
                         let owner = record.as_ref().and_then(|r| r.owner.as_deref());
                         let mut commit = |actual: Option<&str>| -> anyhow::Result<()> {
                             let _authority =
@@ -23600,6 +23607,122 @@ mod tests {
             let response: Value = serde_json::from_str(&frame).unwrap();
             assert_eq!(response["error"]["code"], FORBIDDEN);
             assert!(response.get("result").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn messages_frame_capacity_wait_rechecks_remote_tui_owner() {
+        // A trusted-local resume rebinds the TUI owner without changing the
+        // principal or generation, so only the TUI fence can refuse the frame.
+        for (rebind, backpressure) in [(false, false), (false, true), (true, false), (true, true)] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = two_user_config(&tmp);
+            let data_dir = config.data_dir.clone();
+            let (fixture, sessions, _, store) = make_persistence_test_dispatcher(config, &data_dir);
+            let ctx = Arc::clone(&fixture.ctx);
+            let mut creator = scoped_dispatcher(&ctx, 4343).await;
+            creator.set_tui_id_for_test(Some("remote-tui".into()));
+            creator
+                .handle_session_new_for_test(&json!({
+                    "agent_alias":"test-agent", "session_id":"shared", "chat_mode":"acp"
+                }))
+                .await
+                .unwrap();
+            store
+                .append_turn(
+                    "shared",
+                    &[ConversationMessage::Chat(ChatMessage::user(
+                        "private-marker",
+                    ))],
+                )
+                .unwrap();
+            let (mut remote, _) = roster_peer(&ctx, 4343).await;
+            remote.access_policy = RpcAccessPolicy::RemoteSessionOwner;
+            remote.set_tui_id_for_test(Some("remote-tui".into()));
+            let (tx, mut frames) = tokio::sync::mpsc::channel(1);
+            if backpressure {
+                tx.send("occupied".into()).await.unwrap();
+            }
+            let writer = tx.clone();
+            remote.rpc = Arc::new(RpcOutbound::new(tx));
+            let (arrived, release) = sessions.set_test_effect_pause("messages-frame");
+            let request = zeroclaw_spawn::spawn!(async move {
+                remote.process_line(&json!({"jsonrpc":"2.0", "id":93, "method":"session/messages", "params":{"session_id":"shared"}}).to_string()).await;
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(10), arrived.notified())
+                .await
+                .unwrap();
+            let generation = sessions.get_generation("shared").await;
+            if backpressure {
+                release.notify_one();
+                // The extra Sender belongs to a started reserve_owned future;
+                // capacity is zero until the sentinel is drained.
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while writer.strong_count() != 3 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(writer.capacity(), 0);
+            }
+            let mut local = None;
+            if rebind {
+                let mut resumer = scoped_dispatcher(&ctx, 4343).await;
+                resumer.set_tui_id_for_test(Some("local-tui".into()));
+                resumer
+                    .handle_session_new_for_test(&json!({
+                        "agent_alias":"test-agent", "session_id":"shared", "chat_mode":"acp"
+                    }))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    sessions
+                        .session_owner_tui_id("shared")
+                        .await
+                        .unwrap()
+                        .as_deref(),
+                    Some("local-tui")
+                );
+                local = Some(resumer);
+            }
+            assert_eq!(sessions.get_generation("shared").await, generation);
+            if backpressure {
+                assert_eq!(frames.recv().await.unwrap(), "occupied");
+            } else {
+                release.notify_one();
+            }
+            request.await.unwrap();
+            let frame = frames.recv().await.unwrap();
+            let response: Value = serde_json::from_str(&frame).unwrap();
+            if let Some(mut local) = local {
+                assert!(
+                    !frame.contains("private-marker"),
+                    "former remote TUI owner received the transcript: {frame}"
+                );
+                assert!(response.get("result").is_none(), "{response}");
+                assert_eq!(response["error"]["code"], SESSION_NOT_OWNED, "{response}");
+                // The trusted-local caller that took the session still reads it.
+                let (tx, mut local_frames) = tokio::sync::mpsc::channel(1);
+                local.rpc = Arc::new(RpcOutbound::new(tx));
+                local
+                    .process_line(&json!({"jsonrpc":"2.0", "id":94, "method":"session/messages", "params":{"session_id":"shared"}}).to_string())
+                    .await;
+                let control = local_frames.recv().await.unwrap();
+                assert!(
+                    control.contains("private-marker"),
+                    "trusted-local control: {control}"
+                );
+            } else {
+                assert!(
+                    frame.contains("private-marker"),
+                    "current-owner control: {frame}"
+                );
+                assert!(
+                    response.get("error").is_none(),
+                    "current-owner control: {response}"
+                );
+            }
         }
     }
 
