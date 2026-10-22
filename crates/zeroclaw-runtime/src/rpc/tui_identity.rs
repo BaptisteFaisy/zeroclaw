@@ -280,6 +280,32 @@ impl TuiRegistry {
             .copied()
     }
 
+    /// Keep registration serialized with a synchronous retirement decision
+    /// and removal. Take the session map before entering this closure; the
+    /// closure must neither await nor re-enter the registry.
+    pub(crate) fn with_departure<R>(
+        &self,
+        tui_id: &str,
+        read: impl FnOnce(Option<TuiDeparture>) -> R,
+    ) -> R {
+        let presence = self.presence.lock().unwrap_or_else(|e| e.into_inner());
+        let departure = presence.departed.get(tui_id).copied();
+        let result = read(departure);
+        drop(presence);
+        result
+    }
+
+    /// Scheduling probe for the final-check race regression. The test's
+    /// oracle is registration/removal ordering and session survival.
+    #[cfg(test)]
+    pub(crate) fn test_presence_available(&self) -> bool {
+        match self.presence.try_lock() {
+            Ok(_) => true,
+            Err(std::sync::TryLockError::WouldBlock) => false,
+            Err(std::sync::TryLockError::Poisoned(_)) => panic!("presence lock poisoned"),
+        }
+    }
+
     /// Forget the departures for which `keep` is false, once nothing can
     /// depend on them any more (their identity owns no live session).
     pub fn retain_departures(&self, mut keep: impl FnMut(&str, &TuiDeparture) -> bool) {

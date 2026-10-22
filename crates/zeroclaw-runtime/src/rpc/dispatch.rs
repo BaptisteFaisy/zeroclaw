@@ -48432,6 +48432,106 @@ mod tests {
             assert_eq!(ends.load(std::sync::atomic::Ordering::SeqCst), 0);
         }
 
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn reconnect_and_final_retirement_removal_have_a_valid_order() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            let (_tmp, sessions, ctx, ends) = context_counting_ends();
+            let mut gone = remote(&ctx, "tui_final_race");
+            let session = open(&gone).await;
+            disconnect(&ctx, &mut gone).await;
+
+            let order = Arc::new(AtomicUsize::new(1));
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (commit_tx, commit_rx) = tokio::sync::oneshot::channel();
+            let mut entered_tx = Some(entered_tx);
+            let mut commit_tx = Some(commit_tx);
+            let commit_order = Arc::clone(&order);
+            sessions.set_test_retirement_commit_hook(move |committed| {
+                if committed {
+                    let _ = commit_tx
+                        .take()
+                        .unwrap()
+                        .send(commit_order.fetch_add(1, Ordering::SeqCst));
+                } else {
+                    let _ = entered_tx.take().unwrap().send(());
+                    release_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("release final removal");
+                }
+            });
+            let sweep_ctx = Arc::clone(&ctx);
+            let sweep = zeroclaw_spawn::spawn!(async move {
+                retire_orphaned_sessions(&sweep_ctx, Instant::now() + TIMEOUT).await
+            });
+            tokio::time::timeout(Duration::from_secs(10), entered_rx)
+                .await
+                .unwrap()
+                .unwrap();
+
+            let (probe_tx, probe_rx) = tokio::sync::oneshot::channel();
+            let (registered_tx, mut registered_rx) = tokio::sync::oneshot::channel();
+            let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+            let register_ctx = Arc::clone(&ctx);
+            let register_order = Arc::clone(&order);
+            let reconnect = std::thread::spawn(move || {
+                // This selects a schedule, never an assertion: if registration
+                // can finish while removal is paused, force it to do so. If
+                // presence is busy, allow removal to proceed before waiting.
+                let available = register_ctx.tui_registry.test_presence_available();
+                let _ = probe_tx.send(available);
+                let _back = remote(&register_ctx, "tui_final_race");
+                let _ = registered_tx.send(register_order.fetch_add(1, Ordering::SeqCst));
+                finish_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("finish reconnect worker");
+            });
+            let available = tokio::time::timeout(Duration::from_secs(10), probe_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            let registration_before_release = if available {
+                Some(
+                    tokio::time::timeout(Duration::from_secs(10), &mut registered_rx)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            release_tx.send(()).unwrap();
+            let committed = tokio::time::timeout(Duration::from_secs(10), commit_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            let registered = match registration_before_release {
+                Some(order) => order,
+                None => tokio::time::timeout(Duration::from_secs(10), registered_rx)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            };
+            let retired = tokio::time::timeout(Duration::from_secs(10), sweep)
+                .await
+                .unwrap()
+                .unwrap();
+            let live = sessions.list_ids().await;
+            finish_tx.send(()).unwrap();
+            reconnect.join().unwrap();
+
+            // Allowed linearizations: a completed registration preserves its
+            // session; otherwise removal commits before registration finishes.
+            assert!(
+                registered > committed || (retired.is_empty() && live.contains(&session)),
+                "registration completed at {registered} before removal at {committed}, but its session was retired: {retired:?}"
+            );
+            assert_eq!(ends.load(Ordering::SeqCst), retired.len());
+            assert_eq!(ctx.tui_registry.departure("tui_final_race"), None);
+            assert_eq!(live.contains(&session), retired.is_empty());
+        }
+
         #[tokio::test]
         async fn an_identity_with_a_connection_still_open_has_not_left() {
             let (_tmp, sessions, ctx) = context(None);

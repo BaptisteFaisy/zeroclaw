@@ -289,6 +289,9 @@ type GatedOpPause = (
 type PromptRegistrationPause = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
 
 #[cfg(test)]
+type RetirementCommitHook = Box<dyn FnMut(bool) + Send>;
+
+#[cfg(test)]
 type PromptRehydrationPause = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
 
 #[cfg(test)]
@@ -395,6 +398,10 @@ pub struct SessionStore {
     /// holds the session map. Taken by the first removal that reaches it.
     #[cfg(test)]
     test_retirement_removal_pause: std::sync::Mutex<Option<PromptRegistrationPause>>,
+    /// Test-only observer immediately before and after the synchronous
+    /// retirement removal, after its final eligibility check.
+    #[cfg(test)]
+    test_retirement_commit_hook: std::sync::Mutex<Option<RetirementCommitHook>>,
 }
 
 /// Generation-owned handle for the canonical cancellation-token registration.
@@ -484,6 +491,8 @@ impl SessionStore {
             test_retirement_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             test_retirement_removal_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_retirement_commit_hook: std::sync::Mutex::new(None),
         }
     }
 
@@ -1804,13 +1813,15 @@ impl SessionStore {
     /// Remove the live session `expected.id` for orphan retirement, only if it
     /// is still exactly the session that was judged: the same incarnation,
     /// owner and last activity, with no turn in flight, and `still_eligible`
-    /// still holds. All of it is decided under the map lock that rebinding a
-    /// session and recording its activity also take, so neither can land
-    /// between the decision and the removal. Returns the detached agent.
+    /// still holds. Lock order is session map, then TUI presence: rebinding,
+    /// activity and registration cannot land between the final decision and
+    /// removal. No await occurs while presence is held. Returns the detached
+    /// agent after both guards are released.
     pub(crate) async fn remove_if_unchanged(
         &self,
         expected: &OwnedSession,
-        still_eligible: impl FnOnce() -> bool,
+        registry: &super::tui_identity::TuiRegistry,
+        still_eligible: impl FnOnce(Option<super::tui_identity::TuiDeparture>) -> bool,
     ) -> Option<Arc<Mutex<Agent>>> {
         let mut sessions = self.sessions.lock().await;
         self.wait_test_retirement_removal_pause().await;
@@ -1818,10 +1829,26 @@ impl SessionStore {
             .get(&expected.id)
             .and_then(|current| Self::owned(&expected.id, current))
             .is_some_and(|current| current == *expected);
-        if !unchanged || self.has_inflight_turn(&expected.id) || !still_eligible() {
+        if !unchanged || self.has_inflight_turn(&expected.id) {
             return None;
         }
-        let removed = sessions.remove(&expected.id)?;
+        let removed = registry.with_departure(&expected.owner_tui_id, |departure| {
+            if !still_eligible(departure) {
+                return None;
+            }
+            #[cfg(test)]
+            let mut commit_hook = self.test_retirement_commit_hook.lock().unwrap().take();
+            #[cfg(test)]
+            if let Some(hook) = commit_hook.as_mut() {
+                hook(false);
+            }
+            let removed = sessions.remove(&expected.id)?;
+            #[cfg(test)]
+            if let Some(hook) = commit_hook.as_mut() {
+                hook(true);
+            }
+            Some(removed)
+        })?;
         drop(sessions);
         if let Some(notify) = removed.pending_generation.as_ref() {
             notify.notify_waiters();
@@ -2098,6 +2125,11 @@ impl SessionStore {
         *self.test_retirement_removal_pause.lock().unwrap() =
             Some((Arc::clone(&entered), Arc::clone(&release)));
         (entered, release)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_retirement_commit_hook(&self, hook: impl FnMut(bool) + Send + 'static) {
+        *self.test_retirement_commit_hook.lock().unwrap() = Some(Box::new(hook));
     }
 
     #[cfg(test)]

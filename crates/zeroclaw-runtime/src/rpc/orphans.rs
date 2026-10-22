@@ -76,12 +76,25 @@ async fn retire_until_cancelled(
 
 /// Whether `session` is an orphaned remote session that is due at `now`.
 fn is_due(ctx: &RpcContext, session: &OwnedSession, timeout: Duration, now: Instant) -> bool {
-    ctx.tui_registry
-        .departure(&session.owner_tui_id)
-        .is_some_and(|departure| {
-            departure.remote && now.saturating_duration_since(departure.at) >= timeout
-        })
-        && now.saturating_duration_since(session.last_active) >= timeout
+    is_due_with_departure(
+        ctx,
+        session,
+        timeout,
+        now,
+        ctx.tui_registry.departure(&session.owner_tui_id),
+    )
+}
+
+fn is_due_with_departure(
+    ctx: &RpcContext,
+    session: &OwnedSession,
+    timeout: Duration,
+    now: Instant,
+    departure: Option<super::tui_identity::TuiDeparture>,
+) -> bool {
+    departure.is_some_and(|departure| {
+        departure.remote && now.saturating_duration_since(departure.at) >= timeout
+    }) && now.saturating_duration_since(session.last_active) >= timeout
         && !ctx.sessions.has_inflight_turn(&session.id)
         && !ctx.approval_pending.has_pending_for_session(&session.id)
 }
@@ -119,8 +132,8 @@ async fn retire(
     // alone.
     let Some(agent) = ctx
         .sessions
-        .remove_if_unchanged(&current, || {
-            !cancel.is_cancelled() && is_due(ctx, &current, timeout, now)
+        .remove_if_unchanged(&current, &ctx.tui_registry, |departure| {
+            !cancel.is_cancelled() && is_due_with_departure(ctx, &current, timeout, now, departure)
         })
         .await
     else {
