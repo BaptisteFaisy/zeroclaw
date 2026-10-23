@@ -1,8 +1,7 @@
 //! `zeroclaw-rpc-proto` is the client-facing wire contract. Its value is
 //! that a client can link it without linking the daemon, so its dependency
-//! list is an allow-list: foundation crates and serde only. A runtime or
-//! async-I/O edge here would silently turn every RPC client into a runtime
-//! consumer.
+//! list is an allow-list: foundation crates and serde only. A runtime edge
+//! here would silently turn every RPC client into a runtime consumer.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -45,7 +44,7 @@ fn rpc_proto_depends_only_on_foundation_crates() {
             assert!(
                 allowed.contains(dep.as_str()),
                 "zeroclaw-rpc-proto [{table}] declares `{dep}`, which is outside its allow-list. \
-                 The crate must stay linkable by RPC clients without the runtime or async I/O; \
+                 The crate must stay linkable by RPC clients without the runtime; \
                  extend ALLOWED_DEPENDENCIES only with a foundation crate and say why in the PR."
             );
         }
