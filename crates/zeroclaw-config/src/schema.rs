@@ -5268,6 +5268,23 @@ impl Config {
             .refs_owned_by_agent(agent_alias)
     }
 
+    /// Whether `agent_alias` is the only enabled agent in this config.
+    ///
+    /// This is the one legacy-ownership rule shared by the Discord archive
+    /// and the channel session claim: data written before per-agent
+    /// attribution existed can have had only one author when exactly one
+    /// agent is enabled, so that agent owns it. With zero or several enabled
+    /// agents nobody does, and the operator attributes the data explicitly.
+    #[must_use]
+    pub fn is_sole_enabled_agent(&self, agent_alias: &str) -> bool {
+        let mut enabled = self
+            .agents
+            .iter()
+            .filter(|(_, agent)| agent.enabled)
+            .map(|(alias, _)| alias.as_str());
+        enabled.next() == Some(agent_alias) && enabled.next().is_none()
+    }
+
     /// Workspace dir a channel's inbound-media handler writes into. Resolves
     /// the channel's owning agent and returns `<install>/agents/<alias>/workspace/`;
     /// falls back to `data_dir` for orphan channels (no owning agent enabled).
@@ -52071,6 +52088,40 @@ model_provider = \"ollama.default\"
         );
 
         assert!(config.channel_refs_owned_by_agent("rowan").is_empty());
+    }
+
+    #[::core::prelude::v1::test]
+    fn is_sole_enabled_agent_requires_exactly_one_enabled_agent_that_is_the_caller() {
+        let mut config = Config::default();
+        config.agents.clear();
+        assert!(
+            !config.is_sole_enabled_agent("solo"),
+            "with no agents nobody is the sole owner"
+        );
+        config.agents.insert(
+            "solo".to_string(),
+            agent_with_channels(true, &["telegram.main"]),
+        );
+        assert!(config.is_sole_enabled_agent("solo"));
+        assert!(
+            !config.is_sole_enabled_agent("other"),
+            "the rule names one agent, not everyone"
+        );
+        config.agents.insert(
+            "dormant".to_string(),
+            agent_with_channels(false, &["discord.ops"]),
+        );
+        assert!(
+            config.is_sole_enabled_agent("solo"),
+            "disabled agents do not make the author ambiguous"
+        );
+        assert!(
+            !config.is_sole_enabled_agent("dormant"),
+            "a disabled caller is never the sole enabled agent"
+        );
+        config.agents.get_mut("dormant").unwrap().enabled = true;
+        assert!(!config.is_sole_enabled_agent("solo"));
+        assert!(!config.is_sole_enabled_agent("dormant"));
     }
 
     #[::core::prelude::v1::test]

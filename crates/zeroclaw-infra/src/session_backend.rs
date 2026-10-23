@@ -133,16 +133,60 @@ pub fn check_session_ownership(
 /// storage admission; callbacks must not acquire storage or cross an await.
 pub type ChannelAuthority = dyn Fn(&mut dyn FnMut(&BTreeSet<String>)) + Send + Sync;
 
+/// What one inbound turn may claim, resolved by a live policy reader after
+/// storage admission so the decision and the write share one critical
+/// section.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionClaimGrant {
+    /// Channel refs the calling agent currently owns. A transcript stamped
+    /// with one of them and no agent may be claimed.
+    pub channels: BTreeSet<String>,
+    /// Whether an existing transcript that carries neither agent nor channel
+    /// attribution may be adopted. Such transcripts predate ownership
+    /// stamping on the channel path. A sole enabled agent is their only
+    /// possible author, so it adopts them, exactly as it owns the legacy
+    /// Discord archive. With several enabled agents nobody adopts
+    /// implicitly; the operator attributes the transcript explicitly.
+    pub adopt_unattributed: bool,
+}
+
+/// Synchronous live claim authority. The resolver retains its policy read
+/// guard while invoking the effect with the caller's current grant, under
+/// the same storage rules as [`ChannelAuthority`].
+pub type SessionClaimAuthority = dyn Fn(&mut dyn FnMut(&SessionClaimGrant)) + Send + Sync;
+
+/// Decide one inbound ownership claim.
+///
+/// `ownership` is `None` when no session exists (a new conversation may
+/// always be created); otherwise it is the persisted `(agent, channel)`
+/// attribution. Agent and channel ownership are judged exactly as
+/// [`check_session_ownership`] does for reads. Only the unattributed case
+/// can be widened, and only by the grant's `adopt_unattributed` bit.
+pub fn decide_session_claim(
+    ownership: Option<(Option<&str>, Option<&str>)>,
+    agent_alias: &str,
+    grant: &SessionClaimGrant,
+) -> Result<(), SessionOwnershipDenial> {
+    let Some((owner_agent, owner_channel)) = ownership else {
+        return Ok(());
+    };
+    match check_session_ownership(owner_agent, owner_channel, agent_alias, &grant.channels) {
+        Err(SessionOwnershipDenial::Unattributed) if grant.adopt_unattributed => Ok(()),
+        decision => decision,
+    }
+}
+
 /// Outcome of an ownership claim on a session key.
 ///
-/// `Foreign` carries the persisted ownership refusal for auditing. It can
-/// describe an explicit agent, a foreign channel, or missing attribution.
+/// `Foreign` carries the persisted ownership refusal so callers can tell an
+/// explicit other owner or foreign channel from a transcript that predates
+/// attribution, and surface the matching remedy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionOwnerClaim {
     /// The session was absent or its trusted persisted ownership allowed the claim.
     Claimed,
     /// Persisted ownership refused the claim; nothing was written.
-    Foreign(String),
+    Foreign(SessionOwnershipDenial),
 }
 
 /// Trait for session persistence backends.
@@ -389,18 +433,20 @@ pub trait SessionBackend: Send + Sync {
         agent_alias: &str,
     ) -> std::io::Result<SessionOwnerClaim> {
         self.claim_session_with_authority(session_key, agent_alias, &|effect| {
-            effect(&BTreeSet::new())
+            effect(&SessionClaimGrant::default())
         })
     }
 
-    /// Claim an inbound session without overwriting channel-only legacy ownership.
-    /// Unsupported backends fail closed. Existing unattributed transcripts are
-    /// not new sessions and cannot be claimed without trusted ownership.
+    /// Claim an inbound session without overwriting channel-only legacy
+    /// ownership. Unsupported backends fail closed. An existing transcript
+    /// with no attribution is not a new session: it is adopted only when the
+    /// grant says so (see [`SessionClaimGrant::adopt_unattributed`]), and the
+    /// backend decides that inside the same critical section as the write.
     fn claim_session_with_authority(
         &self,
         _session_key: &str,
         _agent_alias: &str,
-        _authority: &ChannelAuthority,
+        _authority: &SessionClaimAuthority,
     ) -> std::io::Result<SessionOwnerClaim> {
         Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -620,5 +666,46 @@ mod tests {
         let q = SessionQuery::default();
         assert!(q.keyword.is_none());
         assert!(q.limit.is_none());
+    }
+
+    #[test]
+    fn claim_decision_adopts_unattributed_only_with_the_grant() {
+        let mut grant = SessionClaimGrant::default();
+        // An absent session is always creatable.
+        assert_eq!(decide_session_claim(None, "solo", &grant), Ok(()));
+
+        // An existing transcript with no attribution predates ownership
+        // stamping: refused by default, adopted only with the grant.
+        let legacy = Some((None, None));
+        assert_eq!(
+            decide_session_claim(legacy, "solo", &grant),
+            Err(SessionOwnershipDenial::Unattributed)
+        );
+        grant.adopt_unattributed = true;
+        assert_eq!(decide_session_claim(legacy, "solo", &grant), Ok(()));
+
+        // The adoption bit never widens an explicit agent or a channel the
+        // caller does not own.
+        assert_eq!(
+            decide_session_claim(Some((Some("other"), None)), "solo", &grant),
+            Err(SessionOwnershipDenial::ForeignAgent("other".into()))
+        );
+        assert_eq!(
+            decide_session_claim(Some((None, Some("discord.ops"))), "solo", &grant),
+            Err(SessionOwnershipDenial::ForeignChannel("discord.ops".into()))
+        );
+        grant.channels.insert("discord.ops".into());
+        assert_eq!(
+            decide_session_claim(Some((None, Some("discord.ops"))), "solo", &grant),
+            Ok(())
+        );
+        assert_eq!(
+            decide_session_claim(
+                Some((Some("solo"), Some("discord.ops"))),
+                "solo",
+                &SessionClaimGrant::default()
+            ),
+            Ok(())
+        );
     }
 }

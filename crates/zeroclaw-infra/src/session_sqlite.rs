@@ -1798,21 +1798,23 @@ impl SessionBackend for SqliteSessionBackend {
         &self,
         session_key: &str,
         agent_alias: &str,
-        authority: &crate::session_backend::ChannelAuthority,
+        authority: &crate::session_backend::SessionClaimAuthority,
     ) -> std::io::Result<crate::session_backend::SessionOwnerClaim> {
-        use crate::session_backend::SessionOwnerClaim;
+        use crate::session_backend::{
+            SessionOwnerClaim, SessionOwnershipDenial, decide_session_claim,
+        };
         let mut conn = self.conn.lock();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(std::io::Error::other)?;
         let ownership = Self::session_ownership(&tx, session_key)?;
         let mut tx = Some(tx);
-        let mut claim = SessionOwnerClaim::Foreign("unavailable authority".into());
+        let mut claim = SessionOwnerClaim::Foreign(SessionOwnershipDenial::AtomicCheckUnavailable);
         let mut result = Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "channel authority unavailable",
         ));
-        authority(&mut |channels| {
+        authority(&mut |grant| {
             result = (|| {
                 if agent_alias.is_empty() {
                     return Err(std::io::Error::new(
@@ -1820,15 +1822,14 @@ impl SessionBackend for SqliteSessionBackend {
                         "empty session owner",
                     ));
                 }
-                if let Some((owner, channel)) = &ownership
-                    && let Err(denial) = check_session_ownership(
+                let persisted = ownership.as_ref().map(|(owner, channel)| {
+                    (
                         owner.as_deref().filter(|value| !value.is_empty()),
                         channel.as_deref().filter(|value| !value.is_empty()),
-                        agent_alias,
-                        channels,
                     )
-                {
-                    claim = SessionOwnerClaim::Foreign(format!("{denial:?}"));
+                });
+                if let Err(denial) = decide_session_claim(persisted, agent_alias, grant) {
+                    claim = SessionOwnerClaim::Foreign(denial);
                     return Ok(());
                 }
                 let tx = tx
@@ -1854,7 +1855,7 @@ impl SessionBackend for SqliteSessionBackend {
         agent_alias: &str,
     ) -> std::io::Result<crate::session_backend::SessionOwnerClaim> {
         self.claim_session_with_authority(session_key, agent_alias, &|effect| {
-            effect(&BTreeSet::new())
+            effect(&crate::session_backend::SessionClaimGrant::default())
         })
     }
 
@@ -3671,6 +3672,17 @@ mod tests {
             let worker_store = Arc::clone(&store);
             let worker_policy = Arc::clone(&policy);
             let worker = std::thread::spawn(move || {
+                let claim_policy = Arc::clone(&worker_policy);
+                let claim_entered_tx = entered_tx.clone();
+                let claim_authority =
+                    move |effect: &mut dyn FnMut(&crate::session_backend::SessionClaimGrant)| {
+                        let channels = claim_policy.read().clone();
+                        claim_entered_tx.send(()).unwrap();
+                        effect(&crate::session_backend::SessionClaimGrant {
+                            channels,
+                            adopt_unattributed: false,
+                        });
+                    };
                 let authority = move |effect: &mut dyn FnMut(&BTreeSet<String>)| {
                     let grant = worker_policy.read();
                     entered_tx.send(()).unwrap();
@@ -3702,7 +3714,7 @@ mod tests {
                     ),
                     "claim" => assert!(matches!(
                         worker_store
-                            .claim_session_with_authority("legacy", "owner", &authority)
+                            .claim_session_with_authority("legacy", "owner", &claim_authority)
                             .unwrap(),
                         crate::session_backend::SessionOwnerClaim::Foreign(_)
                     )),
@@ -3759,6 +3771,17 @@ mod tests {
             let worker_store = Arc::clone(&store);
             let (entered_tx, entered_rx) = mpsc::channel();
             let worker = std::thread::spawn(move || {
+                let claim_policy = Arc::clone(&policy_reader);
+                let claim_entered_tx = entered_tx.clone();
+                let claim_authority =
+                    move |effect: &mut dyn FnMut(&crate::session_backend::SessionClaimGrant)| {
+                        let channels = claim_policy.read().clone();
+                        claim_entered_tx.send(()).unwrap();
+                        effect(&crate::session_backend::SessionClaimGrant {
+                            channels,
+                            adopt_unattributed: false,
+                        });
+                    };
                 let authority = move |effect: &mut dyn FnMut(&BTreeSet<String>)| {
                     let grant = policy_reader.read();
                     entered_tx.send(()).unwrap();
@@ -3779,7 +3802,7 @@ mod tests {
                 } else {
                     assert!(matches!(
                         worker_store
-                            .claim_session_with_authority("legacy", "owner", &authority)
+                            .claim_session_with_authority("legacy", "owner", &claim_authority)
                             .unwrap(),
                         crate::session_backend::SessionOwnerClaim::Foreign(_)
                     ));
@@ -3845,5 +3868,91 @@ mod tests {
                 .unwrap(),
             ScopedSessionAccess::Denied(_)
         ));
+    }
+
+    /// Rows master wrote on the channel path carry neither an agent nor a
+    /// channel stamp. After the upgrade the sole enabled agent adopts them
+    /// inside the claim; with several enabled agents the claim refuses with
+    /// the unattributed denial and leaves the row untouched.
+    #[test]
+    fn claim_adopts_master_shaped_unattributed_row_only_for_the_sole_agent() {
+        use crate::session_backend::{
+            SessionClaimGrant, SessionContext, SessionOwnerClaim, SessionOwnershipDenial,
+        };
+        let tmp = TempDir::new().unwrap();
+        let store = SqliteSessionBackend::new(tmp.path()).unwrap();
+        store
+            .append("legacy", &ChatMessage::user("pre-upgrade turn"))
+            .unwrap();
+        // Master-shaped: the metadata row exists with NULL attribution.
+        let persisted: (Option<String>, Option<String>) = store
+            .conn
+            .lock()
+            .query_row(
+                "SELECT agent_alias, channel_id FROM session_metadata WHERE session_key = 'legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(persisted, (None, None));
+
+        let refusing = |effect: &mut dyn FnMut(&SessionClaimGrant)| {
+            effect(&SessionClaimGrant::default());
+        };
+        assert_eq!(
+            store
+                .claim_session_with_authority("legacy", "solo", &refusing)
+                .unwrap(),
+            SessionOwnerClaim::Foreign(SessionOwnershipDenial::Unattributed)
+        );
+        assert_eq!(store.get_session_agent_alias("legacy").unwrap(), None);
+        assert_eq!(store.load("legacy").len(), 1);
+
+        let adopting = |effect: &mut dyn FnMut(&SessionClaimGrant)| {
+            effect(&SessionClaimGrant {
+                adopt_unattributed: true,
+                ..SessionClaimGrant::default()
+            });
+        };
+        assert_eq!(
+            store
+                .claim_session_with_authority("legacy", "solo", &adopting)
+                .unwrap(),
+            SessionOwnerClaim::Claimed
+        );
+        assert_eq!(
+            store.get_session_agent_alias("legacy").unwrap().as_deref(),
+            Some("solo")
+        );
+        assert_eq!(store.load("legacy")[0].content, "pre-upgrade turn");
+        // Adoption is a one-time repair. The row is now explicitly owned, so
+        // a different sole agent is refused like any other foreign agent.
+        assert_eq!(
+            store
+                .claim_session_with_authority("legacy", "other", &adopting)
+                .unwrap(),
+            SessionOwnerClaim::Foreign(SessionOwnershipDenial::ForeignAgent("solo".into()))
+        );
+        // Channel-stamped legacy rows are never adopted through this bit.
+        store
+            .append("channel-legacy", &ChatMessage::user("ops turn"))
+            .unwrap();
+        store
+            .set_session_context(
+                "channel-legacy",
+                SessionContext {
+                    channel_id: Some("discord.ops"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .claim_session_with_authority("channel-legacy", "solo", &adopting)
+                .unwrap(),
+            SessionOwnerClaim::Foreign(SessionOwnershipDenial::ForeignChannel(
+                "discord.ops".into()
+            ))
+        );
     }
 }

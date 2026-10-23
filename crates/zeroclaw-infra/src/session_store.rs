@@ -969,19 +969,25 @@ impl SessionBackend for SessionStore {
         &self,
         session_key: &str,
         agent_alias: &str,
-        authority: &crate::session_backend::ChannelAuthority,
+        authority: &crate::session_backend::SessionClaimAuthority,
     ) -> std::io::Result<crate::session_backend::SessionOwnerClaim> {
-        use crate::session_backend::SessionOwnerClaim;
+        use crate::session_backend::{
+            SessionOwnerClaim, SessionOwnershipDenial, decide_session_claim,
+        };
         let _guard = self.mutation_guard()?;
+        // A transcript without a sidecar is an existing, unattributed
+        // session (master wrote every channel transcript this way), not an
+        // absent one; `metadata_for_session` is `None` only when neither file
+        // exists.
         let ownership = self
             .metadata_for_session(session_key)
             .map(|metadata| (metadata.agent_alias, metadata.channel_id));
-        let mut claim = SessionOwnerClaim::Foreign("unavailable authority".into());
+        let mut claim = SessionOwnerClaim::Foreign(SessionOwnershipDenial::AtomicCheckUnavailable);
         let mut result = Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "channel authority unavailable",
         ));
-        authority(&mut |channels| {
+        authority(&mut |grant| {
             result = (|| {
                 if agent_alias.is_empty() {
                     return Err(std::io::Error::new(
@@ -989,15 +995,14 @@ impl SessionBackend for SessionStore {
                         "empty session owner",
                     ));
                 }
-                if let Some((owner, channel)) = &ownership
-                    && let Err(denial) = check_session_ownership(
+                let persisted = ownership.as_ref().map(|(owner, channel)| {
+                    (
                         owner.as_deref().filter(|value| !value.is_empty()),
                         channel.as_deref().filter(|value| !value.is_empty()),
-                        agent_alias,
-                        channels,
                     )
-                {
-                    claim = SessionOwnerClaim::Foreign(format!("{denial:?}"));
+                });
+                if let Err(denial) = decide_session_claim(persisted, agent_alias, grant) {
+                    claim = SessionOwnerClaim::Foreign(denial);
                     return Ok(());
                 }
                 self.update_metadata_unlocked(session_key, |metadata| {
@@ -1017,7 +1022,7 @@ impl SessionBackend for SessionStore {
         agent_alias: &str,
     ) -> std::io::Result<crate::session_backend::SessionOwnerClaim> {
         self.claim_session_with_authority(session_key, agent_alias, &|effect| {
-            effect(&BTreeSet::new())
+            effect(&crate::session_backend::SessionClaimGrant::default())
         })
     }
 
@@ -2045,6 +2050,17 @@ mod tests {
             let worker_store = Arc::clone(&store);
             let worker_policy = Arc::clone(&policy);
             let worker = std::thread::spawn(move || {
+                let claim_policy = Arc::clone(&worker_policy);
+                let claim_entered_tx = entered_tx.clone();
+                let claim_authority =
+                    move |effect: &mut dyn FnMut(&crate::session_backend::SessionClaimGrant)| {
+                        let channels = claim_policy.read().clone();
+                        claim_entered_tx.send(()).unwrap();
+                        effect(&crate::session_backend::SessionClaimGrant {
+                            channels,
+                            adopt_unattributed: false,
+                        });
+                    };
                 let authority = move |effect: &mut dyn FnMut(&BTreeSet<String>)| {
                     let grant = worker_policy.read();
                     entered_tx.send(()).unwrap();
@@ -2076,7 +2092,7 @@ mod tests {
                     ),
                     "claim" => assert!(matches!(
                         worker_store
-                            .claim_session_with_authority("legacy", "owner", &authority)
+                            .claim_session_with_authority("legacy", "owner", &claim_authority)
                             .unwrap(),
                         crate::session_backend::SessionOwnerClaim::Foreign(_)
                     )),
@@ -2104,5 +2120,83 @@ mod tests {
                 ScopedSessionAccess::Granted(())
             ));
         }
+    }
+
+    /// A transcript master wrote on the channel path has no ownership sidecar
+    /// at all. After the upgrade the sole enabled agent adopts it inside the
+    /// claim, which materializes the sidecar; with several enabled agents the
+    /// claim refuses with the unattributed denial and writes nothing.
+    #[test]
+    fn claim_adopts_sidecar_less_transcript_only_for_the_sole_agent() {
+        use crate::session_backend::{
+            SessionClaimGrant, SessionContext, SessionOwnerClaim, SessionOwnershipDenial,
+        };
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        store
+            .append("legacy", &ChatMessage::user("pre-upgrade turn"))
+            .unwrap();
+        assert!(store.session_path("legacy").exists());
+        assert!(
+            !store.metadata_path("legacy").exists(),
+            "master-shaped: no ownership sidecar"
+        );
+
+        let refusing = |effect: &mut dyn FnMut(&SessionClaimGrant)| {
+            effect(&SessionClaimGrant::default());
+        };
+        assert_eq!(
+            store
+                .claim_session_with_authority("legacy", "solo", &refusing)
+                .unwrap(),
+            SessionOwnerClaim::Foreign(SessionOwnershipDenial::Unattributed)
+        );
+        assert!(!store.metadata_path("legacy").exists());
+        assert_eq!(store.load("legacy").len(), 1);
+
+        let adopting = |effect: &mut dyn FnMut(&SessionClaimGrant)| {
+            effect(&SessionClaimGrant {
+                adopt_unattributed: true,
+                ..SessionClaimGrant::default()
+            });
+        };
+        assert_eq!(
+            store
+                .claim_session_with_authority("legacy", "solo", &adopting)
+                .unwrap(),
+            SessionOwnerClaim::Claimed
+        );
+        assert!(store.metadata_path("legacy").exists());
+        assert_eq!(
+            store.get_session_agent_alias("legacy").unwrap().as_deref(),
+            Some("solo")
+        );
+        assert_eq!(store.load("legacy")[0].content, "pre-upgrade turn");
+        assert_eq!(
+            store
+                .claim_session_with_authority("legacy", "other", &adopting)
+                .unwrap(),
+            SessionOwnerClaim::Foreign(SessionOwnershipDenial::ForeignAgent("solo".into()))
+        );
+        store
+            .append("channel-legacy", &ChatMessage::user("ops turn"))
+            .unwrap();
+        store
+            .set_session_context(
+                "channel-legacy",
+                SessionContext {
+                    channel_id: Some("discord.ops"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .claim_session_with_authority("channel-legacy", "solo", &adopting)
+                .unwrap(),
+            SessionOwnerClaim::Foreign(SessionOwnershipDenial::ForeignChannel(
+                "discord.ops".into()
+            ))
+        );
     }
 }

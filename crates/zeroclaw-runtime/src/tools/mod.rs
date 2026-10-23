@@ -1863,26 +1863,16 @@ fn all_tools_with_runtime_on_thread(
                                 .into_iter()
                                 .filter(|r| r.starts_with("discord."))
                                 .collect();
-                            if cfg.agents.values().filter(|agent| agent.enabled).count() == 1
-                                && cfg.agents.get(&alias).is_some_and(|agent| agent.enabled)
-                            {
+                            if cfg.is_sole_enabled_agent(&alias) {
                                 namespaces.push("default".to_string());
                             }
                             effect(&namespaces);
                         }))
                     }
-                    None => {
-                        let enabled_agent_count =
-                            root_config.agents.values().filter(|a| a.enabled).count();
-                        DiscordArchiveScope::new(
-                            owned_discord_refs,
-                            enabled_agent_count == 1
-                                && root_config
-                                    .agents
-                                    .get(agent_alias)
-                                    .is_some_and(|agent| agent.enabled),
-                        )
-                    }
+                    None => DiscordArchiveScope::new(
+                        owned_discord_refs,
+                        root_config.is_sole_enabled_agent(agent_alias),
+                    ),
                 };
                 register_tool!(
                     "discord_search",
