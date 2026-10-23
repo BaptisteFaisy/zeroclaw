@@ -173,7 +173,13 @@ impl Instance {
             "the config must be written inside the instance's temp dir, never over the \
              developer's live config"
         );
-        config.save().await.expect("write the isolated config.toml");
+        // Each write replaces the whole file of this isolated instance on
+        // purpose: the config is built here, not loaded from that file, so a
+        // plain save would refuse the overwrite.
+        config
+            .force_save()
+            .await
+            .expect("write the isolated config.toml");
     }
 
     /// Write the standalone gateway's own config, in its own config dir and
