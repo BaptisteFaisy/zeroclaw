@@ -329,9 +329,13 @@ everything else; JSON-RPC errors are kept for the caller's own faults.
 | `timeout` | No outcome within 10 seconds of the request entering the route's queue |
 | `cancelled` | A `plugin-webhook/cancel` for this `request_id` ended the dispatch |
 
-Outcomes carry no plugin diagnostic detail. The daemon logs that detail with
-the plugin and channel alias, and records the plugin's rejections with the
-route's path as well.
+Outcomes carry no plugin diagnostic detail, and neither do the daemon's
+records. A rejection is logged with the plugin name, the channel alias and
+an `error_key` (`plugin_webhook_unauthorized`, `plugin_webhook_invalid` or
+`plugin_webhook_unavailable`; `plugin_webhook_route_closed` and
+`plugin_webhook_reply_dropped` when the route stopped serving), under a fixed
+message. The route's path stays out of the record, because some vendors use
+it as the shared secret, and so does the plugin's own rejection text.
 
 Each dispatch runs in its own task, so the connection keeps answering other
 requests, including `plugin-webhook/cancel`, while the plugin works. A
