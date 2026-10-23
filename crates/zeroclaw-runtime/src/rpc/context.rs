@@ -295,6 +295,7 @@ impl RpcContext {
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
+            plugin_webhooks: None,
             sop_engine: None,
             sop_driver_handles: None,
             sop_audit: None,

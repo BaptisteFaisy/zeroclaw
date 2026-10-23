@@ -16389,13 +16389,9 @@ mod tests {
                 ..PluginChannelConfig::default()
             };
 
-            dispatcher
-                .ctx
-                .config
-                .write()
-                .channels
-                .plugin
-                .remove("fixture-alias");
+            publish_test_config(&dispatcher.ctx, |config| {
+                config.channels.plugin.remove("fixture-alias");
+            });
             let response = call(
                 &mut dispatcher,
                 &mut rx,
@@ -16411,13 +16407,12 @@ mod tests {
                 "{message}"
             );
 
-            dispatcher
-                .ctx
-                .config
-                .write()
-                .channels
-                .plugin
-                .insert("fixture-alias".into(), instance(false));
+            publish_test_config(&dispatcher.ctx, |config| {
+                config
+                    .channels
+                    .plugin
+                    .insert("fixture-alias".into(), instance(false));
+            });
             let response = call(
                 &mut dispatcher,
                 &mut rx,
@@ -16433,8 +16428,7 @@ mod tests {
                 "{message}"
             );
 
-            {
-                let mut config = dispatcher.ctx.config.write();
+            publish_test_config(&dispatcher.ctx, |config| {
                 config
                     .channels
                     .plugin
@@ -16449,7 +16443,7 @@ mod tests {
                         ..AliasedAgentConfig::default()
                     },
                 );
-            }
+            });
             let response = call(
                 &mut dispatcher,
                 &mut rx,
@@ -16469,14 +16463,13 @@ mod tests {
                 "a refused dispatch reaches no worker"
             );
 
-            dispatcher
-                .ctx
-                .config
-                .write()
-                .agents
-                .get_mut("ops")
-                .expect("the agent was added")
-                .accept_injected_webhooks = true;
+            publish_test_config(&dispatcher.ctx, |config| {
+                config
+                    .agents
+                    .get_mut("ops")
+                    .expect("the agent was added")
+                    .accept_injected_webhooks = true;
+            });
             let response = call(
                 &mut dispatcher,
                 &mut rx,
@@ -16508,13 +16501,9 @@ mod tests {
 
             // A live config write removes the instance. Its route stays
             // published until the next reload retires it.
-            dispatcher
-                .ctx
-                .config
-                .write()
-                .channels
-                .plugin
-                .remove("fixture-alias");
+            publish_test_config(&dispatcher.ctx, |config| {
+                config.channels.plugin.remove("fixture-alias");
+            });
             assert!(
                 ingress.registry().get("fixture").is_some(),
                 "the route outlives the write until reload"
