@@ -58,6 +58,7 @@ while IFS= read -r path; do
         crates/zeroclaw-gateway/src/core_rpc.rs|\
         crates/zeroclaw-rpc-client/*|\
         crates/zeroclaw-rpc-proto/*|\
+        crates/zeroclaw-api/src/jsonrpc.rs|\
         crates/zeroclaw-gateway/src/plugin_webhook*|\
         crates/zeroclaw-gateway/src/lib.rs|\
         crates/zeroclaw-gateway/Cargo.toml|\
