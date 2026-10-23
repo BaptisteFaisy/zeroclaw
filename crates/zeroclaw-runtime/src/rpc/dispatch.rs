@@ -16154,13 +16154,15 @@ mod tests {
                 assert!(message.contains(method), "{message}");
                 assert!(!message.contains("rpc-plugin-webhook"), "{message}");
 
-                // Other tests share the log stream, so pick this refusal's
-                // record by event, method, and principal.
+                // Other tests share the log stream and the test principal, so
+                // pick this refusal's record by event, method, principal and
+                // the reason the caller was given.
                 let mut audited = Vec::new();
                 while let Ok(record) = records.try_recv() {
                     if record["message"] == "RPC authorization denied"
                         && record["attributes"]["method"] == method
                         && record["attributes"]["principal_id"] == principal_id
+                        && record["attributes"]["reason"] == message
                     {
                         audited.push(record);
                     }
