@@ -36,6 +36,11 @@ pub enum Method {
     SessionDelete,
     SessionApprove,
     SessionKill,
+    SessionSteer,
+    SessionAbort,
+    SessionAppend,
+    SessionRename,
+    SessionRunOnce,
 
     // Memory
     MemoryList,
@@ -175,6 +180,11 @@ impl Method {
         (Method::SessionDelete, "session/delete"),
         (Method::SessionApprove, "session/approve"),
         (Method::SessionKill, "session/kill"),
+        (Method::SessionSteer, "session/steer"),
+        (Method::SessionAbort, "session/abort"),
+        (Method::SessionAppend, "session/append"),
+        (Method::SessionRename, "session/rename"),
+        (Method::SessionRunOnce, "session/run-once"),
         // Memory
         (Method::MemoryList, "memory/list"),
         (Method::MemorySearch, "memory/search"),
@@ -316,7 +326,7 @@ impl Method {
             // Sessions
             M::SessionNew => (Typed("SessionNewParams"), Typed("SessionNewResult")),
             M::SessionClose => (Typed("SessionIdParams"), Typed("SessionCloseResult")),
-            M::SessionPrompt => (Typed("SessionPromptParams"), Typed("SessionPromptResult")),
+            M::SessionPrompt => (Typed("SessionPromptParams"), Typed("SessionPromptAck")),
             M::SessionConfigure => (
                 Typed("SessionConfigureParams"),
                 Typed("SessionConfigureResult"),
@@ -333,6 +343,11 @@ impl Method {
             M::SessionDelete => (Typed("SessionIdParams"), Typed("SessionDeleteResult")),
             M::SessionApprove => (Typed("SessionApproveParams"), Typed("SessionApproveResult")),
             M::SessionKill => (Typed("SessionKillParams"), Typed("SessionKillResult")),
+            M::SessionSteer => (Typed("SessionSteerParams"), Typed("SessionSteerResult")),
+            M::SessionAbort => (Typed("SessionIdParams"), Typed("SessionCancelResult")),
+            M::SessionAppend => (Typed("SessionAppendParams"), Typed("SessionAppendResult")),
+            M::SessionRename => (Typed("SessionRenameParams"), Typed("SessionRenameResult")),
+            M::SessionRunOnce => (Typed("SessionRunOnceParams"), Typed("SessionRunOnceResult")),
 
             // Memory
             M::MemoryList => (Typed("MemoryListParams"), Typed("MemoryListResult")),

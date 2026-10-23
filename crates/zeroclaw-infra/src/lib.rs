@@ -3,6 +3,7 @@
 //! These are cross-cutting utilities used by multiple channel implementations.
 
 pub mod acp_session_store;
+pub mod conversation_owners;
 pub mod debounce;
 pub mod net_guard;
 pub mod plugin_webhook;
