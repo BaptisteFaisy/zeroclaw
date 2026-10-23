@@ -2045,6 +2045,14 @@ impl RpcDispatcher {
         std::collections::HashMap::new()
     }
 
+    /// A caller that is not this host's local IPC: the WSS listener, or the
+    /// in-process seam, which relays a remote browser. Local-only behaviour
+    /// that keys on the peer keys on this, never on the peer label alone.
+    fn is_remote_caller(&self) -> bool {
+        self.peer_label.starts_with("wss:")
+            || self.transport_kind == crate::rpc::transport::TransportKind::Inproc
+    }
+
     fn may_use_forwarded_environment(
         &self,
         grants: Option<&zeroclaw_api::grants::ResolvedGrants>,
@@ -6605,12 +6613,13 @@ impl RpcDispatcher {
                 .agent_workspace_dir(&agent_alias)
                 .to_string_lossy()
                 .to_string();
-            let is_wss = self.peer_label.starts_with("wss:");
+            let is_remote = self.is_remote_caller();
             // Resolve + authorize attachment sources once; the returned slots
             // are index-aligned with req.attachments and carry the exact
-            // canonical target each read must bind to. On WSS, path sources are
-            // rejected inside process_file_entry, so no resolution is needed.
-            let attachment_sources = if is_wss {
+            // canonical target each read must bind to. For a remote caller,
+            // path sources are rejected inside process_file_entry, so no
+            // resolution is needed.
+            let attachment_sources = if is_remote {
                 Vec::new()
             } else {
                 match self.authorize_attachment_sources(
@@ -6644,7 +6653,7 @@ impl RpcDispatcher {
                         entry,
                         sid,
                         &upload_root,
-                        is_wss,
+                        is_remote,
                         source,
                         &self.ctx.sessions,
                     ) => result?,
@@ -11710,11 +11719,11 @@ impl RpcDispatcher {
             .upload_target(Method::FileAttach, &req.session_id)
             .await?;
 
-        let is_wss = self.peer_label.starts_with("wss:");
+        let is_remote = self.is_remote_caller();
         // Resolve + authorize once; the returned slots are index-aligned with
-        // req.files and carry the exact canonical target each read binds to. On
-        // WSS, path sources are rejected in load_file_entry.
-        let attachment_sources = if is_wss {
+        // req.files and carry the exact canonical target each read binds to.
+        // For a remote caller, path sources are rejected in load_file_entry.
+        let attachment_sources = if is_remote {
             Vec::new()
         } else {
             self.authorize_attachment_sources(
@@ -11730,7 +11739,7 @@ impl RpcDispatcher {
 
         for (idx, entry) in req.files.iter().enumerate() {
             let source = attachment_sources.get(idx).and_then(|s| s.as_ref());
-            let (bytes, filename) = load_file_entry(entry, is_wss, source).await?;
+            let (bytes, filename) = load_file_entry(entry, is_remote, source).await?;
             total_bytes += bytes.len() as u64;
             if total_bytes > MAX_REQUEST_BYTES {
                 return Err(rpc_err(
@@ -12388,7 +12397,7 @@ impl RpcDispatcher {
         // itself, which is the entitlement this method relies on. Lift the
         // refusal once there is a principal to authorize run contents against,
         // and replace it with that check rather than simply removing it.
-        if self.peer_label.starts_with("wss:") {
+        if self.is_remote_caller() {
             return Err(rpc_err(
                 AUTH_REQUIRED,
                 "sops/run-detail is not served over remote WSS: the transport has no \
@@ -12684,7 +12693,7 @@ impl RpcDispatcher {
         // socket itself. Checked before the params are parsed so a refused
         // caller learns nothing about which SOPs exist. Replace this with a
         // principal check once there is one, rather than removing it.
-        if self.peer_label.starts_with("wss:") {
+        if self.is_remote_caller() {
             return Err(rpc_err(
                 AUTH_REQUIRED,
                 "sops/rename is not served over remote WSS: the transport has no \

@@ -14401,7 +14401,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-rpc-client"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "serde",
  "serde_json",
