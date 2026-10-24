@@ -8315,9 +8315,13 @@ permissions = ["http_client"]
                 ..Default::default()
             },
         );
+        // `discord_search` registers only for the agent that owns an enabled,
+        // archiving Discord alias. With no agent bindings declared, the sole
+        // enabled agent owns every enabled channel, so the alias must be on.
         cfg.channels.discord.insert(
             "inventory".into(),
             DiscordConfig {
+                enabled: true,
                 archive: true,
                 ..Default::default()
             },
