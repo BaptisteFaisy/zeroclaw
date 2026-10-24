@@ -80,6 +80,7 @@ Plus five plugin known-issue fixes, Telegram rate-limit handling, ZeroCode cost 
 
 - Quickstart help for a provider's `api_key` now says the key is encrypted into `config.toml`, with its encryption key in `.secret_key` beside it, instead of claiming the OS keyring (#11840).
 - Bump `js-yaml` to 4.3.2 in the dashboard build, outside advisory GHSA-2883-xcg3-v3hh (#10729).
+- The arm64 `dist` container image publishes again: its build now gets 8 GiB of swap and a serial build, as the release workflow's Linux ARM64 build does (#11833, closes #11828).
 
 ## Bug Fixes
 
@@ -143,7 +144,24 @@ These issues ship in v0.8.7. None of them weakens a security check; where behavi
 - **Installing over an installed package is refused.** `plugin install` of a package that is already installed refuses and prints the matching `plugin update` command (#10162).
 - **Registry packages have no versioned WIT compatibility check yet.** The registry lists only versions built for this release, and the install-time load check refuses an incompatible package, but a package does not yet declare which host versions it supports.
 - **Slack no longer shows "is thinking…" in ordinary channel threads.** Since v0.8.5, an agent mentioned in a channel thread shows only the 👀 acknowledgement reaction until it replies; the status line appears only in Slack's AI-assistant pane. With `stream_drafts = true`, progress appears as a draft message that the final answer replaces (#11416).
-- **The `dist` container image may not publish with this release.** Its arm64 build ran out of memory on the release runners for v0.8.6. `docker-publish.yml` now gives that build more memory (#11833), but it has not yet completed there. The `v0.8.7`, `latest`, `v0.8.7-debian` and `debian` images, for amd64 and arm64, carry the same features, repackaged from the release archives; use one of them in the meantime (#11828).
+
+## Binary size
+
+Release binary bytes per target triple, as printed by each build job's binary size check with the release workflow's toolchain and target flags. v0.8.6 comes from its release run (run 39095722409, `c473221313`); v0.8.7 from a `dist` Cross-Platform Build of the freeze commit (run 40059806582, `4db7afdcfa`). The ARM32 and Android binaries carry no plugin host. The largest binary, x86_64-unknown-linux-musl, is 76,774,224 bytes, 6.78 MiB under the 80 MiB release cap.
+
+```text
+target                               v0.8.6      v0.8.7       delta  delta %  plugin host
+x86_64-unknown-linux-gnu         76,621,800  76,715,464     +93,664    +0.1%  yes
+x86_64-unknown-linux-musl        76,642,608  76,774,224    +131,616    +0.2%  yes
+aarch64-unknown-linux-gnu        55,781,376  55,978,512    +197,136    +0.4%  yes
+aarch64-unknown-linux-musl       51,627,424  51,685,280     +57,856    +0.1%  yes
+x86_64-apple-darwin              64,339,064  64,408,904     +69,840    +0.1%  yes
+aarch64-apple-darwin             42,810,832  42,860,816     +49,984    +0.1%  yes
+x86_64-pc-windows-msvc           64,436,736  64,529,408     +92,672    +0.1%  yes
+armv7-unknown-linux-gnueabihf    52,989,368  53,063,388     +74,020    +0.1%  no
+arm-unknown-linux-gnueabihf      53,329,336  53,382,876     +53,540    +0.1%  no
+aarch64-linux-android            45,448,392  45,540,096     +91,704    +0.2%  no
+```
 
 ## Contributors
 
