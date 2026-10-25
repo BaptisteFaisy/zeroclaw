@@ -540,6 +540,28 @@ struct TurnCompleteExtras {
 }
 type BoxRpcFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = RpcResult> + Send + 'a>>;
 
+/// Operator text for a refused alias creation, shared by explicit creation and
+/// property writes that would create the alias. Retired-knowledge refusals are
+/// localized; the reserved and invalid cases keep their existing wording.
+fn alias_create_refusal_message(error: &zeroclaw_config::alias_refs::CreateError) -> String {
+    use zeroclaw_config::alias_refs::{CreateError, RetiredKnowledgeError};
+    match error {
+        CreateError::Retirement(RetiredKnowledgeError::Retained { alias }) => {
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-alias-create-knowledge-retained",
+                &[("alias", alias)],
+            )
+        }
+        CreateError::Retirement(RetiredKnowledgeError::Uninspectable { alias, reason }) => {
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-alias-create-knowledge-uninspectable",
+                &[("alias", alias), ("reason", reason)],
+            )
+        }
+        CreateError::Reserved(_) | CreateError::Invalid(_) => error.to_string(),
+    }
+}
+
 fn rpc_err(code: i32, msg: impl Into<String>) -> JsonRpcError {
     JsonRpcError {
         code,
@@ -9508,14 +9530,12 @@ impl RpcDispatcher {
         prop: &str,
         value: &Value,
     ) -> Result<(), JsonRpcError> {
-        if config.ensure_map_key_for_path(prop) {
-            // Refused to vivify the reserved `default` agent: return a
-            // reserved error rather than a downstream "Unknown property".
-            return Err(rpc_err(
-                INVALID_PARAMS,
-                "alias `default` is reserved and cannot be created",
-            ));
-        }
+        // Refused to create the alias this path names (the reserved `default`
+        // agent, or an agent whose retired knowledge remains): return that
+        // refusal rather than a downstream "Unknown property".
+        config
+            .ensure_map_key_for_path(prop)
+            .map_err(|error| rpc_err(INVALID_PARAMS, alias_create_refusal_message(&error)))?;
         let info = config.prop_fields().into_iter().find(|f| f.name == prop);
         // Polymorphic value: strings pass through, everything else coerced.
         let value_str = match value {
@@ -10098,7 +10118,7 @@ impl RpcDispatcher {
             // path cannot author an `agents.default` the rename guard then traps.
             let created =
                 zeroclaw_config::alias_refs::create_map_key_checked(config, &req.path, &req.key)
-                    .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+                    .map_err(|e| rpc_err(INVALID_PARAMS, alias_create_refusal_message(&e)))?;
             if created {
                 config.mark_dirty(&format!("{}.{}", req.path, req.key));
             }
@@ -37290,6 +37310,110 @@ mod tests {
                 .agent_lifecycle
                 .reserve_admission("must_not_publish")
                 .is_ok()
+        );
+    }
+
+    /// A committed delete whose knowledge purge failed leaves rows under the
+    /// deleted alias. `config/set` and `config/set-many` must refuse to
+    /// recreate that agent until a retried delete converges, and the agent
+    /// recreated afterwards must not see the retired rows.
+    #[tokio::test]
+    async fn config_set_cannot_recreate_agent_until_retired_knowledge_converges() {
+        use zeroclaw_memory::knowledge_graph::{KnowledgeGraph, KnowledgeScope};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_agent_delete_test_config(&tmp);
+        let graph_dir = tmp.path().join("graph");
+        std::fs::create_dir_all(&graph_dir).unwrap();
+        config.knowledge.db_path = graph_dir
+            .join("knowledge.db")
+            .to_string_lossy()
+            .into_owned();
+        let graph_path = config.knowledge.resolved_db_path();
+        let node = seed_agent_knowledge(&config, "alpha", "retired-agent-marker");
+        config.save().await.unwrap();
+        let dispatcher = make_config_set_test_dispatcher(config);
+        // The refusal text is localized: expect exactly what the shared probe and
+        // this surface's formatter produce for the store's current state.
+        let expected = |config: &zeroclaw_config::schema::Config| {
+            alias_create_refusal_message(&zeroclaw_config::alias_refs::CreateError::Retirement(
+                zeroclaw_config::alias_refs::ensure_knowledge_owner_retired(config, "alpha")
+                    .expect_err("the retired alias must not be admissible yet"),
+            ))
+        };
+        // Not a channel-generation field: this dispatcher has no reload
+        // controls, and the refusal under test must come from admission.
+        let set_alpha = json!({"prop": "agents.alpha.delegate_same_risk_profile", "value": true});
+
+        // Fail the knowledge half of the delete: the store's parent is unreadable.
+        let parked = tmp.path().join("parked-graph");
+        std::fs::rename(&graph_dir, &parked).unwrap();
+        std::fs::write(&graph_dir, "blocked parent").unwrap();
+        let deleted = dispatcher
+            .handle_agent_delete(&json!({"alias": "alpha"}))
+            .await
+            .unwrap();
+        assert_eq!(deleted["deleted"], true, "{deleted}");
+        assert!(
+            !deleted["warnings"].as_array().unwrap().is_empty(),
+            "a failed knowledge purge must be reported: {deleted}"
+        );
+        assert!(!dispatcher.ctx.config.read().agents.contains_key("alpha"));
+
+        // While the store cannot be inspected, recreation is refused.
+        let err = dispatcher.handle_config_set(&set_alpha).await.unwrap_err();
+        assert_eq!(err.code, INVALID_PARAMS, "{}", err.message);
+        let uninspectable = expected(&dispatcher.ctx.config.snapshot());
+        assert_eq!(err.message, uninspectable);
+
+        std::fs::remove_file(&graph_dir).unwrap();
+        std::fs::rename(&parked, &graph_dir).unwrap();
+        let graph = KnowledgeGraph::new(&graph_path, 100).unwrap();
+        assert_eq!(
+            graph.count_owner("alpha").unwrap(),
+            1,
+            "the failed purge must retain the rows"
+        );
+
+        let config_path = dispatcher.ctx.config.read().config_path.clone();
+        let disk_before = std::fs::read(&config_path).unwrap();
+        let retained = expected(&dispatcher.ctx.config.snapshot());
+        assert_ne!(retained, uninspectable, "the refusal reason must change");
+        let err = dispatcher.handle_config_set(&set_alpha).await.unwrap_err();
+        assert_eq!(err.code, INVALID_PARAMS, "{}", err.message);
+        assert_eq!(err.message, retained);
+        let err = dispatcher
+            .handle_config_set_many(&json!({"sets": [set_alpha.clone()]}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, INVALID_PARAMS, "{}", err.message);
+        assert!(err.message.contains(&retained), "{}", err.message);
+        assert!(!dispatcher.ctx.config.read().agents.contains_key("alpha"));
+        assert_eq!(
+            std::fs::read(&config_path).unwrap(),
+            disk_before,
+            "refused writes must not persist"
+        );
+
+        // Retrying the delete converges; recreation is then admitted and the
+        // new agent's scope finds none of the retired rows.
+        let retried = dispatcher
+            .handle_agent_delete(&json!({"alias": "alpha"}))
+            .await
+            .unwrap();
+        assert_eq!(retried["deleted"], true, "{retried}");
+        assert_eq!(graph.count_owner("alpha").unwrap(), 0);
+        dispatcher.handle_config_set(&set_alpha).await.unwrap();
+        assert!(dispatcher.ctx.config.read().agents.contains_key("alpha"));
+        assert!(
+            graph
+                .get_node(
+                    &KnowledgeScope::for_agent("alpha", Vec::<String>::new()),
+                    &node
+                )
+                .unwrap()
+                .is_none(),
+            "a recreated agent must not read the retired agent's rows"
         );
     }
 

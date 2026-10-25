@@ -116,6 +116,9 @@ fn create_entry(config: &mut Config, section: &str, alias: &str) -> Result<()> {
                 "the `default` agent is reserved and cannot be created"
             )
         ),
+        Err(error @ alias_refs::CreateError::Retirement(_)) => {
+            bail!("{}", crate::alias_create_refusal_text(&error))
+        }
         Err(alias_refs::CreateError::Invalid(msg)) => return Err(anyhow::Error::msg(msg)),
     };
     if created {

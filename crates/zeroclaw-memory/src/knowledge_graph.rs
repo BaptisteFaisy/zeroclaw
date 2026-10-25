@@ -1731,6 +1731,13 @@ mod tests {
                 )
                 .unwrap()
             );
+            // Property-path creation runs the same nonwaiting probe.
+            assert!(
+                config_write
+                    .ensure_map_key_for_path("agents.autofresh.enabled")
+                    .is_ok()
+            );
+            assert!(config_write.agents.contains_key("autofresh"));
             let after: i64 = tx
                 .query_row("PRAGMA schema_version", [], |row| row.get(0))
                 .unwrap();

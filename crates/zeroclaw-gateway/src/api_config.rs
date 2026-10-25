@@ -398,6 +398,25 @@ fn config_commit_admission_error(
     )
 }
 
+/// Map a refused alias creation to the HTTP error surface, for explicit
+/// creation and for property writes that would create the alias. Reserved
+/// and retired-knowledge refusals are validation failures (400); an unknown
+/// section or malformed key stays `path_not_found` (404). The caller sets
+/// the path.
+fn alias_create_refusal(error: zeroclaw_config::alias_refs::CreateError) -> ConfigApiError {
+    use zeroclaw_config::alias_refs::CreateError;
+    match error {
+        CreateError::Reserved(alias) => ConfigApiError::new(
+            ConfigApiCode::ValidationFailed,
+            format!("alias `{alias}` is reserved and cannot be created"),
+        ),
+        CreateError::Retirement(retirement) => {
+            ConfigApiError::new(ConfigApiCode::ValidationFailed, retirement.to_string())
+        }
+        CreateError::Invalid(message) => ConfigApiError::new(ConfigApiCode::PathNotFound, message),
+    }
+}
+
 /// Map a publication refusal (non-successor revision) to the HTTP error
 /// surface. The published pair is unchanged when this is returned.
 fn config_commit_publish_error(
@@ -1048,16 +1067,11 @@ pub async fn handle_prop_put(
         Err(e) => return error_response(config_commit_admission_error(e)),
     };
     let mut new_config = _cfg_guard.current_config();
-    if new_config.ensure_map_key_for_path(&body.path) {
-        // Refused to vivify the reserved `default` agent: surface the same
-        // reserved error the explicit create surfaces do, not a generic 404.
-        return error_response(
-            ConfigApiError::new(
-                ConfigApiCode::ValidationFailed,
-                "alias `default` is reserved and cannot be created",
-            )
-            .with_path(&body.path),
-        );
+    if let Err(error) = new_config.ensure_map_key_for_path(&body.path) {
+        // Refused to create the alias this path names (the reserved `default`
+        // agent, or an agent whose retired knowledge remains): surface the
+        // same refusal the explicit create does, not a generic 404.
+        return error_response(alias_create_refusal(error).with_path(&body.path));
     }
     let info = match lookup_prop_field(&new_config, &body.path) {
         Some(info) => info,
@@ -1803,26 +1817,20 @@ pub async fn handle_map_key(
     };
     let mut working = _cfg_guard.current_config();
 
-    // Create through the shared guarded boundary so the reserved-agent rule (the
-    // `default` runtime fallback) is enforced once for every surface. Reserved ->
-    // 400 (validation_failed), symmetric with the rename guard; an unknown
-    // section or invalid key stays 404 (path_not_found) as before.
+    // Create through the shared guarded boundary so the agent admission rules
+    // (the reserved `default` runtime fallback, and retired knowledge that a
+    // recreated alias would inherit) are enforced once for every surface.
+    // Refusals -> 400 (validation_failed), symmetric with the rename guard; an
+    // unknown section or invalid key stays 404 (path_not_found) as before.
     let created =
         match zeroclaw_config::alias_refs::create_map_key_checked(&mut working, &path, &key) {
             Ok(b) => b,
-            Err(zeroclaw_config::alias_refs::CreateError::Reserved(a)) => {
-                return error_response(
-                    ConfigApiError::new(
-                        ConfigApiCode::ValidationFailed,
-                        format!("alias `{a}` is reserved and cannot be created"),
-                    )
-                    .with_path(format!("{path}.{key}")),
-                );
-            }
-            Err(zeroclaw_config::alias_refs::CreateError::Invalid(msg)) => {
-                return error_response(
-                    ConfigApiError::new(ConfigApiCode::PathNotFound, msg).with_path(&path),
-                );
+            Err(error) => {
+                let target = match &error {
+                    zeroclaw_config::alias_refs::CreateError::Invalid(_) => path.clone(),
+                    _ => format!("{path}.{key}"),
+                };
+                return error_response(alias_create_refusal(error).with_path(target));
             }
         };
 
@@ -2723,16 +2731,16 @@ pub async fn handle_patch(
 
     for (idx, op) in ops.iter().enumerate() {
         let path = json_pointer_to_dotted(&op.path);
-        if matches!(op.op.as_str(), "add" | "replace") && working.ensure_map_key_for_path(&path) {
-            // Refused to vivify the reserved `default` agent: surface the same
-            // reserved error the explicit create surfaces do, not a generic 404.
+        if matches!(op.op.as_str(), "add" | "replace")
+            && let Err(error) = working.ensure_map_key_for_path(&path)
+        {
+            // Refused to create the alias this path names (the reserved
+            // `default` agent, or an agent whose retired knowledge remains):
+            // surface the same refusal the explicit create does, not a 404.
             return error_response(
-                ConfigApiError::new(
-                    ConfigApiCode::ValidationFailed,
-                    "alias `default` is reserved and cannot be created",
-                )
-                .with_path(&path)
-                .with_op_index(idx),
+                alias_create_refusal(error)
+                    .with_path(&path)
+                    .with_op_index(idx),
             );
         }
         let info = lookup_prop_field(&working, &path);
@@ -4086,6 +4094,136 @@ mod tests {
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(!state.config.read().agents.contains_key("recreated"));
+    }
+
+    /// A committed delete whose knowledge purge failed leaves rows under the
+    /// deleted alias after its lifecycle lease is released. Property writes
+    /// that would recreate that agent must refuse, not hand the old rows to a
+    /// new agent, until the retirement converges.
+    #[tokio::test]
+    async fn property_writes_cannot_recreate_agent_with_retained_knowledge() {
+        use zeroclaw_memory::knowledge_graph::{KnowledgeGraph, KnowledgeScope, NodeType};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        let graph_dir = tmp.path().join("graph");
+        std::fs::create_dir_all(&graph_dir).unwrap();
+        config.knowledge.db_path = graph_dir
+            .join("knowledge.db")
+            .to_string_lossy()
+            .into_owned();
+        let graph_path = config.knowledge.resolved_db_path();
+        drop(
+            KnowledgeGraph::new(&graph_path, 100)
+                .unwrap()
+                .add_node(
+                    &KnowledgeScope::for_agent("retired", Vec::<String>::new()),
+                    NodeType::Pattern,
+                    "retained",
+                    "retired agent knowledge",
+                    &[],
+                    None,
+                )
+                .unwrap(),
+        );
+        config.save().await.unwrap();
+        let state = test_state(config);
+        let config_path = state.config.read().config_path.clone();
+        let disk_before = std::fs::read(&config_path).unwrap();
+        let put = |state: &AppState| {
+            handle_prop_put(
+                State(state.clone()),
+                None,
+                axum::Json(PropPutBody {
+                    path: "agents.retired.enabled".to_string(),
+                    value: serde_json::json!(true),
+                    comment: None,
+                }),
+            )
+        };
+
+        let (status, json) = response_json(put(&state).await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(json["code"], "validation_failed");
+        assert_eq!(json["path"], "agents.retired.enabled");
+        assert!(
+            json["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("still owns knowledge")),
+            "{json}"
+        );
+
+        let (status, json) = response_json(
+            handle_patch(
+                State(state.clone()),
+                None,
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([{
+                    "op": "add",
+                    "path": "/agents/retired/enabled",
+                    "value": true,
+                }])),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(json["code"], "validation_failed");
+        assert_eq!(json["op_index"], 0);
+        assert!(
+            json["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("still owns knowledge")),
+            "{json}"
+        );
+
+        // Explicit creation reports the same refusal as a validation failure.
+        let (status, json) = response_json(
+            handle_map_key(
+                State(state.clone()),
+                None,
+                Query(MapKeyQuery {
+                    path: "agents".to_string(),
+                    key: "retired".to_string(),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(json["code"], "validation_failed");
+        assert_eq!(json["path"], "agents.retired");
+
+        assert!(!state.config.read().agents.contains_key("retired"));
+        assert_eq!(
+            std::fs::read(&config_path).unwrap(),
+            disk_before,
+            "refused writes must not persist"
+        );
+
+        // A store that cannot be inspected refuses too.
+        let parked = tmp.path().join("parked-graph");
+        std::fs::rename(&graph_dir, &parked).unwrap();
+        std::fs::write(&graph_dir, "blocked parent").unwrap();
+        let (status, json) = response_json(put(&state).await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert!(
+            json["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("cannot inspect retired knowledge")),
+            "{json}"
+        );
+        assert!(!state.config.read().agents.contains_key("retired"));
+        std::fs::remove_file(&graph_dir).unwrap();
+        std::fs::rename(&parked, &graph_dir).unwrap();
+
+        // Once the retirement converges the alias is admitted again.
+        let graph = KnowledgeGraph::new(&graph_path, 100).unwrap();
+        let snapshot = graph.export_owner("retired").unwrap();
+        graph.purge_archived_owner("retired", &snapshot).unwrap();
+        let (status, json) = response_json(put(&state).await).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert!(state.config.read().agents.contains_key("retired"));
     }
 
     #[tokio::test]

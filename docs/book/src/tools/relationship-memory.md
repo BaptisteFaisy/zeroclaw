@@ -66,7 +66,14 @@ Deletion captures its row and affected-edge set before asynchronous archive work
 After the archive is durable, purge verifies that exact set inside its write
 transaction. Changed or additional rows or edges are retained with a retry warning;
 retry produces a fresh archive. Creating or renaming an alias onto remaining
-knowledge is refused, including when that residue cannot be inspected. A stale
+knowledge is refused, including when that residue cannot be inspected. The
+refusal covers explicit creation and every property write that would create
+the agent: `zeroclaw config set` and `zeroclaw config patch`, the gateway
+property and patch APIs, RPC `config/set` and `config/set-many`, and the
+`model_routing_config` tool's `upsert_agent` action. Retry the delete until it
+converges, then create the agent again. An environment override that names a
+new agent is applied when config loads and is not checked, so do not
+reintroduce a retired alias that way before its delete converges. A stale
 retirement cannot purge a later incarnation's new rows.
 
 Initial rename works through the supported gateway or CLI lifecycle surfaces.

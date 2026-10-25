@@ -574,6 +574,9 @@ pub enum CreateError {
     /// The generated [`Config::create_map_key`] rejected the request: there is
     /// no map-keyed section at `path`, or the key is invalid. Carries the reason.
     Invalid(String),
+    /// A new agent alias would adopt knowledge a retired agent of the same
+    /// name still owns, or that ownership cannot be checked.
+    Retirement(RetiredKnowledgeError),
 }
 
 impl std::fmt::Display for CreateError {
@@ -581,23 +584,65 @@ impl std::fmt::Display for CreateError {
         match self {
             Self::Reserved(a) => write!(f, "alias `{a}` is reserved and cannot be created"),
             Self::Invalid(m) => write!(f, "{m}"),
+            Self::Retirement(error) => write!(f, "{error}"),
         }
     }
 }
 
 impl std::error::Error for CreateError {}
 
+/// Why a new agent alias cannot be admitted over a retired agent's knowledge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetiredKnowledgeError {
+    /// Knowledge rows owned by this alias remain after a failed retirement.
+    Retained { alias: String },
+    /// The knowledge store exists but could not be read without waiting:
+    /// a metadata error, a busy writer, or a SQLite failure.
+    Uninspectable { alias: String, reason: String },
+}
+
+impl std::fmt::Display for RetiredKnowledgeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Retained { alias } => write!(
+                f,
+                "agent `{alias}` still owns knowledge; finish its retirement before reusing the alias"
+            ),
+            Self::Uninspectable { alias, reason } => write!(
+                f,
+                "cannot inspect retired knowledge for agent `{alias}`: {reason}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RetiredKnowledgeError {}
+
+/// Admission rule for a new key under `section`, shared by explicit creation
+/// ([`create_map_key_checked`]) and property-path auto-creation
+/// ([`Config::ensure_map_key_for_path`]) so the two paths cannot drift. Only
+/// the `agents` section has rules: the reserved runtime fallback is never
+/// created, and an absent alias is admitted only once the knowledge store
+/// shows no rows it still owns.
+pub(crate) fn admit_map_key(cfg: &Config, section: &str, key: &str) -> Result<(), CreateError> {
+    if section != "agents" {
+        return Ok(());
+    }
+    if is_reserved_agent_alias(key) {
+        return Err(CreateError::Reserved(RESERVED_DEFAULT_AGENT.to_string()));
+    }
+    if !cfg.agents.contains_key(key) {
+        ensure_knowledge_owner_retired(cfg, key).map_err(CreateError::Retirement)?;
+    }
+    Ok(())
+}
+
 pub fn create_map_key_checked(
     cfg: &mut Config,
     path: &str,
     key: &str,
 ) -> Result<bool, CreateError> {
-    if path == "agents" && is_reserved_agent_alias(key) {
-        return Err(CreateError::Reserved(RESERVED_DEFAULT_AGENT.to_string()));
-    }
-    if path == "agents" && !cfg.agents.contains_key(key) {
-        ensure_knowledge_owner_retired(cfg, key).map_err(CreateError::Invalid)?;
-    }
+    admit_map_key(cfg, path, key)?;
     cfg.create_map_key(path, key).map_err(CreateError::Invalid)
 }
 
@@ -605,11 +650,34 @@ pub fn create_map_key_checked(
 /// database without creating it or waiting for its writer: callers may hold
 /// config serialization, while graph operations resolve live config only after
 /// their SQLite wait. Busy or uninspectable storage therefore refuses creation.
-fn ensure_knowledge_owner_retired(cfg: &Config, alias: &str) -> Result<(), String> {
+///
+/// Agent creation paths that insert into `agents` directly, rather than through
+/// [`create_map_key_checked`], call this before inserting a new alias.
+///
+/// This probe mirrors the ownership predicate in the memory crate's
+/// `KnowledgeGraph::count_owner` and `export_owner_from`; crate layering keeps
+/// it here. A schema change to `owner_agent` must update both.
+pub fn ensure_knowledge_owner_retired(
+    cfg: &Config,
+    alias: &str,
+) -> Result<(), RetiredKnowledgeError> {
+    let uninspectable = |reason: String| RetiredKnowledgeError::Uninspectable {
+        alias: alias.to_string(),
+        reason,
+    };
     let path = cfg.knowledge.resolved_db_path();
     match std::fs::metadata(&path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(format!("cannot inspect retired knowledge: {error}")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Windows reports a path under a regular-file ancestor as not
+            // found where Unix reports ENOTDIR. Re-walk the ancestors so an
+            // unreadable store is refused on every platform, as the runtime's
+            // lifecycle path classifier does.
+            return match obstructing_store_ancestor(&path) {
+                Some(reason) => Err(uninspectable(reason)),
+                None => Ok(()),
+            };
+        }
+        Err(error) => return Err(uninspectable(error.to_string())),
         Ok(_) => {}
     }
     let inspect = || -> rusqlite::Result<bool> {
@@ -635,11 +703,34 @@ fn ensure_knowledge_owner_retired(cfg: &Config, alias: &str) -> Result<(), Strin
     };
     match inspect() {
         Ok(false) => Ok(()),
-        Ok(true) => Err(format!(
-            "agent `{alias}` still owns knowledge; finish its retirement before reusing the alias"
-        )),
-        Err(error) => Err(format!("cannot inspect retired knowledge: {error}")),
+        Ok(true) => Err(RetiredKnowledgeError::Retained {
+            alias: alias.to_string(),
+        }),
+        Err(error) => Err(uninspectable(error.to_string())),
     }
+}
+
+/// The first ancestor of a store reported as missing that proves the store is
+/// unreadable rather than absent: a non-directory, or one whose metadata
+/// cannot be read. `None` when the nearest existing ancestor is a directory.
+fn obstructing_store_ancestor(path: &std::path::Path) -> Option<String> {
+    for ancestor in path.ancestors().skip(1) {
+        if ancestor.as_os_str().is_empty() {
+            continue;
+        }
+        match std::fs::metadata(ancestor) {
+            Ok(metadata) if metadata.is_dir() => return None,
+            Ok(_) => return Some(format!("{} is not a directory", ancestor.display())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Some(format!(
+                    "{} could not be inspected: {error}",
+                    ancestor.display()
+                ));
+            }
+        }
+    }
+    None
 }
 
 /// Outcome of a successful [`rename_with_cascade`].
@@ -706,7 +797,8 @@ pub fn rename_with_cascade(
     }
 
     if matches!(kind, AliasKind::Agent) {
-        ensure_knowledge_owner_retired(cfg, new_alias).map_err(RenameError::InvalidName)?;
+        ensure_knowledge_owner_retired(cfg, new_alias)
+            .map_err(|error| RenameError::InvalidName(error.to_string()))?;
     }
     let section = section_path(kind);
     // `rename_map_key` validates `new_alias` via `validate_alias_key` (whose
@@ -1456,6 +1548,121 @@ mod tests {
         std::fs::create_dir(&path).unwrap();
         assert!(create_map_key_checked(&mut cfg, "agents", "blocked").is_err());
         assert!(!cfg.agents.contains_key("blocked"));
+    }
+
+    /// Property-path auto-creation (PUT/PATCH prop, RPC config set, CLI config
+    /// patch) admits a new agent alias through the same retired-knowledge rule
+    /// as explicit creation, and never probes for an alias that already exists.
+    #[test]
+    fn auto_create_refuses_retained_knowledge_and_uninspectable_store() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = Config::default();
+        let path = tmp.path().join("graph.db");
+        cfg.knowledge.db_path = path.to_string_lossy().into_owned();
+
+        // No store yet: creation proceeds and does not initialize one.
+        assert!(cfg.ensure_map_key_for_path("agents.fresh.enabled").is_ok());
+        assert!(cfg.agents.contains_key("fresh"));
+        assert!(
+            !path.exists(),
+            "auto-creation must not initialize knowledge"
+        );
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE nodes (owner_agent TEXT); CREATE TABLE edges (owner_agent TEXT); \
+             INSERT INTO nodes VALUES ('retired');",
+        )
+        .unwrap();
+        let dirty_before = cfg.dirty_paths.clone();
+        match cfg.ensure_map_key_for_path("agents.retired.enabled") {
+            Err(CreateError::Retirement(RetiredKnowledgeError::Retained { alias })) => {
+                assert_eq!(alias, "retired");
+            }
+            other => panic!("retained knowledge must refuse auto-creation, got {other:?}"),
+        }
+        assert!(!cfg.agents.contains_key("retired"));
+        assert_eq!(
+            cfg.dirty_paths, dirty_before,
+            "a refused creation must not dirty config"
+        );
+        // Edge-only residue counts too.
+        conn.execute_batch("DELETE FROM nodes; INSERT INTO edges VALUES ('retired');")
+            .unwrap();
+        assert!(matches!(
+            cfg.ensure_map_key_for_path("agents.retired.enabled"),
+            Err(CreateError::Retirement(
+                RetiredKnowledgeError::Retained { .. }
+            ))
+        ));
+
+        // A busy writer refuses at once instead of waiting.
+        let blocker = rusqlite::Connection::open(&path).unwrap();
+        blocker.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            cfg.ensure_map_key_for_path("agents.busy.enabled"),
+            Err(CreateError::Retirement(
+                RetiredKnowledgeError::Uninspectable { .. }
+            ))
+        ));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "the probe must not wait for the writer"
+        );
+        assert!(!cfg.agents.contains_key("busy"));
+        blocker.execute_batch("ROLLBACK;").unwrap();
+
+        // Converged cleanup admits the alias again.
+        conn.execute("DELETE FROM edges", []).unwrap();
+        assert!(
+            cfg.ensure_map_key_for_path("agents.retired.enabled")
+                .is_ok()
+        );
+        assert!(cfg.agents.contains_key("retired"));
+
+        // An unreadable store refuses; existing aliases and other sections
+        // never probe it, and the reserved alias is refused before any I/O.
+        drop((conn, blocker));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(matches!(
+            cfg.ensure_map_key_for_path("agents.blocked.enabled"),
+            Err(CreateError::Retirement(
+                RetiredKnowledgeError::Uninspectable { .. }
+            ))
+        ));
+        assert!(!cfg.agents.contains_key("blocked"));
+        assert!(
+            cfg.ensure_map_key_for_path("agents.retired.enabled")
+                .is_ok()
+        );
+        assert!(
+            cfg.ensure_map_key_for_path("providers.models.openai.fresh.api_key")
+                .is_ok()
+        );
+        assert!(matches!(
+            cfg.ensure_map_key_for_path("agents.default.enabled"),
+            Err(CreateError::Reserved(_))
+        ));
+    }
+
+    /// The not-found branch is what Windows reports for a store whose parent
+    /// is a regular file; Unix reports ENOTDIR instead. Drive the ancestor
+    /// walk directly so both shapes are covered on any host.
+    #[test]
+    fn missing_store_under_a_file_ancestor_is_uninspectable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let blocked_parent = tmp.path().join("graph");
+        std::fs::write(&blocked_parent, "not a directory").unwrap();
+        assert!(
+            obstructing_store_ancestor(&blocked_parent.join("knowledge.db"))
+                .is_some_and(|reason| reason.contains("is not a directory"))
+        );
+        assert!(
+            obstructing_store_ancestor(&tmp.path().join("missing/nested/knowledge.db")).is_none(),
+            "a store under absent directories is absent"
+        );
     }
 
     #[test]
@@ -2785,18 +2992,21 @@ mod tests {
     fn ensure_map_key_for_path_refuses_reserved_default_agent() {
         let mut cfg = empty_config();
         // A set-prop on a nonexistent `agents.default` must NOT auto-vivify the
-        // reserved runtime-fallback agent, and signals the refusal (true) so the
+        // reserved runtime-fallback agent, and reports the refusal so the
         // set-prop surface returns a reserved error (PUT /prop, PATCH, RPC set).
-        assert!(cfg.ensure_map_key_for_path("agents.default.enabled"));
+        assert!(matches!(
+            cfg.ensure_map_key_for_path("agents.default.enabled"),
+            Err(CreateError::Reserved(_))
+        ));
         assert!(!cfg.agents.contains_key("default"));
         // A non-reserved agent IS vivified (not refused), as normal set-prop-on-new.
-        assert!(!cfg.ensure_map_key_for_path("agents.scout.enabled"));
+        assert!(cfg.ensure_map_key_for_path("agents.scout.enabled").is_ok());
         assert!(cfg.agents.contains_key("scout"));
         // An already-present `default` (e.g. migration-synthesized) is left intact
-        // and still configurable: the existence check returns false (not refused).
+        // and still configurable: the existence check admits it (not refused).
         cfg.agents
             .insert("default".to_string(), AliasedAgentConfig::default());
-        assert!(!cfg.ensure_map_key_for_path("agents.default.model"));
+        assert!(cfg.ensure_map_key_for_path("agents.default.model").is_ok());
         assert!(cfg.agents.contains_key("default"));
     }
 
