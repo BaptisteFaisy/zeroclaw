@@ -4942,8 +4942,9 @@ impl DelegateTool {
                             return Ok(ToolResult {
                                 success: false,
                                 output: ToolOutput::default(),
-                                error: Some(format!(
-                                    "Failed to initialize knowledge for delegate target '{agent_name}': {e:#}"
+                                error: Some(crate::i18n::get_required_cli_string_with_args(
+                                    "delegate-knowledge-init-failed",
+                                    &[("agent", agent_name), ("error", &format!("{e:#}"))],
                                 )),
                             });
                         }

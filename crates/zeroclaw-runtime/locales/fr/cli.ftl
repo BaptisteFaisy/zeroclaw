@@ -1198,6 +1198,7 @@ channel-runtime-fallback-footer =
     Changer de modèle : /models
 channel-runtime-model-fallback-redacted = ⚡ Le modèle demandé était indisponible ; un modèle de secours a généré cette réponse.
 delegate-provider-fallback-warning = Avertissement : l’agent délégué a repris son exécution grâce à un basculement vers un fournisseur de secours. Les détails de la défaillance du fournisseur ont été consignés et omis de ce résultat.
+delegate-knowledge-init-failed = Impossible d’initialiser les connaissances de l’agent délégué '{ $agent }' : { $error }
 turn-tool-protocol-strict-mixed-error = L’analyse stricte des outils ne peut pas exécuter une chaîne de repli qui mélange des candidats native-tool et text-only. Configurez chaque candidat accessible pour utiliser le même protocole d’outils, ou définissez strict_tool_parsing sur false.
 delegate-provider-fallback-header = [Agent '{ $agent }' (demandé : { $requested_provider }/{ $requested_model } ; fourni : { $actual_provider }/{ $actual_model })]
 delegate-provider-fallback-header-agentic = [Agent '{ $agent }' (demandé : { $requested_provider }/{ $requested_model } ; fourni : { $actual_provider }/{ $actual_model }, agentique)]

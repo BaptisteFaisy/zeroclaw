@@ -1195,6 +1195,7 @@ channel-runtime-fallback-footer =
     Cambiar modelo: /models
 channel-runtime-model-fallback-redacted = ⚡ El modelo solicitado no estaba disponible; un modelo de respaldo generó esta respuesta.
 delegate-provider-fallback-warning = Advertencia: El agente delegado se recuperó mediante una alternativa de proveedor. Los detalles del fallo del proveedor se registraron y se omitieron de este resultado.
+delegate-knowledge-init-failed = No se pudo inicializar el conocimiento del agente delegado '{ $agent }': { $error }
 turn-tool-protocol-strict-mixed-error = El análisis estricto de herramientas no puede ejecutar una cadena de alternativas que mezcle candidatos con herramientas nativas y candidatos de solo texto. Configura cada candidato accesible para que use el mismo protocolo de herramientas, o establece strict_tool_parsing en false.
 delegate-provider-fallback-header = [Agente '{ $agent }' (solicitado: { $requested_provider }/{ $requested_model }; servido: { $actual_provider }/{ $actual_model })]
 delegate-provider-fallback-header-agentic = [Agente '{ $agent }' (solicitado: { $requested_provider }/{ $requested_model }; servido: { $actual_provider }/{ $actual_model }, agentic)]
