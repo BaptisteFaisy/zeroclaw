@@ -71,9 +71,13 @@ refusal covers explicit creation and every property write that would create
 the agent: `zeroclaw config set` and `zeroclaw config patch`, the gateway
 property and patch APIs, RPC `config/set` and `config/set-many`, and the
 `model_routing_config` tool's `upsert_agent` action. Retry the delete until it
-converges, then create the agent again. An environment override that names a
-new agent is applied when config loads and is not checked, so do not
-reintroduce a retired alias that way before its delete converges. A stale
+converges, then create the agent again. An environment override that names an
+agent defines it again at the next config load, over any knowledge a failed
+delete left behind; load cannot tell that from an env-defined agent reading
+its own knowledge, so it does not check. Remove an agent's
+`ZEROCLAW_agents__<alias>__*` variables before deleting it. The
+`model_routing_config` tool refuses `remove_agent`; delete an agent through
+the CLI, gateway, or RPC lifecycle surfaces, which run this cascade. A stale
 retirement cannot purge a later incarnation's new rows.
 
 Initial rename works through the supported gateway or CLI lifecycle surfaces.

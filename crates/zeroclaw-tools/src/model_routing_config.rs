@@ -1555,26 +1555,33 @@ impl ModelRoutingConfigTool {
         })
     }
 
-    async fn handle_remove_agent(&self, args: &Value) -> anyhow::Result<ToolResult> {
+    /// `remove_agent` is refused. Removing the config entry here would skip
+    /// the lifecycle path every supported delete surface runs: the delete
+    /// lease and config commit that serialize the change with the daemon,
+    /// the hard-reference refusal and soft-reference scrub, and the
+    /// owned-state cascade that archives and purges the agent's memory,
+    /// knowledge, cron, and ACP state. That path lives in the runtime, which
+    /// this crate cannot depend on, so the tool names the surfaces that run
+    /// it. Nothing is read or written, and the refusal runs before the
+    /// write-access gate, so every caller gets the same explanation.
+    fn handle_remove_agent(&self, args: &Value) -> anyhow::Result<ToolResult> {
         let name = Self::parse_non_empty_string(args, "name")?;
-
-        let mut cfg = self.load_config_without_env()?;
-        if cfg.agents.remove(&name).is_none() {
-            anyhow::bail!("No aliased agent found with name '{name}'");
-        }
-
-        cfg.save().await?;
-
-        Ok(ToolResult {
-            success: true,
-            output: serde_json::to_string_pretty(&json!({
-                "message": "Aliased agent removed",
-                "name": name,
-                "config": Self::snapshot(&cfg),
-            }))?
-            .into(),
-            error: None,
-        })
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "error_key": "tools.model_routing_remove_agent_refused",
+                    "agent": name,
+                })),
+            "model_routing_config: refused remove_agent; agent deletion runs only through the lifecycle surfaces"
+        );
+        Err(anyhow::Error::msg(
+            crate::i18n::get_required_tool_string_with_args(
+                "tool-model-routing-config-error-remove-agent-unsupported",
+                &[("agent", name.as_str())],
+            ),
+        ))
     }
 }
 
@@ -1627,8 +1634,7 @@ impl Tool for ModelRoutingConfigTool {
                         "set_default",
                         "upsert_scenario",
                         "remove_scenario",
-                        "upsert_agent",
-                        "remove_agent"
+                        "upsert_agent"
                     ],
                     "default": "get"
                 },
@@ -1690,7 +1696,7 @@ impl Tool for ModelRoutingConfigTool {
                 },
                 "name": {
                     "type": "string",
-                    "description": "Aliased agent name for upsert_agent/remove_agent"
+                    "description": "Aliased agent name for upsert_agent. Agents are deleted through the lifecycle surfaces (zeroclaw agents delete, the dashboard, RPC agents/delete), not this tool."
                 },
                 "max_depth": {
                     "type": ["integer", "null"],
@@ -1738,8 +1744,10 @@ impl Tool for ModelRoutingConfigTool {
         let result = match action.as_str() {
             "get" => self.handle_get(),
             "list_hints" => self.handle_list_hints(),
-            "set_default" | "upsert_scenario" | "remove_scenario" | "upsert_agent"
-            | "remove_agent" => {
+            // Refused before the write gate: the explanation is the same for
+            // every caller, and no config is read or written.
+            "remove_agent" => self.handle_remove_agent(&args),
+            "set_default" | "upsert_scenario" | "remove_scenario" | "upsert_agent" => {
                 if let Some(blocked) = self.require_write_access() {
                     return Ok(blocked);
                 }
@@ -1749,14 +1757,13 @@ impl Tool for ModelRoutingConfigTool {
                     "upsert_scenario" => Box::pin(self.handle_upsert_scenario(&args)).await,
                     "remove_scenario" => Box::pin(self.handle_remove_scenario(&args)).await,
                     "upsert_agent" => Box::pin(self.handle_upsert_agent(&args)).await,
-                    "remove_agent" => Box::pin(self.handle_remove_agent(&args)).await,
                     _ => Err(anyhow::Error::msg(format!(
                         "Unknown model-routing action after validation: {action}"
                     ))),
                 }
             }
             _ => anyhow::bail!(
-                "Unknown action '{action}'. Valid: get, list_hints, set_default, upsert_scenario, remove_scenario, upsert_agent, remove_agent"
+                "Unknown action '{action}'. Valid: get, list_hints, set_default, upsert_scenario, remove_scenario, upsert_agent"
             ),
         };
 
@@ -1987,8 +1994,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upsert_and_remove_delegate_agent() {
+    async fn upsert_delegate_agent_then_remove_agent_is_refused() {
         let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
         let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
         let upsert = tool
@@ -2023,6 +2031,9 @@ mod tests {
             json!(["file_read", "file_write", "shell"])
         );
 
+        // Removing the entry here would orphan the agent's owned state and
+        // skip the lifecycle path, so the tool refuses and changes nothing.
+        let disk_before = std::fs::read(&cfg_path).unwrap();
         let remove = tool
             .execute(json!({
                 "action": "remove_agent",
@@ -2030,11 +2041,74 @@ mod tests {
             }))
             .await
             .unwrap();
-        assert!(remove.success, "{:?}", remove.error);
+        assert!(!remove.success, "{remove:?}");
+        assert!(
+            remove
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("zeroclaw agents delete coder")),
+            "{remove:?}"
+        );
+        assert_eq!(
+            std::fs::read(&cfg_path).unwrap(),
+            disk_before,
+            "a refused remove_agent must not write config"
+        );
 
         let get_result = tool.execute(json!({"action": "get"})).await.unwrap();
         let output: Value = serde_json::from_str(&get_result.output).unwrap();
-        assert!(output["agents"]["coder"].is_null());
+        assert_eq!(output["agents"]["coder"]["risk_profile"], json!("coder"));
+    }
+
+    /// `remove_agent` would delete the config entry outside the lifecycle
+    /// path (delete lease, config commit, hard-reference refusal, reference
+    /// scrub, owned-state cascade), which this crate cannot reach. It is
+    /// refused unconditionally: without reading config, for an unknown
+    /// alias, and under read-only autonomy; and it is no longer advertised.
+    #[tokio::test]
+    async fn remove_agent_is_refused_unconditionally() {
+        let tmp = TempDir::new().unwrap();
+        let config = Box::pin(test_config(&tmp)).await;
+        let tool = ModelRoutingConfigTool::new(Arc::clone(&config), test_security());
+        let actions = tool.parameters_schema()["properties"]["action"]["enum"].clone();
+        assert!(
+            !actions
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|action| action == "remove_agent"),
+            "{actions}"
+        );
+
+        std::fs::remove_file(&config.config_path).unwrap();
+        let refused = tool
+            .execute(json!({"action": "remove_agent", "name": "ghost"}))
+            .await
+            .unwrap();
+        assert!(!refused.success, "{refused:?}");
+        let error = refused.error.as_deref().unwrap_or_default();
+        assert!(
+            error.contains("zeroclaw agents delete ghost") && error.contains("agents/delete"),
+            "{error}"
+        );
+        assert!(
+            !config.config_path.exists(),
+            "the refusal must not read or recreate config"
+        );
+
+        let readonly = ModelRoutingConfigTool::new(config, readonly_security());
+        let refused = readonly
+            .execute(json!({"action": "remove_agent", "name": "ghost"}))
+            .await
+            .unwrap();
+        assert!(!refused.success, "{refused:?}");
+        assert!(
+            refused
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("agents/delete")),
+            "a read-only caller gets the same explanation: {refused:?}"
+        );
     }
 
     /// `upsert_agent` inserts into `agents` directly. A new alias must not
