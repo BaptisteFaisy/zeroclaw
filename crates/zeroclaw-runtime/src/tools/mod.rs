@@ -422,6 +422,36 @@ fn select_declared_builtin_tool(
     selection.is_enabled(name)
 }
 
+/// The knowledge scope an agent's tool runs under. The scope is bound from
+/// the trusted agent alias, never from tool arguments. With a live config
+/// handle, grants resolve per graph operation; without one, reads widen only
+/// through the agent's configured `workspace.read_knowledge_from`.
+pub(crate) fn knowledge_scope_for_agent(
+    config: &Config,
+    live_config: Option<&zeroclaw_config::live::LiveConfigHandle>,
+    agent_alias: &str,
+) -> zeroclaw_memory::knowledge_graph::KnowledgeScope {
+    if let Some(live) = live_config {
+        return zeroclaw_memory::knowledge_graph::KnowledgeScope::live_agent(
+            agent_alias,
+            live.clone(),
+        );
+    }
+    let read_knowledge_from: Vec<String> = config
+        .agents
+        .get(agent_alias)
+        .map(|agent| {
+            agent
+                .workspace
+                .read_knowledge_from
+                .iter()
+                .map(|target| target.as_str().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    zeroclaw_memory::knowledge_graph::KnowledgeScope::for_agent(agent_alias, read_knowledge_from)
+}
+
 fn register_builtin_tool(
     selection: &zeroclaw_config::builtin_tools::BuiltinToolsConfig,
     registry: &mut Vec<Arc<dyn Tool>>,
@@ -2992,32 +3022,11 @@ fn all_tools_with_runtime_on_thread(
                                 "knowledge graph assigned unattributed legacy rows"
                             );
                         }
-                        // The scope is bound from the trusted registration alias,
-                        // never from tool arguments. Reads widen only through the
-                        // validated workspace.read_knowledge_from allowlist.
-                        let read_knowledge_from: Vec<String> = root_config
-                            .agents
-                            .get(agent_alias)
-                            .map(|agent| {
-                                agent
-                                    .workspace
-                                    .read_knowledge_from
-                                    .iter()
-                                    .map(|target| target.as_str().to_string())
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        let scope = if let Some(live) = &live_config {
-                            zeroclaw_memory::knowledge_graph::KnowledgeScope::live_agent(
-                                agent_alias,
-                                live.clone(),
-                            )
-                        } else {
-                            zeroclaw_memory::knowledge_graph::KnowledgeScope::for_agent(
-                                agent_alias,
-                                read_knowledge_from,
-                            )
-                        };
+                        let scope = knowledge_scope_for_agent(
+                            root_config,
+                            live_config.as_ref(),
+                            agent_alias,
+                        );
                         register_tool!(
                             "knowledge",
                             Arc::new(KnowledgeTool::new(Arc::new(graph), scope))
