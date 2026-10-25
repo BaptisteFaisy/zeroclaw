@@ -100,6 +100,28 @@ impl ModelRoutingConfigTool {
             && runtime_view.agents.contains_key(name)
     }
 
+    /// Localized refusal for a new agent alias whose retired knowledge remains
+    /// or cannot be inspected.
+    fn retired_knowledge_refusal(
+        error: &zeroclaw_config::alias_refs::RetiredKnowledgeError,
+    ) -> String {
+        use zeroclaw_config::alias_refs::RetiredKnowledgeError;
+        match error {
+            RetiredKnowledgeError::Retained { alias } => {
+                crate::i18n::get_required_tool_string_with_args(
+                    "tool-model-routing-config-error-retired-knowledge",
+                    &[("agent", alias)],
+                )
+            }
+            RetiredKnowledgeError::Uninspectable { alias, reason } => {
+                crate::i18n::get_required_tool_string_with_args(
+                    "tool-model-routing-config-error-uninspectable-knowledge",
+                    &[("agent", alias), ("reason", reason)],
+                )
+            }
+        }
+    }
+
     fn load_config_without_env(&self) -> anyhow::Result<Config> {
         let contents = fs::read_to_string(&self.config.config_path).map_err(|error| {
             ::zeroclaw_log::record!(
@@ -1221,7 +1243,7 @@ impl ModelRoutingConfigTool {
         // file is live, not a recreation, so it is not probed.
         if existing_agent.is_none() && !Self::agent_defined_by_env(&cfg, &name) {
             zeroclaw_config::alias_refs::ensure_knowledge_owner_retired(&self.config, &name)
-                .map_err(|error| anyhow::Error::msg(error.to_string()))?;
+                .map_err(|error| anyhow::Error::msg(Self::retired_knowledge_refusal(&error)))?;
         }
 
         // Validate the provider route before mutating any provider, profile, or agent state.
@@ -2084,11 +2106,16 @@ mod tests {
 
         let refused = tool.execute(upsert.clone()).await.unwrap();
         assert!(!refused.success, "{refused:?}");
-        assert!(
-            refused
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("still owns knowledge")),
+        assert_eq!(
+            refused.error.as_deref(),
+            Some(
+                ModelRoutingConfigTool::retired_knowledge_refusal(
+                    &zeroclaw_config::alias_refs::RetiredKnowledgeError::Retained {
+                        alias: "retired".to_string(),
+                    }
+                )
+                .as_str()
+            ),
             "{refused:?}"
         );
         assert_eq!(
