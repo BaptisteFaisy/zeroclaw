@@ -7,14 +7,13 @@
 
 use anyhow::Context;
 use chrono::{DateTime, Utc};
-use parking_lot::{Mutex, RwLock, RwLockReadGuard};
+use parking_lot::Mutex;
 use rusqlite::{Connection, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
 use uuid::Uuid;
-use zeroclaw_config::schema::Config;
+use zeroclaw_config::live::{LiveConfigHandle, LiveConfigReadGuard};
 
 // ── Domain types ────────────────────────────────────────────────
 
@@ -159,7 +158,7 @@ pub struct GraphStats {
 /// resolves its current grants after the SQLite wait. Lock order is graph
 /// connection, SQLite transaction, then live config read. The config guard
 /// never crosses an await. Static scopes serve one-shot and maintenance callers.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum KnowledgeScope {
     /// Operations run as one configured agent. Reads see rows owned by
     /// that agent and rows owned by any alias in the read allowlist.
@@ -179,14 +178,33 @@ pub enum KnowledgeScope {
     /// retained here: storage resolves them after acquiring its transaction.
     LiveAgent {
         alias: String,
-        config: Arc<RwLock<Config>>,
+        config: LiveConfigHandle,
     },
+}
+
+// Manual: the live handle exposes config contents, which a scope's debug
+// output must not print. The trusted alias is the only identity it carries.
+impl std::fmt::Debug for KnowledgeScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Agent { alias, read_from } => f
+                .debug_struct("Agent")
+                .field("alias", alias)
+                .field("read_from", read_from)
+                .finish(),
+            Self::Unrestricted => f.write_str("Unrestricted"),
+            Self::LiveAgent { alias, .. } => f
+                .debug_struct("LiveAgent")
+                .field("alias", alias)
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 struct ResolvedKnowledgeScope<'a> {
     scope: std::borrow::Cow<'a, KnowledgeScope>,
     // Keeps authorization coherent through the synchronous storage effect.
-    _config_guard: Option<RwLockReadGuard<'a, Config>>,
+    _config_guard: Option<LiveConfigReadGuard<'a>>,
 }
 
 impl std::ops::Deref for ResolvedKnowledgeScope<'_> {
@@ -197,7 +215,7 @@ impl std::ops::Deref for ResolvedKnowledgeScope<'_> {
 }
 
 impl KnowledgeScope {
-    pub fn live_agent(alias: impl Into<String>, config: Arc<RwLock<Config>>) -> Self {
+    pub fn live_agent(alias: impl Into<String>, config: LiveConfigHandle) -> Self {
         Self::LiveAgent {
             alias: alias.into(),
             config,
@@ -1577,9 +1595,20 @@ fn sql_limit(limit: usize) -> anyhow::Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use tempfile::TempDir;
+    use zeroclaw_config::live::LiveConfig;
+    use zeroclaw_config::schema::Config;
 
     const TEST_AGENT: &str = "test-agent";
+
+    /// Publish one config edit through the storage a live scope reads.
+    fn publish(live: &LiveConfig, edit: impl FnOnce(&mut Config)) {
+        let mut next = live.snapshot();
+        edit(&mut next);
+        let revision = live.next_revision().unwrap();
+        live.publish(revision, next).unwrap();
+    }
 
     #[test]
     fn retained_live_scope_rechecks_after_connection_wait() {
@@ -1595,8 +1624,8 @@ mod tests {
             .unwrap()
             .workspace
             .read_knowledge_from = vec!["b".into()];
-        let live = Arc::new(RwLock::new(config));
-        let scope = KnowledgeScope::live_agent("a", Arc::clone(&live));
+        let live = LiveConfig::new(config);
+        let scope = KnowledgeScope::live_agent("a", live.handle());
         let b = agent("b");
         let id = graph
             .add_node(&b, NodeType::Pattern, "private", "secret", &[], None)
@@ -1612,13 +1641,15 @@ mod tests {
             worker_graph.get_node(&worker_scope, &worker_id).unwrap()
         });
         started_rx.recv().unwrap();
-        live.write()
-            .agents
-            .get_mut("a")
-            .unwrap()
-            .workspace
-            .read_knowledge_from
-            .clear();
+        publish(&live, |config| {
+            config
+                .agents
+                .get_mut("a")
+                .unwrap()
+                .workspace
+                .read_knowledge_from
+                .clear();
+        });
         drop(storage);
         assert!(worker.join().unwrap().is_none());
         let later = graph
@@ -1626,19 +1657,23 @@ mod tests {
             .unwrap();
         assert!(graph.get_node(&scope, &later).unwrap().is_none());
         assert_eq!(graph.stats(&scope).unwrap().total_nodes, 0);
-        live.write()
-            .agents
-            .get_mut("a")
-            .unwrap()
-            .workspace
-            .read_knowledge_from = vec!["b".into()];
-        live.write().agents.get_mut("b").unwrap().enabled = false;
+        publish(&live, |config| {
+            config
+                .agents
+                .get_mut("a")
+                .unwrap()
+                .workspace
+                .read_knowledge_from = vec!["b".into()];
+            config.agents.get_mut("b").unwrap().enabled = false;
+        });
         assert_eq!(
             graph.stats(&scope).unwrap().total_nodes,
             2,
             "configured disabled sibling remains an explicit read source"
         );
-        live.write().agents.get_mut("a").unwrap().enabled = false;
+        publish(&live, |config| {
+            config.agents.get_mut("a").unwrap().enabled = false
+        });
         assert!(graph.stats(&scope).is_err());
         assert!(
             graph
@@ -1656,8 +1691,8 @@ mod tests {
         config.knowledge.enabled = true;
         config.knowledge.db_path = path.to_string_lossy().into_owned();
         config.agents.insert("a".into(), Default::default());
-        let live = Arc::new(RwLock::new(config));
-        let scope = KnowledgeScope::live_agent("a", Arc::clone(&live));
+        let live = LiveConfig::new(config);
+        let scope = KnowledgeScope::live_agent("a", live.handle());
         let mut independent = Connection::open(path).unwrap();
         let tx = independent
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1677,11 +1712,12 @@ mod tests {
         });
         started_rx.recv().unwrap();
         {
-            let mut config_write = live.write();
+            // A config commit stages its edit on a snapshot while it holds
+            // config serialization, then publishes. Config-side probes use a
+            // separate, read-only, nonwaiting connection: they must not
+            // request the blocked writer or the tool's graph mutex.
+            let mut config_write = live.snapshot();
             config_write.agents.get_mut("a").unwrap().enabled = false;
-            // Config-side probes use a separate, read-only, nonwaiting
-            // connection. They must not request the blocked writer or the
-            // tool's graph mutex while this config guard is held.
             let before: i64 = tx
                 .query_row("PRAGMA schema_version", [], |row| row.get(0))
                 .unwrap();
@@ -1702,6 +1738,8 @@ mod tests {
                 before, after,
                 "config-side probes must not initialize schema"
             );
+            let revision = live.next_revision().unwrap();
+            live.publish(revision, config_write).unwrap();
         }
         tx.commit().unwrap();
         assert!(worker.join().unwrap().is_err());

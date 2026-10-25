@@ -1136,8 +1136,7 @@ mod tests {
             .execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
             .unwrap();
         let authority = crate::LiveConfigAuthority::new(config.clone());
-        let writer = authority.config_write_lock();
-        let _guard = writer.lock().await;
+        let _commit = authority.begin_config_commit().await.unwrap();
         let before = std::time::Instant::now();
         assert!(committed_delete_residue_exists(&config, None, None, "retired").await);
         assert!(

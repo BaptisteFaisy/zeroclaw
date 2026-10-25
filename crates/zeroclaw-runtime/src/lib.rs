@@ -20,6 +20,7 @@ pub mod agent_owned_state;
 pub mod approval;
 pub mod browse;
 pub mod calendar;
+pub mod composition;
 pub mod control_plane;
 pub mod cost;
 pub mod cron;
@@ -55,3 +56,5 @@ pub mod tunnel;
 pub mod verifiable_intent;
 
 pub use live_config_authority::{AgentExecutionCapability, LiveConfigAuthority};
+
+pub mod config_application;
